@@ -1,0 +1,84 @@
+name: Release macOS app
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build, for example v0.1.5"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    env:
+      DEVSWEEP_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+      DEVSWEEP_APPLE_ID: ${{ secrets.APPLE_ID }}
+      DEVSWEEP_APPLE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      DEVSWEEP_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Import Developer ID certificate
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
+      - name: Validate version and release tag
+        id: version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)"
+          expected_tag="v${version}"
+          if [[ "${RELEASE_TAG}" != "${expected_tag}" ]]; then
+            echo "Tag ${RELEASE_TAG} does not match app version ${version}. Expected ${expected_tag}." >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "release_tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build, sign, notarize, staple, and verify
+        run: ./scripts/distribute_app.sh
+
+      - name: Verify Developer ID signature and notarization
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="${PWD}/DevSweep.app"
+          zip="${PWD}/.build/release/DevSweep-${{ steps.version.outputs.version }}-macos.zip"
+          codesign -dvvv "${app}" 2>&1 | grep -E 'Authority=Developer ID Application|Timestamp=|TeamIdentifier='
+          xcrun stapler validate "${app}"
+          spctl --assess --type execute --verbose=4 "${app}"
+          test -f "${zip}"
+
+      - name: Publish or replace GitHub Release asset
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          zip=".build/release/DevSweep-${VERSION}-macos.zip"
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" "${zip}" --clobber
+          else
+            gh release create "${RELEASE_TAG}" "${zip}" \
+              --title "DevSweep ${RELEASE_TAG}" \
+              --generate-notes
+          fi

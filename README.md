@@ -36,6 +36,8 @@ DEVSWEEP_ARCHS="arm64 x86_64" ./scripts/build_app.sh
 
 正式发布需要 Developer ID 签名和 Apple 公证。配置已验证的 `DEVSWEEP_NOTARY_PROFILE` 后，可使用 `scripts/distribute_app.sh` 生成经过公证的 `DevSweep-<version>-macos.zip`。在线更新要求 Release 资产使用这个文件名，并保留 GitHub 自动生成的 SHA-256 digest。包含在线更新功能的首个版本之前，旧安装需要手动安装一次。
 
+GitHub Actions 的 tag 发布还需要配置仓库 Secrets：`APPLE_CERTIFICATE_P12`、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_DEVELOPER_ID`、`APPLE_ID`、`APPLE_APP_SPECIFIC_PASSWORD` 和 `APPLE_TEAM_ID`。workflow 会导入 Developer ID 证书，完成签名、公证、staple 和 Release 资产上传。
+
 也可以直接在 Xcode 中打开 `Package.swift`。
 
 ## 设计依据
