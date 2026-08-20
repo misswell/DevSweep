@@ -9,6 +9,7 @@ private enum DevSweepUpdaterError: LocalizedError {
     case parentDidNotExit
     case launchFailed(Int32)
     case launchVerificationFailed
+    case rollbackFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -20,6 +21,8 @@ private enum DevSweepUpdaterError: LocalizedError {
             return "启动 DevSweep 失败，open 退出码：\(status)"
         case .launchVerificationFailed:
             return "未找到路径正确的新 DevSweep 进程"
+        case .rollbackFailed(let detail):
+            return "更新失败且回滚失败：\(detail)"
         }
     }
 }
@@ -123,6 +126,37 @@ private func launchAndVerify(_ application: URL) throws -> pid_t {
     return try waitForApplication(at: application, excluding: existingPIDs)
 }
 
+private func restoreBackup(
+    _ backup: URL,
+    to destination: URL,
+    using fileManager: FileManager
+) throws {
+    guard fileManager.fileExists(atPath: backup.path) else {
+        throw DevSweepUpdaterError.rollbackFailed("旧版本备份不存在")
+    }
+
+    do {
+        if fileManager.fileExists(atPath: destination.path) {
+            _ = try fileManager.replaceItemAt(destination, withItemAt: backup)
+        } else {
+            try fileManager.moveItem(at: backup, to: destination)
+        }
+    } catch {
+        let firstAttempt = error.localizedDescription
+        if fileManager.fileExists(atPath: destination.path) {
+            try? fileManager.removeItem(at: destination)
+        }
+
+        do {
+            try fileManager.moveItem(at: backup, to: destination)
+        } catch {
+            throw DevSweepUpdaterError.rollbackFailed(
+                "首次恢复失败：\(firstAttempt)；再次恢复失败：\(error.localizedDescription)"
+            )
+        }
+    }
+}
+
 private func install(_ arguments: UpdaterArguments) throws {
     try waitForParent(arguments.parentPID)
 
@@ -132,6 +166,7 @@ private func install(_ arguments: UpdaterArguments) throws {
     let incoming = parent.appendingPathComponent(".DevSweep-update-\(token).app", isDirectory: true)
     let backupName = ".DevSweep-backup-\(token).app"
     let backup = parent.appendingPathComponent(backupName, isDirectory: true)
+    var needsRollback = false
 
     do {
         try fileManager.copyItem(at: arguments.sourceApplication, to: incoming)
@@ -141,34 +176,44 @@ private func install(_ arguments: UpdaterArguments) throws {
             backupItemName: backupName,
             options: .withoutDeletingBackupItem
         )
+        needsRollback = true
 
         do {
             let pid = try launchAndVerify(arguments.destinationApplication)
+            needsRollback = false
             try? fileManager.removeItem(at: backup)
             appendLog(
                 "Update installed at \(arguments.destinationApplication.path); verified pid=\(pid), path=\(arguments.destinationApplication.path)",
                 to: arguments.logURL
             )
-        } catch {
-            if fileManager.fileExists(atPath: backup.path) {
-                _ = try? fileManager.replaceItemAt(
-                    arguments.destinationApplication,
-                    withItemAt: backup
+        } catch let installError {
+            do {
+                try restoreBackup(backup, to: arguments.destinationApplication, using: fileManager)
+                needsRollback = false
+            } catch {
+                throw DevSweepUpdaterError.rollbackFailed(
+                    "新版本启动失败：\(installError.localizedDescription)；回滚失败：\(error.localizedDescription)"
                 )
             }
-            throw error
+            throw installError
         }
     } catch {
         try? fileManager.removeItem(at: incoming)
-        if !fileManager.fileExists(atPath: arguments.destinationApplication.path),
-           fileManager.fileExists(atPath: backup.path) {
-            try? fileManager.moveItem(at: backup, to: arguments.destinationApplication)
+
+        if needsRollback {
+            do {
+                try restoreBackup(backup, to: arguments.destinationApplication, using: fileManager)
+                needsRollback = false
+                appendLog("Rollback restored the previous DevSweep bundle", to: arguments.logURL)
+            } catch {
+                appendLog("Rollback failed: \(error.localizedDescription)", to: arguments.logURL)
+            }
         }
 
         appendLog("Update failed: \(error.localizedDescription)", to: arguments.logURL)
         writeFailure(error, to: arguments.failureMarkerURL)
 
-        if fileManager.fileExists(atPath: arguments.destinationApplication.path) {
+        if !needsRollback && fileManager.fileExists(atPath: arguments.destinationApplication.path) {
             if let pid = try? launchAndVerify(arguments.destinationApplication) {
                 appendLog(
                     "Rolled back and relaunched old app; verified pid=\(pid), path=\(arguments.destinationApplication.path)",
@@ -177,6 +222,11 @@ private func install(_ arguments: UpdaterArguments) throws {
             } else {
                 appendLog("Rollback app could not be verified after update failure", to: arguments.logURL)
             }
+        } else if needsRollback {
+            appendLog(
+                "The destination bundle is not known to be the previous version; refusing to relaunch it",
+                to: arguments.logURL
+            )
         }
         throw error
     }
