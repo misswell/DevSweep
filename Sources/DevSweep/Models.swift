@@ -67,6 +67,13 @@ struct CacheItem: Identifiable, Hashable {
     }
 }
 
+struct CleanupSelection {
+    static func selectedItems(from items: [CacheItem], visibleItems: [CacheItem]) -> [CacheItem] {
+        let visibleIDs = Set(visibleItems.map(\.id))
+        return items.filter { visibleIDs.contains($0.id) && $0.isSelected && $0.risk != .manual }
+    }
+}
+
 struct CleanupReport {
     let removed: [CacheItem]
     let failures: [(CacheItem, String)]

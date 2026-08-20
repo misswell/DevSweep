@@ -831,9 +831,6 @@ final class DevSweepStore: ObservableObject {
         return order.filter(present.contains) + present.subtracting(order).sorted()
     }
 
-    var selectedItems: [CacheItem] { items.filter(\.isSelected) }
-    var selectedSize: Int64 { selectedItems.reduce(0) { $0 + $1.size } }
-    var selectedCount: Int { selectedItems.count }
     var totalSize: Int64 { items.reduce(0) { $0 + $1.size } }
 
     func categorySize(_ category: String?) -> Int64 {
@@ -878,6 +875,7 @@ final class DevSweepStore: ObservableObject {
 
     func setSelected(_ id: UUID, selected: Bool) {
         guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        guard items[index].risk != .manual else { return }
         items[index].isSelected = selected
     }
 
@@ -922,8 +920,8 @@ final class DevSweepStore: ObservableObject {
         persistProjectRoots()
     }
 
-    func cleanSelected() {
-        let selected = selectedItems
+    func cleanSelected(ids: Set<UUID>) {
+        let selected = items.filter { ids.contains($0.id) && $0.isSelected && $0.risk != .manual }
         guard !selected.isEmpty, !isCleaning else { return }
         isCleaning = true
         statusMessage = "正在把选中项目移入废纸篓…"

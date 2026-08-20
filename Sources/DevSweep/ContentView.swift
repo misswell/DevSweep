@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject private var store: DevSweepStore
+    @EnvironmentObject private var updater: DevSweepSoftwareUpdater
     @State private var selectedCategory = "全部"
     @State private var onlySelected = false
     @State private var onlyLarge = false
@@ -9,6 +10,7 @@ struct ContentView: View {
     @State private var showingError = false
     @State private var showingHelp = false
     @State private var showingScanDetails = false
+    @State private var pendingCleanupItems: [CacheItem] = []
 
     private let largeThreshold: Int64 = 1 * 1024 * 1024 * 1024
 
@@ -20,6 +22,14 @@ struct ContentView: View {
         }
     }
 
+    private var cleanupItems: [CacheItem] {
+        CleanupSelection.selectedItems(from: store.items, visibleItems: visibleItems)
+    }
+
+    private var cleanupSize: Int64 {
+        cleanupItems.reduce(0) { $0 + $1.size }
+    }
+
     var body: some View {
         NavigationSplitView {
             sidebar
@@ -29,6 +39,11 @@ struct ContentView: View {
         .frame(minWidth: 1_040, minHeight: 700)
         .task {
             if store.items.isEmpty { store.scan() }
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard !Task.isCancelled else { return }
+            if case .idle = updater.state {
+                await updater.checkForUpdates()
+            }
         }
         .onChange(of: store.lastError) { value in
             showingError = value != nil
@@ -43,6 +58,7 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showingHelp) {
             HelpView()
+                .environmentObject(updater)
         }
         .sheet(isPresented: $showingScanDetails) {
             if let report = store.lastReport {
@@ -141,11 +157,15 @@ struct ContentView: View {
             titleVisibility: .visible
         ) {
             Button("移入废纸篓", role: .destructive) {
-                store.cleanSelected()
+                let ids = Set(pendingCleanupItems.map(\.id))
+                pendingCleanupItems = []
+                store.cleanSelected(ids: ids)
             }
-            Button("取消", role: .cancel) {}
+            Button("取消", role: .cancel) {
+                pendingCleanupItems = []
+            }
         } message: {
-            Text("将处理 \(store.selectedCount) 项，共 \(store.selectedSize.devSweepFileSize)。运行中的模拟器、未登记目录和手动项目不会自动删除。")
+            Text("将处理 \(pendingCleanupItems.count) 项，共 \(pendingCleanupItems.reduce(0) { $0 + $1.size }.devSweepFileSize)。运行中的模拟器、未登记目录和手动项目不会自动删除。")
         }
     }
 
@@ -159,6 +179,7 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            updateButton
             Button {
                 showingHelp = true
             } label: {
@@ -178,6 +199,54 @@ struct ContentView: View {
         .padding(.vertical, 16)
     }
 
+    @ViewBuilder
+    private var updateButton: some View {
+        switch updater.state {
+        case .available(let release):
+            Button {
+                showingHelp = true
+            } label: {
+                Label("发现 \(release.version.description)", systemImage: "arrow.down.circle.fill")
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.tint)
+            .help("查看在线更新")
+        case .checking:
+            updateProgress("检查更新…")
+        case .downloading:
+            updateProgress("下载更新…")
+        case .installing:
+            updateProgress("准备安装…")
+        case .failed:
+            Button {
+                showingHelp = true
+            } label: {
+                Image(systemName: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
+            }
+            .buttonStyle(.borderless)
+            .help("查看更新失败原因")
+        case .idle, .upToDate:
+            Button {
+                Task { await updater.checkForUpdates() }
+            } label: {
+                Image(systemName: "arrow.down.circle")
+            }
+            .buttonStyle(.borderless)
+            .help("检查在线更新")
+        }
+    }
+
+    private func updateProgress(_ message: String) -> some View {
+        HStack(spacing: 6) {
+            ProgressView()
+                .controlSize(.small)
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
     private var overviewCard: some View {
         HStack(spacing: 20) {
             VStack(alignment: .leading, spacing: 8) {
@@ -192,13 +261,13 @@ struct ContentView: View {
             }
             Spacer()
             VStack(alignment: .trailing, spacing: 8) {
-                Text("当前选择")
+                Text("当前页选择")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
-                Text(store.selectedSize.devSweepFileSize)
+                Text(cleanupSize.devSweepFileSize)
                     .font(.system(size: 28, weight: .semibold, design: .rounded))
                     .foregroundStyle(.tint)
-                Text("\(store.selectedCount) 项")
+                Text("\(cleanupItems.count) 项")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -363,12 +432,13 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
             Spacer()
             Button {
+                pendingCleanupItems = cleanupItems
                 showingConfirmation = true
             } label: {
-                Label("清理选中项目", systemImage: "trash")
+                Label("清理当前页选中项目", systemImage: "trash")
             }
             .buttonStyle(.borderedProminent)
-            .disabled(store.selectedCount == 0 || store.isCleaning || store.isScanning)
+            .disabled(cleanupItems.isEmpty || store.isCleaning || store.isScanning)
         }
         .padding(.horizontal, 24)
         .padding(.vertical, 14)
@@ -592,6 +662,7 @@ private struct ScanDetailsView: View {
 
 struct HelpView: View {
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var updater: DevSweepSoftwareUpdater
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -617,6 +688,7 @@ struct HelpView: View {
                 .font(.headline)
             Text("普通缓存和 XCTest 克隆设备移入 macOS 废纸篓；CoreSimulator 设备使用 simctl 删除以保持设备注册一致。红色项目不会自动删除，橙色项目默认不勾选。")
                 .foregroundStyle(.secondary)
+            SoftwareUpdateView(updater: updater)
             Text("开源参考")
                 .font(.headline)
             Link("macOS-dev-cache-cleaner", destination: URL(string: "https://github.com/k-angama/macOS-dev-cache-cleaner")!)
@@ -624,6 +696,78 @@ struct HelpView: View {
             Spacer()
         }
         .padding(24)
-        .frame(width: 620, height: 520)
+        .frame(width: 620, height: 680)
+    }
+}
+
+private struct SoftwareUpdateView: View {
+    @ObservedObject var updater: DevSweepSoftwareUpdater
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("在线更新")
+                .font(.headline)
+            Text("从 GitHub Releases 检查经过签名和 Apple 公证的 DevSweep 版本。")
+                .foregroundStyle(.secondary)
+            Text("当前版本：\(updater.currentVersion)")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+
+            switch updater.state {
+            case .idle:
+                checkButton
+            case .checking:
+                progress("正在检查更新…")
+            case .upToDate:
+                Label("已是最新版本", systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                checkButton
+            case .available(let release):
+                Label("发现新版本 \(release.version.description)", systemImage: "arrow.down.circle.fill")
+                    .foregroundStyle(.tint)
+                if !release.releaseNotes.isEmpty {
+                    Text("更新说明")
+                        .font(.subheadline.weight(.semibold))
+                    Text(release.releaseNotes)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+                Text("安装后 DevSweep 会自动重启。仅接受经过 SHA-256、Developer ID 和 Gatekeeper 校验的安装包。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button("下载并安装") {
+                    Task { await updater.downloadAndInstall() }
+                }
+                .buttonStyle(.borderedProminent)
+            case .downloading:
+                progress("正在下载更新…")
+            case .installing:
+                progress("正在验证并准备安装…")
+            case .failed(let failure):
+                Label(failure.displayText, systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+                checkButton
+            }
+        }
+        .padding(14)
+        .background(.quaternary.opacity(0.35))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private var checkButton: some View {
+        Button("检查更新") {
+            Task { await updater.checkForUpdates() }
+        }
+        .disabled(updater.state.isBusy)
+    }
+
+    private func progress(_ message: String) -> some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .controlSize(.small)
+            Text(message)
+                .foregroundStyle(.secondary)
+        }
     }
 }
