@@ -285,7 +285,7 @@ final class DevSweepSoftwareUpdater: ObservableObject {
                 try DevSweepUpdatePackageValidator.prepare(downloadURL: downloadURL, release: release)
             }.value
             try launchInstaller(for: package)
-            NSApp.terminate(nil)
+            terminateAfterSheetsClose()
         } catch {
             state = .failed(DevSweepUpdateFailure(error))
         }
@@ -343,6 +343,16 @@ final class DevSweepSoftwareUpdater: ObservableObject {
             try? fileManager.removeItem(at: helperDirectory)
             throw error
         }
+    }
+
+    private func terminateAfterSheetsClose() {
+        guard NSApp.windows.allSatisfy({ $0.attachedSheet == nil }) else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                self?.terminateAfterSheetsClose()
+            }
+            return
+        }
+        NSApp.terminate(nil)
     }
 
     private static func consumeFailureMarker(at url: URL) -> String? {

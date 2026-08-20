@@ -702,6 +702,7 @@ struct HelpView: View {
 }
 
 private struct SoftwareUpdateView: View {
+    @Environment(\.dismiss) private var dismiss
     @ObservedObject var updater: DevSweepSoftwareUpdater
 
     var body: some View {
@@ -738,6 +739,7 @@ private struct SoftwareUpdateView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Button("下载并安装") {
+                    dismiss()
                     Task { await updater.downloadAndInstall() }
                 }
                 .buttonStyle(.borderedProminent)

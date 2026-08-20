@@ -79,12 +79,17 @@ private func writeFailure(_ error: Error, to url: URL) {
     try? Data(message.utf8).write(to: url, options: .atomic)
 }
 
-private func waitForParent(_ pid: pid_t) throws {
-    for _ in 0..<600 {
-        if kill(pid, 0) != 0 { return }
-        usleep(100_000)
+private func waitForParent(_ pid: pid_t, logURL: URL) throws {
+    switch DevSweepParentTermination.ensureExited(pid: pid) {
+    case .alreadyExited:
+        return
+    case .terminatedBySIGTERM:
+        appendLog("旧版 DevSweep 未能优雅退出，已发送 SIGTERM", to: logURL)
+    case .killedBySIGKILL:
+        appendLog("旧版 DevSweep 忽略 SIGTERM，已发送 SIGKILL", to: logURL)
+    case .stillRunning:
+        throw DevSweepUpdaterError.parentDidNotExit
     }
-    throw DevSweepUpdaterError.parentDidNotExit
 }
 
 private func normalizedPath(_ url: URL) -> String {
@@ -158,8 +163,6 @@ private func restoreBackup(
 }
 
 private func install(_ arguments: UpdaterArguments) throws {
-    try waitForParent(arguments.parentPID)
-
     let fileManager = FileManager.default
     let parent = arguments.destinationApplication.deletingLastPathComponent()
     let token = UUID().uuidString
@@ -167,8 +170,10 @@ private func install(_ arguments: UpdaterArguments) throws {
     let backupName = ".DevSweep-backup-\(token).app"
     let backup = parent.appendingPathComponent(backupName, isDirectory: true)
     var needsRollback = false
+    var replacementCompleted = false
 
     do {
+        try waitForParent(arguments.parentPID, logURL: arguments.logURL)
         try fileManager.copyItem(at: arguments.sourceApplication, to: incoming)
         _ = try fileManager.replaceItemAt(
             arguments.destinationApplication,
@@ -176,6 +181,7 @@ private func install(_ arguments: UpdaterArguments) throws {
             backupItemName: backupName,
             options: .withoutDeletingBackupItem
         )
+        replacementCompleted = true
         needsRollback = true
 
         do {
@@ -213,7 +219,7 @@ private func install(_ arguments: UpdaterArguments) throws {
         appendLog("Update failed: \(error.localizedDescription)", to: arguments.logURL)
         writeFailure(error, to: arguments.failureMarkerURL)
 
-        if !needsRollback && fileManager.fileExists(atPath: arguments.destinationApplication.path) {
+        if replacementCompleted && !needsRollback && fileManager.fileExists(atPath: arguments.destinationApplication.path) {
             if let pid = try? launchAndVerify(arguments.destinationApplication) {
                 appendLog(
                     "Rolled back and relaunched old app; verified pid=\(pid), path=\(arguments.destinationApplication.path)",
