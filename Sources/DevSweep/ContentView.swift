@@ -72,31 +72,52 @@ struct ContentView: View {
     }
 
     private var sidebar: some View {
-        List(selection: $selectedCategory) {
-            Section {
-                SidebarRow(
-                    title: "全部项目",
-                    subtitle: "所有可发现的开发者缓存",
-                    icon: "sparkles",
-                    size: store.totalSize
-                )
-                .tag("全部")
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 10) {
+                Image(systemName: "sparkles")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(.tint)
+                    .frame(width: 34, height: 34)
+                    .background(Color.accentColor.opacity(0.12))
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("DevSweep")
+                        .font(.headline.weight(.semibold))
+                    Text("开发者空间清理")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
             }
+            .padding(.horizontal, 16)
+            .padding(.top, 16)
+            .padding(.bottom, 10)
 
-            Section("分类") {
-                ForEach(store.categories, id: \.self) { category in
+            List(selection: $selectedCategory) {
+                Section {
                     SidebarRow(
-                        title: category,
-                        subtitle: categorySubtitle(category),
-                        icon: categoryIcon(category),
-                        size: store.categorySize(category)
+                        title: "全部项目",
+                        subtitle: "所有可发现的开发者缓存",
+                        icon: "sparkles",
+                        size: store.totalSize
                     )
-                    .tag(category)
+                    .tag("全部")
+                }
+
+                Section("分类") {
+                    ForEach(store.categories, id: \.self) { category in
+                        SidebarRow(
+                            title: category,
+                            subtitle: categorySubtitle(category),
+                            icon: categoryIcon(category),
+                            size: store.categorySize(category)
+                        )
+                        .tag(category)
+                    }
                 }
             }
+            .listStyle(.sidebar)
         }
-        .listStyle(.sidebar)
-        .navigationTitle("DevSweep")
         .safeAreaInset(edge: .bottom) {
             VStack(alignment: .leading, spacing: 8) {
                 Divider()
@@ -147,7 +168,11 @@ struct ContentView: View {
                         }
                     }
                 }
-                .padding(24)
+                .frame(maxWidth: 980, alignment: .leading)
+                .padding(.horizontal, 30)
+                .padding(.top, 26)
+                .padding(.bottom, 26)
+                .frame(maxWidth: .infinity)
             }
             bottomBar
         }
@@ -180,24 +205,38 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            if store.isScanning || store.isCleaning {
+                ProgressView()
+                    .controlSize(.small)
+            } else {
+                Label("\(store.items.count) 项", systemImage: "square.stack.3d.up")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(.quaternary.opacity(0.55))
+                    .clipShape(Capsule())
+            }
             updateButton
             Button {
                 showingHelp = true
             } label: {
                 Image(systemName: "questionmark.circle")
             }
-            .buttonStyle(.borderless)
+            .buttonStyle(.bordered)
             .help("查看清理范围和安全说明")
             Button {
                 store.scan()
             } label: {
                 Label("重新扫描", systemImage: "arrow.clockwise")
             }
+            .buttonStyle(.bordered)
             .disabled(store.isScanning || store.isCleaning)
             .keyboardShortcut("r", modifiers: [.command])
         }
-        .padding(.horizontal, 24)
-        .padding(.vertical, 16)
+        .controlSize(.large)
+        .padding(.horizontal, 30)
+        .padding(.vertical, 18)
     }
 
     @ViewBuilder
@@ -249,10 +288,10 @@ struct ContentView: View {
     }
 
     private var overviewCard: some View {
-        HStack(spacing: 20) {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("可回收空间")
-                    .font(.subheadline)
+        HStack(spacing: 24) {
+            VStack(alignment: .leading, spacing: 6) {
+                Label("可回收空间", systemImage: "externaldrive.badge.minus")
+                    .font(.subheadline.weight(.medium))
                     .foregroundStyle(.secondary)
                 Text(store.totalSize.devSweepFileSize)
                     .font(.system(size: 38, weight: .bold, design: .rounded))
@@ -260,20 +299,24 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Spacer()
-            VStack(alignment: .trailing, spacing: 8) {
-                Text("当前页选择")
-                    .font(.subheadline)
+            Spacer(minLength: 20)
+            Rectangle()
+                .fill(Color.primary.opacity(0.12))
+                .frame(width: 1, height: 64)
+            VStack(alignment: .trailing, spacing: 6) {
+                Label("当前选择", systemImage: "checkmark.circle")
+                    .font(.subheadline.weight(.medium))
                     .foregroundStyle(.secondary)
                 Text(cleanupSize.devSweepFileSize)
                     .font(.system(size: 28, weight: .semibold, design: .rounded))
                     .foregroundStyle(.tint)
-                Text("\(cleanupItems.count) 项")
+                Text("\(cleanupItems.count) 项待清理")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         }
-        .padding(22)
+        .padding(.horizontal, 24)
+        .padding(.vertical, 22)
         .background(
             LinearGradient(
                 colors: [Color.accentColor.opacity(0.14), Color.accentColor.opacity(0.04)],
@@ -289,25 +332,32 @@ struct ContentView: View {
     }
 
     private var projectScopeCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 12) {
                 Image(systemName: "folder.badge.gearshape")
                     .font(.title3)
                     .foregroundStyle(.orange)
-                    .frame(width: 32)
+                    .frame(width: 32, height: 32)
+                    .background(Color.orange.opacity(0.12))
+                    .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
                 VStack(alignment: .leading, spacing: 3) {
                     Text("项目生成物扫描范围")
                         .font(.subheadline.weight(.semibold))
                     Text("自动识别 target、node_modules、.build、Pods、build、dist、.next 等目录")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer()
-                Button("添加目录") {
+                Button {
                     store.chooseProjectRoots()
+                } label: {
+                    Label("添加目录", systemImage: "plus")
                 }
                 .buttonStyle(.bordered)
             }
+
+            Divider()
 
             if store.projectRoots.isEmpty {
                 Text("未配置项目根目录；仍会扫描 Home 下的固定开发者缓存")
@@ -349,9 +399,13 @@ struct ContentView: View {
             }
             .padding(.leading, 44)
         }
-        .padding(14)
-        .background(.quaternary.opacity(0.45))
+        .padding(18)
+        .background(.background)
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.primary.opacity(0.08))
+        }
     }
 
     private func scanSummaryCard(_ report: ScanReport) -> some View {
@@ -359,7 +413,9 @@ struct ContentView: View {
             Image(systemName: report.permissionFailures > 0 ? "exclamationmark.triangle" : "checkmark.seal")
                 .font(.title3)
                 .foregroundStyle(report.permissionFailures > 0 ? .orange : .green)
-                .frame(width: 32)
+                .frame(width: 32, height: 32)
+                .background((report.permissionFailures > 0 ? Color.orange : Color.green).opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
             VStack(alignment: .leading, spacing: 3) {
                 Text("扫描范围已确认")
                     .font(.subheadline.weight(.semibold))
@@ -373,14 +429,20 @@ struct ContentView: View {
                 }
             }
             Spacer()
-            Button("查看扫描详情") {
+            Button {
                 showingScanDetails = true
+            } label: {
+                Label("查看详情", systemImage: "chevron.right")
             }
             .buttonStyle(.borderless)
         }
-        .padding(14)
-        .background(.quaternary.opacity(0.3))
+        .padding(16)
+        .background(.background)
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.primary.opacity(0.08))
+        }
     }
 
     private var scanningState: some View {
@@ -405,22 +467,38 @@ struct ContentView: View {
 
     private var toolbar: some View {
         HStack(spacing: 12) {
+            Label("筛选", systemImage: "line.3.horizontal.decrease.circle")
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(.secondary)
+            Divider()
+                .frame(height: 20)
             Toggle("只看已选", isOn: $onlySelected)
                 .toggleStyle(.checkbox)
             Toggle("只看大于 1 GB", isOn: $onlyLarge)
                 .toggleStyle(.checkbox)
-            Button("全选当前分类") {
-                store.setAllSelected(true, category: selectedCategory == "全部" ? nil : selectedCategory)
-            }
-            .buttonStyle(.borderless)
-            Button("取消选择") {
-                store.setAllSelected(false, category: selectedCategory == "全部" ? nil : selectedCategory)
-            }
-            .buttonStyle(.borderless)
             Spacer()
-            Text("橙色项目删除前请确认；红色项目只提供说明")
+            Text("显示 \(visibleItems.count) 项")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            Menu {
+                Button("全选当前分类") {
+                    store.setAllSelected(true, category: selectedCategory == "全部" ? nil : selectedCategory)
+                }
+                Button("取消选择") {
+                    store.setAllSelected(false, category: selectedCategory == "全部" ? nil : selectedCategory)
+                }
+            } label: {
+                Label("选择", systemImage: "checkmark.circle")
+            }
+            .menuStyle(.borderlessButton)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(.background)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.primary.opacity(0.08))
         }
     }
 
@@ -428,9 +506,13 @@ struct ContentView: View {
         HStack {
             Image(systemName: "checkmark.shield")
                 .foregroundStyle(.green)
-            Text("清理会优先移入废纸篓，不直接永久删除")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(cleanupItems.isEmpty ? "选择项目后开始清理" : "准备清理 \(cleanupItems.count) 项")
+                    .font(.subheadline.weight(.medium))
+                Text("清理会优先移入废纸篓，不直接永久删除")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Spacer()
             Button {
                 pendingCleanupItems = cleanupItems
@@ -442,7 +524,7 @@ struct ContentView: View {
             .disabled(cleanupItems.isEmpty || store.isCleaning || store.isScanning)
         }
         .padding(.horizontal, 24)
-        .padding(.vertical, 14)
+        .padding(.vertical, 12)
         .background(.regularMaterial)
     }
 
@@ -494,7 +576,7 @@ private struct SidebarRow: View {
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
         }
-        .padding(.vertical, 3)
+        .padding(.vertical, 4)
     }
 }
 
@@ -538,17 +620,24 @@ private struct CacheItemRow: View {
                 }
             }
             Spacer(minLength: 12)
-            Text(item.size.devSweepFileSize)
-                .font(.subheadline.monospacedDigit().weight(.medium))
-                .frame(minWidth: 78, alignment: .trailing)
+            VStack(alignment: .trailing, spacing: 4) {
+                Text(item.size.devSweepFileSize)
+                    .font(.subheadline.monospacedDigit().weight(.medium))
+                Text(item.kind == .simulatorDevice ? "模拟器设备" : "缓存目录")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            .frame(minWidth: 92, alignment: .trailing)
         }
-        .padding(14)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
         .background(.background)
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .stroke(Color.primary.opacity(0.07))
         }
+        .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 
     private var icon: String {
