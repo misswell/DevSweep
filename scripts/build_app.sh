@@ -42,6 +42,7 @@ else
 fi
 
 cp "$PROJECT_DIR/Info.plist" "$APP_PATH/Contents/Info.plist"
+cp "$PROJECT_DIR/Resources/DevSweep.icns" "$APP_PATH/Contents/Resources/DevSweep.icns"
 chmod +x "$APP_PATH/Contents/MacOS/DevSweep" "$APP_PATH/Contents/MacOS/DevSweepUpdater"
 
 DEVELOPER_ID="${DEVSWEEP_DEVELOPER_ID:-}"
