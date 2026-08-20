@@ -33,6 +33,7 @@ struct ContentView: View {
     var body: some View {
         NavigationSplitView {
             sidebar
+                .navigationSplitViewColumnWidth(min: 240, ideal: 290, max: 360)
         } detail: {
             dashboard
         }
