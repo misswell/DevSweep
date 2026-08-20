@@ -2,6 +2,8 @@
 
 DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcode、Rust/Tauri、Node、SwiftPM、Cargo、Gradle、Maven、Python、Go、Flutter、VS Code、Cursor 等开发环境。
 
+当前版本：0.1.3
+
 ## 当前功能
 
 - 按 Xcode、CoreSimulator、XCTest、项目生成物、包管理器、语言工具链、JVM、IDE 分类展示占用，并按空间从大到小排列。
