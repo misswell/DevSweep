@@ -45,6 +45,8 @@ DEVSWEEP_ARCHS='arm64 x86_64' ./scripts/distribute_app.sh
 
 `scripts/build_app.sh` 默认拒绝没有 Developer ID 的构建，避免误把 ad-hoc 包上传到 Release。只有本地开发时才显式使用 `DEVSWEEP_ALLOW_ADHOC=1`；这个包不能发布或用于在线更新。发布前必须确认 `codesign` 显示 `Developer ID Application`、`spctl` 通过且 `xcrun stapler validate` 成功。在线更新要求 Release 资产使用 `DevSweep-<version>-macos.zip` 文件名，并保留 GitHub 自动生成的 SHA-256 digest。包含在线更新功能的首个版本之前，旧安装需要手动安装一次。
 
+正式 Release 使用 `.github/workflows/release.yml` 在 GitHub Actions 上完成，不依赖发布电脑的钥匙串。该 workflow 复用现有项目的仓库 Secrets：`APPLE_CERTIFICATE_P12`、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_ID`、`APPLE_APP_SPECIFIC_PASSWORD`、`APPLE_DEVELOPER_ID` 和 `APPLE_TEAM_ID`。推送符合版本格式的 tag 后，Actions 会自动测试、签名、公证、装订票据、校验并创建 Release。
+
 也可以直接在 Xcode 中打开 `Package.swift`。
 
 ## 设计依据

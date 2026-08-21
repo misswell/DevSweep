@@ -1,0 +1,131 @@
+name: Release DevSweep
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Version tag to build and publish"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+
+jobs:
+  release:
+    name: Build, notarize, and publish
+    runs-on: macos-15
+
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.release_tag || github.ref }}
+
+      - name: Validate release credentials
+        shell: bash
+        env:
+          CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          [[ -n "$CERTIFICATE_P12" ]] || { echo "APPLE_CERTIFICATE_P12 is missing"; exit 1; }
+          [[ -n "$CERTIFICATE_PASSWORD" ]] || { echo "APPLE_CERTIFICATE_PASSWORD is missing"; exit 1; }
+          [[ -n "$APPLE_ID" ]] || { echo "APPLE_ID is missing"; exit 1; }
+          [[ -n "$APPLE_PASSWORD" ]] || { echo "APPLE_APP_SPECIFIC_PASSWORD is missing"; exit 1; }
+          [[ -n "$DEVELOPER_ID" ]] || { echo "APPLE_DEVELOPER_ID is missing"; exit 1; }
+          [[ -n "$TEAM_ID" ]] || { echo "APPLE_TEAM_ID is missing"; exit 1; }
+
+      - name: Validate tag and app version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release tag: $RELEASE_TAG"
+            exit 1
+          fi
+
+          version=$(/usr/libexec/PlistBuddy \
+            -c 'Print :CFBundleShortVersionString' Info.plist)
+
+          if [[ "${RELEASE_TAG#v}" != "$version" ]]; then
+            echo "Tag version does not match Info.plist"
+            echo "tag=$RELEASE_TAG plist=$version"
+            exit 1
+          fi
+
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Run tests
+        run: swift test
+
+      - name: Import Developer ID certificate
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
+      - name: Build, sign, notarize, and staple
+        shell: bash
+        env:
+          DEVSWEEP_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+          DEVSWEEP_DEVELOPER_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          DEVSWEEP_APPLE_ID: ${{ secrets.APPLE_ID }}
+          DEVSWEEP_APPLE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          DEVSWEEP_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          export DEVSWEEP_OUTPUT_DIR="$RUNNER_TEMP/devsweep-release"
+          mkdir -p "$DEVSWEEP_OUTPUT_DIR"
+          echo "DEVSWEEP_OUTPUT_DIR=$DEVSWEEP_OUTPUT_DIR" >> "$GITHUB_ENV"
+
+          DEVSWEEP_ARCHS="arm64 x86_64" ./scripts/distribute_app.sh
+
+      - name: Verify final release package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          zip_path="$DEVSWEEP_OUTPUT_DIR/DevSweep-$RELEASE_VERSION-macos.zip"
+          test -f "$zip_path"
+          codesign --verify --deep --strict DevSweep.app
+          spctl --assess --type execute --verbose DevSweep.app
+          xcrun stapler validate DevSweep.app
+          shasum -a 256 "$zip_path"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          zip_path="$DEVSWEEP_OUTPUT_DIR/DevSweep-$RELEASE_VERSION-macos.zip"
+
+          if gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" \
+              "$zip_path" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              "$zip_path" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "DevSweep $RELEASE_TAG" \
+              --generate-notes
+          fi
