@@ -72,6 +72,11 @@ struct CleanupSelection {
         let visibleIDs = Set(visibleItems.map(\.id))
         return items.filter { visibleIDs.contains($0.id) && $0.isSelected && $0.risk != .manual }
     }
+
+    static func remainingItems(from items: [CacheItem], removing removedItems: [CacheItem]) -> [CacheItem] {
+        let removedIDs = Set(removedItems.map(\.id))
+        return items.filter { !removedIDs.contains($0.id) }
+    }
 }
 
 struct CleanupReport {

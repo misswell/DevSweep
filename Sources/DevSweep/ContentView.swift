@@ -30,6 +30,10 @@ struct ContentView: View {
         cleanupItems.reduce(0) { $0 + $1.size }
     }
 
+    private var hasScanReport: Bool {
+        store.lastReport != nil
+    }
+
     var body: some View {
         NavigationSplitView {
             sidebar
@@ -39,7 +43,6 @@ struct ContentView: View {
         }
         .frame(minWidth: 1_040, minHeight: 700)
         .task {
-            if store.items.isEmpty { store.scan() }
             try? await Task.sleep(nanoseconds: 2_000_000_000)
             guard !Task.isCancelled else { return }
             if case .idle = updater.state {
@@ -48,9 +51,6 @@ struct ContentView: View {
         }
         .onChange(of: store.lastError) { value in
             showingError = value != nil
-        }
-        .onChange(of: store.deepScan) { _ in
-            if !store.isScanning { store.scan() }
         }
         .alert("部分项目未能清理", isPresented: $showingError) {
             Button("知道了") { store.clearError() }
@@ -159,7 +159,11 @@ struct ContentView: View {
                     if store.isScanning {
                         scanningState
                     } else if visibleItems.isEmpty {
-                        EmptyStateView(selectedCategory: selectedCategory, onlyLarge: onlyLarge)
+                        EmptyStateView(
+                            selectedCategory: selectedCategory,
+                            onlyLarge: onlyLarge,
+                            hasScanReport: hasScanReport
+                        )
                     } else {
                         LazyVStack(spacing: 10) {
                             ForEach(visibleItems) { item in
@@ -228,11 +232,13 @@ struct ContentView: View {
             Button {
                 store.scan()
             } label: {
-                Label("重新扫描", systemImage: "arrow.clockwise")
+                Label(
+                    hasScanReport ? "重新扫描" : "开始扫描",
+                    systemImage: hasScanReport ? "arrow.clockwise" : "play.fill"
+                )
             }
             .buttonStyle(.bordered)
             .disabled(store.isScanning || store.isCleaning)
-            .keyboardShortcut("r", modifiers: [.command])
         }
         .controlSize(.large)
         .padding(.horizontal, 30)
@@ -295,7 +301,11 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                 Text(store.totalSize.devSweepFileSize)
                     .font(.system(size: 38, weight: .bold, design: .rounded))
-                Text("扫描到 \(store.items.count) 个缓存或生成物，按占用从大到小排列")
+                Text(
+                    !hasScanReport
+                        ? "点击“开始扫描”查找可清理的开发者缓存和生成物"
+                        : "扫描到 \(store.items.count) 个缓存或生成物，按占用从大到小排列"
+                )
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -419,7 +429,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text("扫描范围已确认")
                     .font(.subheadline.weight(.semibold))
-                Text("检查 \(report.checkedPaths) 个路径，命中 \(report.items.count) 项，跳过 \(report.skippedPaths) 个路径")
+                Text("本次扫描检查 \(report.checkedPaths) 个路径，命中 \(report.items.count) 项，跳过 \(report.skippedPaths) 个路径")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if report.permissionFailures > 0 {
@@ -668,20 +678,31 @@ private struct RiskBadge: View {
 private struct EmptyStateView: View {
     let selectedCategory: String
     let onlyLarge: Bool
+    let hasScanReport: Bool
 
     var body: some View {
         VStack(spacing: 12) {
             Image(systemName: "checkmark.circle")
                 .font(.system(size: 42))
                 .foregroundStyle(.green)
-            Text(selectedCategory == "全部" ? "没有发现符合条件的项目" : "这个分类目前很干净")
+            Text(title)
                 .font(.headline)
-            Text(onlyLarge ? "当前筛选只显示大于 1 GB 的项目，可以关闭筛选查看较小缓存。" : "可以重新扫描，或添加一个项目根目录来查找嵌套生成物。")
+            Text(message)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity, minHeight: 220)
+    }
+
+    private var title: String {
+        guard hasScanReport else { return "准备开始扫描" }
+        return selectedCategory == "全部" ? "没有发现符合条件的项目" : "这个分类目前很干净"
+    }
+
+    private var message: String {
+        guard hasScanReport else { return "点击右上角“开始扫描”，扫描完成后这里会显示可清理项目。" }
+        return onlyLarge ? "当前筛选只显示大于 1 GB 的项目，可以关闭筛选查看较小缓存。" : "可以重新扫描，或添加一个项目根目录来查找嵌套生成物。"
     }
 }
 

@@ -898,7 +898,6 @@ final class DevSweepStore: ObservableObject {
             guard response == .OK else { return }
             Task { @MainActor in
                 self?.addProjectRoots(panel.urls)
-                self?.scan()
             }
         }
     }
@@ -906,13 +905,11 @@ final class DevSweepStore: ObservableObject {
     func removeProjectRoot(_ root: URL) {
         projectRoots.removeAll { $0.standardizedFileURL.path == root.standardizedFileURL.path }
         persistProjectRoots()
-        scan()
     }
 
     func restoreDefaultProjectRoots() {
         projectRoots = Self.defaultProjectRoots(home: FileManager.default.homeDirectoryForCurrentUser)
         persistProjectRoots()
-        scan()
     }
 
     func addProjectRoots(_ roots: [URL]) {
@@ -930,6 +927,8 @@ final class DevSweepStore: ObservableObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isCleaning = false
+                let remainingItems = CleanupSelection.remainingItems(from: self.items, removing: report.removed)
+                self.items = remainingItems
                 if report.failures.isEmpty {
                     self.statusMessage = "已处理 \(report.removed.count) 项，文件可从废纸篓恢复"
                 } else {
@@ -937,7 +936,6 @@ final class DevSweepStore: ObservableObject {
                     self.lastError = "部分项目未能清理：\n\(details)"
                     self.statusMessage = "已处理 \(report.removed.count) 项，\(report.failures.count) 项失败"
                 }
-                self.scan()
             }
         }
     }

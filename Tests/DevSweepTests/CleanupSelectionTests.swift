@@ -99,4 +99,32 @@ final class CleanupSelectionTests: XCTestCase {
 
         XCTAssertEqual(selected.map(\.id), [visibleLargeItem.id])
     }
+
+    func testRemainingItemsRemovesOnlySuccessfullyCleanedItems() {
+        let removedItem = CacheItem(
+            category: "Xcode",
+            name: "removed",
+            path: URL(fileURLWithPath: "/tmp/removed"),
+            size: 1
+        )
+        let failedItem = CacheItem(
+            category: "Xcode",
+            name: "failed",
+            path: URL(fileURLWithPath: "/tmp/failed"),
+            size: 2
+        )
+        let untouchedItem = CacheItem(
+            category: "Node.js 项目",
+            name: "untouched",
+            path: URL(fileURLWithPath: "/tmp/untouched"),
+            size: 3
+        )
+
+        let remaining = CleanupSelection.remainingItems(
+            from: [removedItem, failedItem, untouchedItem],
+            removing: [removedItem]
+        )
+
+        XCTAssertEqual(remaining.map(\.id), [failedItem.id, untouchedItem.id])
+    }
 }
