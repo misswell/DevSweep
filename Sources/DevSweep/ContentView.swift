@@ -510,8 +510,11 @@ struct ContentView: View {
             Text("显示 \(visibleItems.count) 项")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            if !selectedVisibleItems.isEmpty {
-                Menu {
+            Menu {
+                if selectedVisibleItems.isEmpty {
+                    Button("请先勾选项目") {}
+                        .disabled(true)
+                } else {
                     Button {
                         store.addToWhitelist(selectedVisibleItems)
                     } label: {
@@ -535,12 +538,15 @@ struct ContentView: View {
                         )
                     }
                     .disabled(store.isScanning || store.isCleaning)
-                } label: {
-                    Label("操作 \(selectedVisibleItems.count) 项", systemImage: "ellipsis.circle")
                 }
-                .menuStyle(.borderlessButton)
-                .help("对当前勾选的目录执行操作")
+            } label: {
+                Label(
+                    selectedVisibleItems.isEmpty ? "操作" : "操作 \(selectedVisibleItems.count) 项",
+                    systemImage: "ellipsis.circle"
+                )
             }
+            .menuStyle(.borderlessButton)
+            .help(selectedVisibleItems.isEmpty ? "请先勾选目录" : "对当前勾选的目录执行操作")
             Menu {
                 Button("全选当前分类") {
                     store.setAllSelected(true, category: selectedCategory == "全部" ? nil : selectedCategory)
@@ -715,6 +721,24 @@ private struct CacheItemRow: View {
                     .foregroundStyle(.tertiary)
             }
             .frame(minWidth: 92, alignment: .trailing)
+            Button {
+                store.addToWhitelist([item])
+            } label: {
+                Image(systemName: "checkmark.shield")
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.green)
+            .help("加入白名单")
+            .disabled(store.isScanning || store.isCleaning)
+            Button {
+                NSWorkspace.shared.open(item.path)
+            } label: {
+                Image(systemName: "folder")
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+            .help("打开文件夹")
+            .disabled(item.kind == .dockerPrune || store.isScanning || store.isCleaning)
             Button {
                 onClean(item)
             } label: {
