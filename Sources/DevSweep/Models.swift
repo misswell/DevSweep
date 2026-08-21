@@ -4,6 +4,98 @@ import SwiftUI
 enum CleanupKind: String {
     case trash
     case simulatorDevice
+    case dockerPrune
+}
+
+enum DockerCleanupTarget: String, CaseIterable, Equatable, Sendable {
+    case images
+    case containers
+    case volumes
+    case buildCache
+
+    init?(dockerType: String) {
+        switch dockerType {
+        case "Images": self = .images
+        case "Containers": self = .containers
+        case "Local Volumes": self = .volumes
+        case "Build Cache": self = .buildCache
+        default: return nil
+        }
+    }
+
+    var dockerType: String {
+        switch self {
+        case .images: return "Images"
+        case .containers: return "Containers"
+        case .volumes: return "Local Volumes"
+        case .buildCache: return "Build Cache"
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .images: return "未使用镜像"
+        case .containers: return "已停止容器"
+        case .volumes: return "未使用卷"
+        case .buildCache: return "Build Cache"
+        }
+    }
+
+    var arguments: [String] {
+        switch self {
+        case .images: return ["image", "prune", "--all", "--force"]
+        case .containers: return ["container", "prune", "--force"]
+        case .volumes: return ["volume", "prune", "--all", "--force"]
+        case .buildCache: return ["builder", "prune", "--all", "--force"]
+        }
+    }
+
+    var note: String {
+        switch self {
+        case .images:
+            return "通过 Docker 官方 CLI 删除未被容器使用的镜像；镜像需要时可重新拉取，不能从废纸篓恢复"
+        case .containers:
+            return "通过 Docker 官方 CLI 删除已停止容器及其可写层；不能从废纸篓恢复"
+        case .volumes:
+            return "未使用卷可能包含持久化开发数据；仅在确认内容后执行，不能从废纸篓恢复"
+        case .buildCache:
+            return "通过 Docker 官方 CLI 删除构建缓存；下次构建会重新执行，不能从废纸篓恢复"
+        }
+    }
+}
+
+enum DockerReclaimableSize {
+    static func bytes(from value: String) -> Int64? {
+        let sizeText = value.split(separator: "(", maxSplits: 1, omittingEmptySubsequences: true).first?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !sizeText.isEmpty else { return nil }
+
+        let numberEnd = sizeText.firstIndex { character in
+            !character.isNumber && character != "." && character != ","
+        } ?? sizeText.endIndex
+        let numberText = String(sizeText[..<numberEnd]).replacingOccurrences(of: ",", with: "")
+        guard let number = Double(numberText) else { return nil }
+
+        let unit = String(sizeText[numberEnd...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let multiplier: Double
+        switch unit {
+        case "b": multiplier = 1
+        case "kb": multiplier = 1_000
+        case "mb": multiplier = 1_000_000
+        case "gb": multiplier = 1_000_000_000
+        case "tb": multiplier = 1_000_000_000_000
+        case "kib": multiplier = 1_024
+        case "mib": multiplier = 1_048_576
+        case "gib": multiplier = 1_073_741_824
+        case "tib": multiplier = 1_099_511_627_776
+        default: return nil
+        }
+        guard number >= 0,
+              number <= Double(Int64.max) / multiplier else { return nil }
+        return Int64(number * multiplier)
+    }
 }
 
 enum RiskLevel: String, CaseIterable {

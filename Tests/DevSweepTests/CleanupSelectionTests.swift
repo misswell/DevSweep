@@ -127,4 +127,29 @@ final class CleanupSelectionTests: XCTestCase {
 
         XCTAssertEqual(remaining.map(\.id), [failedItem.id, untouchedItem.id])
     }
+
+    func testScannerDoesNotReturnOverlappingParentAndChildItems() {
+        let parent = CacheItem(
+            category: "其他开发缓存",
+            name: "cache",
+            path: URL(fileURLWithPath: "/tmp/devsweep-cache"),
+            size: 100
+        )
+        let child = CacheItem(
+            category: "Python 项目",
+            name: "pip",
+            path: URL(fileURLWithPath: "/tmp/devsweep-cache/pip"),
+            size: 50
+        )
+        let sibling = CacheItem(
+            category: "Xcode",
+            name: "DerivedData",
+            path: URL(fileURLWithPath: "/tmp/devsweep-derived-data"),
+            size: 25
+        )
+
+        let normalized = CacheScanner.nonOverlappingItems([child, sibling, parent])
+
+        XCTAssertEqual(normalized.map(\.path), [parent.path, sibling.path])
+    }
 }

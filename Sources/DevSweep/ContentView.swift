@@ -30,6 +30,14 @@ struct ContentView: View {
         cleanupItems.reduce(0) { $0 + $1.size }
     }
 
+    private var cleanupIncludesDocker: Bool {
+        cleanupItems.contains { $0.kind == .dockerPrune }
+    }
+
+    private var pendingCleanupIncludesDocker: Bool {
+        pendingCleanupItems.contains { $0.kind == .dockerPrune }
+    }
+
     private var hasScanReport: Bool {
         store.lastReport != nil
     }
@@ -186,7 +194,7 @@ struct ContentView: View {
             isPresented: $showingConfirmation,
             titleVisibility: .visible
         ) {
-            Button("移入废纸篓", role: .destructive) {
+            Button(pendingCleanupIncludesDocker ? "执行清理" : "移入废纸篓", role: .destructive) {
                 let ids = Set(pendingCleanupItems.map(\.id))
                 pendingCleanupItems = []
                 store.cleanSelected(ids: ids)
@@ -195,7 +203,11 @@ struct ContentView: View {
                 pendingCleanupItems = []
             }
         } message: {
-            Text("将处理 \(pendingCleanupItems.count) 项，共 \(pendingCleanupItems.reduce(0) { $0 + $1.size }.devSweepFileSize)。运行中的模拟器、未登记目录和手动项目不会自动删除。")
+            Text(
+                pendingCleanupIncludesDocker
+                    ? "将处理 \(pendingCleanupItems.count) 项，共 \(pendingCleanupItems.reduce(0) { $0 + $1.size }.devSweepFileSize)。Docker 资源会通过官方 CLI 直接清理，不能从废纸篓恢复；普通目录会移入废纸篓。"
+                    : "将处理 \(pendingCleanupItems.count) 项，共 \(pendingCleanupItems.reduce(0) { $0 + $1.size }.devSweepFileSize)。运行中的模拟器、未登记目录和手动项目不会自动删除。"
+            )
         }
     }
 
@@ -519,7 +531,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(cleanupItems.isEmpty ? "选择项目后开始清理" : "准备清理 \(cleanupItems.count) 项")
                     .font(.subheadline.weight(.medium))
-                Text("清理会优先移入废纸篓，不直接永久删除")
+                Text(cleanupIncludesDocker ? "包含 Docker 资源，执行后不可从废纸篓恢复" : "清理会优先移入废纸篓，不直接永久删除")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -555,6 +567,8 @@ struct ContentView: View {
         case "测试产物": return "checkmark.seal"
         case "包管理器": return "shippingbox.fill"
         case "语言工具链": return "chevron.left.forwardslash.chevron.right"
+        case "AI/ML": return "brain"
+        case "Docker": return "shippingbox"
         case "JVM": return "cup.and.saucer"
         case "IDE", "Android Studio": return "text.cursor"
         case "设计工具": return "paintbrush"
@@ -633,7 +647,7 @@ private struct CacheItemRow: View {
             VStack(alignment: .trailing, spacing: 4) {
                 Text(item.size.devSweepFileSize)
                     .font(.subheadline.monospacedDigit().weight(.medium))
-                Text(item.kind == .simulatorDevice ? "模拟器设备" : "缓存目录")
+                Text(item.kind == .simulatorDevice ? "模拟器设备" : item.kind == .dockerPrune ? "Docker 资源" : "缓存目录")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
@@ -653,6 +667,7 @@ private struct CacheItemRow: View {
     private var icon: String {
         switch item.kind {
         case .simulatorDevice: return "iphone.gen3"
+        case .dockerPrune: return "shippingbox"
         case .trash:
             if item.category.contains("Xcode") || item.category == "XCTest" { return "hammer" }
             if item.category.contains("项目") { return "folder.badge.gearshape" }
@@ -797,7 +812,7 @@ struct HelpView: View {
                 .foregroundStyle(.secondary)
             Text("清理方式")
                 .font(.headline)
-            Text("普通缓存和 XCTest 克隆设备移入 macOS 废纸篓；CoreSimulator 设备使用 simctl 删除以保持设备注册一致。红色项目不会自动删除，橙色项目默认不勾选。")
+            Text("普通缓存和 XCTest 克隆设备移入 macOS 废纸篓；CoreSimulator 设备使用 simctl 删除以保持设备注册一致；Docker 资源使用官方 CLI 清理且不可恢复。红色项目不会自动删除，橙色项目默认不勾选。")
                 .foregroundStyle(.secondary)
             SoftwareUpdateView(updater: updater)
             Text("开源参考")
@@ -812,7 +827,6 @@ struct HelpView: View {
 }
 
 private struct SoftwareUpdateView: View {
-    @Environment(\.dismiss) private var dismiss
     @ObservedObject var updater: DevSweepSoftwareUpdater
 
     var body: some View {
@@ -849,7 +863,6 @@ private struct SoftwareUpdateView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Button("下载并安装") {
-                    dismiss()
                     Task { await updater.downloadAndInstall() }
                 }
                 .buttonStyle(.borderedProminent)

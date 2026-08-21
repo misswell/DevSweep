@@ -16,10 +16,59 @@ private struct GeneratedRule {
     let note: String
 }
 
-private struct ProcessOutput {
+fileprivate struct ProcessOutput {
     let status: Int32
     let stdout: Data
     let stderr: Data
+}
+
+fileprivate enum DockerSupport {
+    static func executableURL() -> URL? {
+        let pathEntries = ProcessInfo.processInfo.environment["PATH"]?
+            .split(separator: ":")
+            .map { String($0) } ?? []
+        let candidates = pathEntries.map { URL(fileURLWithPath: $0).appendingPathComponent("docker") } + [
+            URL(fileURLWithPath: "/opt/homebrew/bin/docker"),
+            URL(fileURLWithPath: "/usr/local/bin/docker"),
+            URL(fileURLWithPath: "/Applications/Docker.app/Contents/Resources/bin/docker")
+        ]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
+    }
+
+    static func run(arguments: [String]) -> ProcessOutput? {
+        guard let executable = executableURL() else { return nil }
+        guard isLocalContext(executable: executable) else { return nil }
+        return CacheScanner.run(executable: executable.path, arguments: arguments)
+    }
+
+    private static func isLocalContext(executable: URL) -> Bool {
+        if let configuredHost = ProcessInfo.processInfo.environment["DOCKER_HOST"],
+           !configuredHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return isLocalEndpoint(configuredHost)
+        }
+
+        guard let output = CacheScanner.run(
+            executable: executable.path,
+            arguments: ["context", "inspect", "--format", "{{.Endpoints.docker.Host}}"]
+        ),
+        output.status == 0,
+        let text = String(data: output.stdout, encoding: .utf8) else {
+            return false
+        }
+
+        let endpoints = text
+            .split(whereSeparator: \.isNewline)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        return !endpoints.isEmpty && endpoints.allSatisfy(isLocalEndpoint)
+    }
+
+    private static func isLocalEndpoint(_ value: String) -> Bool {
+        let endpoint = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if endpoint.hasPrefix("unix://") { return true }
+        guard let url = URL(string: endpoint), url.scheme?.lowercased() == "tcp" else { return false }
+        return ["localhost", "127.0.0.1", "::1"].contains(url.host?.lowercased() ?? "")
+    }
 }
 
 private struct ScanCollector {
@@ -70,6 +119,15 @@ struct CacheScanner {
         items += dynamicItems(home: home, collector: &collector, progress: progress)
 
         progress(ScanProgress(
+            phase: "检查 Docker 容器资源",
+            checkedPaths: collector.checkedPaths,
+            matchedPaths: items.count,
+            skippedPaths: collector.skippedPaths,
+            permissionFailures: collector.permissionFailures
+        ))
+        items += dockerItems(home: home, collector: &collector, progress: progress)
+
+        progress(ScanProgress(
             phase: "检查模拟器和 XCTest 设备",
             checkedPaths: collector.checkedPaths,
             matchedPaths: items.count,
@@ -96,16 +154,11 @@ struct CacheScanner {
             )
         }
 
-        var seenPaths = Set<String>()
-        let uniqueItems = items.filter { item in
-            let key = item.path.standardizedFileURL.path
-            guard seenPaths.insert(key).inserted else { return false }
-            return true
-        }
-        .filter { $0.size >= minimumItemSize }
-        .sorted {
-            if $0.size == $1.size { return $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-            return $0.size > $1.size
+        let uniqueItems = nonOverlappingItems(items)
+            .filter { $0.size >= minimumItemSize }
+            .sorted {
+                if $0.size == $1.size { return $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+                return $0.size > $1.size
         }
 
         let finalProgress = ScanProgress(
@@ -127,6 +180,35 @@ struct CacheScanner {
             diagnostics: collector.diagnostics,
             duration: Date().timeIntervalSince(startedAt)
         )
+    }
+
+    static func nonOverlappingItems(_ items: [CacheItem]) -> [CacheItem] {
+        var kept: [CacheItem] = []
+        let candidates = items.enumerated()
+            .sorted {
+                let leftDepth = $0.element.path.standardizedFileURL.pathComponents.count
+                let rightDepth = $1.element.path.standardizedFileURL.pathComponents.count
+                if leftDepth == rightDepth {
+                    let leftPath = $0.element.path.standardizedFileURL.path
+                    let rightPath = $1.element.path.standardizedFileURL.path
+                    if leftPath == rightPath { return $0.offset < $1.offset }
+                    return leftPath < rightPath
+                }
+                return leftDepth < rightDepth
+            }
+            .map(\.element)
+
+        for item in candidates {
+            let itemPath = item.path.standardizedFileURL.path
+            let isCovered = kept.contains { existing in
+                let existingPath = existing.path.standardizedFileURL.path
+                return itemPath == existingPath || itemPath.hasPrefix(existingPath + "/")
+            }
+            if !isCovered {
+                kept.append(item)
+            }
+        }
+        return kept
     }
 
     static func size(of url: URL) -> Int64 {
@@ -182,20 +264,43 @@ struct CacheScanner {
             CacheRule(category: "包管理器", name: "pnpm store", relativePath: "Library/pnpm/store", risk: .safe, note: "pnpm 会重新下载依赖"),
             CacheRule(category: "包管理器", name: "pnpm store（Linux 兼容路径）", relativePath: ".local/share/pnpm/store", risk: .safe, note: "pnpm 会重新下载依赖"),
             CacheRule(category: "包管理器", name: "Bun", relativePath: ".bun/install/cache", risk: .safe, note: "Bun 会重新下载依赖"),
+            CacheRule(category: "包管理器", name: "Deno", relativePath: "Library/Caches/deno", risk: .safe, note: "Deno 会重新下载依赖和工具"),
+            CacheRule(category: "包管理器", name: "Deno（旧缓存）", relativePath: ".cache/deno", risk: .safe, note: "Deno 会重新下载依赖和工具"),
+            CacheRule(category: "包管理器", name: "Node.js 通用缓存", relativePath: ".cache/node", risk: .safe, note: "Node.js 工具会自动重建缓存"),
+            CacheRule(category: "包管理器", name: "Corepack", relativePath: "Library/Caches/node/corepack", risk: .safe, note: "Corepack 会重新下载包管理器"),
+            CacheRule(category: "包管理器", name: "Playwright 浏览器缓存", relativePath: "Library/Caches/ms-playwright", risk: .review, note: "Playwright 会重新下载浏览器，确认不再需要对应版本后清理"),
+            CacheRule(category: "包管理器", name: "Puppeteer 浏览器缓存", relativePath: "Library/Caches/puppeteer", risk: .review, note: "Puppeteer 会重新下载浏览器，确认不再需要对应版本后清理"),
             CacheRule(category: "包管理器", name: "CocoaPods", relativePath: "Library/Caches/CocoaPods", risk: .safe, note: "Pods 会重新下载"),
             CacheRule(category: "包管理器", name: "Homebrew 下载缓存", relativePath: "Library/Caches/Homebrew", risk: .safe, note: "Homebrew 会重新下载包"),
             CacheRule(category: "包管理器", name: "SwiftPM 下载缓存", relativePath: "Library/Caches/org.swift.swiftpm", risk: .safe, note: "SwiftPM 会重新解析依赖"),
             CacheRule(category: "包管理器", name: "Composer", relativePath: "Library/Caches/composer", risk: .safe, note: "Composer 会重新下载依赖"),
+            CacheRule(category: "包管理器", name: "NuGet 全局包缓存", relativePath: ".nuget/packages", risk: .safe, note: "NuGet 会重新下载包"),
 
             CacheRule(category: "语言工具链", name: "Cargo registry cache", relativePath: ".cargo/registry/cache", risk: .safe, note: "Cargo 会重新下载 crate"),
+            CacheRule(category: "语言工具链", name: "Cargo registry index", relativePath: ".cargo/registry/index", risk: .safe, note: "Cargo 会重新获取 registry 索引"),
             CacheRule(category: "语言工具链", name: "Cargo registry source", relativePath: ".cargo/registry/src", risk: .safe, note: "Cargo 会重新下载 crate 源码"),
             CacheRule(category: "语言工具链", name: "Cargo git checkout", relativePath: ".cargo/git/checkouts", risk: .safe, note: "Cargo 会重新检出依赖"),
             CacheRule(category: "语言工具链", name: "Cargo git database", relativePath: ".cargo/git/db", risk: .safe, note: "Cargo 会重新获取依赖"),
+            CacheRule(category: "语言工具链", name: "rustup 下载缓存", relativePath: ".rustup/downloads", risk: .safe, note: "rustup 会重新下载工具链安装包"),
+            CacheRule(category: "语言工具链", name: "rustup 临时缓存", relativePath: ".rustup/tmp", risk: .safe, note: "rustup 会重新创建临时文件"),
             CacheRule(category: "语言工具链", name: "pip", relativePath: "Library/Caches/pip", risk: .safe, note: "pip 会重新下载 wheel"),
             CacheRule(category: "语言工具链", name: "pip（旧缓存）", relativePath: ".cache/pip", risk: .safe, note: "pip 会重新下载 wheel"),
             CacheRule(category: "语言工具链", name: "uv", relativePath: "Library/Caches/uv", risk: .safe, note: "uv 会重新下载包"),
             CacheRule(category: "语言工具链", name: "uv（旧缓存）", relativePath: ".cache/uv", risk: .safe, note: "uv 会重新下载包"),
             CacheRule(category: "语言工具链", name: "Poetry", relativePath: "Library/Caches/pypoetry", risk: .safe, note: "Poetry 会重新下载包"),
+            CacheRule(category: "AI/ML", name: "Hugging Face 模型缓存", relativePath: ".cache/huggingface", risk: .review, note: "模型会重新下载；请确认不再需要这些模型"),
+            CacheRule(category: "AI/ML", name: "PyTorch 缓存", relativePath: ".cache/torch", risk: .review, note: "PyTorch 模型和数据会重新下载；请确认后清理"),
+            CacheRule(category: "AI/ML", name: "Whisper 缓存", relativePath: ".cache/whisper", risk: .review, note: "Whisper 模型会重新下载；请确认后清理"),
+            CacheRule(category: "AI/ML", name: "Keras 缓存", relativePath: ".keras", risk: .review, note: "Keras 模型会重新下载；请确认后清理"),
+            CacheRule(category: "AI/ML", name: "TensorFlow Hub 缓存", relativePath: ".cache/tfhub_modules", risk: .review, note: "TensorFlow Hub 模型会重新下载；请确认后清理"),
+            CacheRule(category: "AI/ML", name: "Ollama 模型", relativePath: ".ollama/models", risk: .review, note: "Ollama 模型会重新下载；请确认不再需要本地模型"),
+            CacheRule(category: "AI/ML", name: "LM Studio 模型缓存", relativePath: ".cache/lm-studio", risk: .review, note: "LM Studio 模型会重新下载；请确认不再需要本地模型"),
+            CacheRule(category: "AI/ML", name: "LM Studio 模型（应用目录）", relativePath: "Library/Application Support/LM Studio/models", risk: .review, note: "LM Studio 模型会重新下载；请确认不再需要本地模型"),
+            CacheRule(category: "AI/ML", name: "Ollama 日志", relativePath: "Library/Logs/Ollama", risk: .safe, note: "Ollama 会重新生成日志"),
+            CacheRule(category: "语言工具链", name: "Conda 包缓存", relativePath: ".conda/pkgs", risk: .safe, note: "Conda 会重新下载包"),
+            CacheRule(category: "语言工具链", name: "Miniconda 包缓存", relativePath: "miniconda3/pkgs", risk: .safe, note: "Conda 会重新下载包"),
+            CacheRule(category: "语言工具链", name: "Miniforge 包缓存", relativePath: "miniforge3/pkgs", risk: .safe, note: "Conda 会重新下载包"),
+            CacheRule(category: "语言工具链", name: "Anaconda 包缓存", relativePath: "anaconda3/pkgs", risk: .safe, note: "Conda 会重新下载包"),
             CacheRule(category: "语言工具链", name: "Go build cache", relativePath: "Library/Caches/go-build", risk: .safe, note: "Go 会重新编译"),
             CacheRule(category: "语言工具链", name: "Go modules", relativePath: "go/pkg/mod", risk: .review, note: "删除后 Go 项目需要重新下载模块"),
             CacheRule(category: "语言工具链", name: "Flutter / Dart", relativePath: ".pub-cache", risk: .safe, note: "Pub 会重新下载依赖"),
@@ -204,6 +309,24 @@ struct CacheScanner {
             CacheRule(category: "JVM", name: "Gradle wrapper distributions", relativePath: ".gradle/wrapper/dists", risk: .safe, note: "Gradle wrapper 会重新下载发行版"),
             CacheRule(category: "JVM", name: "Gradle daemon", relativePath: ".gradle/daemon", risk: .review, note: "建议停止 Gradle 构建后清理"),
             CacheRule(category: "JVM", name: "Maven repository", relativePath: ".m2/repository", risk: .review, note: "Maven 会重新下载依赖"),
+            CacheRule(category: "JVM", name: "Maven wrapper distributions", relativePath: ".m2/wrapper/dists", risk: .safe, note: "Maven Wrapper 会重新下载发行版"),
+            CacheRule(category: "JVM", name: "Android SDK 临时下载", relativePath: "Library/Android/sdk/.temp", risk: .safe, note: "Android SDK 会重新下载组件"),
+            CacheRule(category: "JVM", name: "Android SDK 缓存", relativePath: "Library/Android/sdk/.cache", risk: .safe, note: "Android SDK 会自动重建缓存"),
+            CacheRule(category: "JVM", name: "Android 用户缓存", relativePath: ".android/cache", risk: .safe, note: "Android 工具会自动重建缓存"),
+            CacheRule(category: "JVM", name: "Android 旧构建缓存", relativePath: ".android/build-cache", risk: .safe, note: "Android 工具会重新构建"),
+            CacheRule(category: "JVM", name: "Bazel 缓存", relativePath: "Library/Caches/bazel", risk: .safe, note: "Bazel 会重新构建"),
+            CacheRule(category: "JVM", name: "Bazel（旧缓存）", relativePath: ".cache/bazel", risk: .safe, note: "Bazel 会重新构建"),
+
+            CacheRule(category: "语言工具链", name: "mise 缓存", relativePath: ".cache/mise", risk: .safe, note: "mise 会重新下载工具"),
+            CacheRule(category: "语言工具链", name: "asdf 下载缓存", relativePath: ".asdf/downloads", risk: .safe, note: "asdf 会重新下载工具"),
+            CacheRule(category: "语言工具链", name: "asdf 临时缓存", relativePath: ".asdf/tmp", risk: .safe, note: "asdf 会重新创建临时文件"),
+            CacheRule(category: "语言工具链", name: "ccache", relativePath: ".cache/ccache", risk: .safe, note: "编译器会重新编译"),
+            CacheRule(category: "语言工具链", name: "sccache", relativePath: ".cache/sccache", risk: .safe, note: "编译器会重新编译"),
+            CacheRule(category: "语言工具链", name: "ccache（macOS）", relativePath: "Library/Caches/ccache", risk: .safe, note: "编译器会重新编译"),
+            CacheRule(category: "语言工具链", name: "sccache（macOS）", relativePath: "Library/Caches/sccache", risk: .safe, note: "编译器会重新编译"),
+            CacheRule(category: "Python 项目", name: "pipx 缓存", relativePath: ".cache/pipx", risk: .safe, note: "pipx 会重新下载包"),
+            CacheRule(category: "Python 项目", name: "pre-commit 缓存", relativePath: ".cache/pre-commit", risk: .safe, note: "pre-commit 会重新下载环境"),
+            CacheRule(category: "Python 项目", name: "Jupyter 缓存", relativePath: ".cache/jupyter", risk: .safe, note: "Jupyter 会重新生成缓存"),
 
             CacheRule(category: "IDE", name: "VS Code Cache", relativePath: "Library/Application Support/Code/Cache", risk: .safe, note: "编辑器会自动重建"),
             CacheRule(category: "IDE", name: "VS Code CachedData", relativePath: "Library/Application Support/Code/CachedData", risk: .safe, note: "编辑器会自动重建"),
@@ -215,8 +338,9 @@ struct CacheScanner {
             CacheRule(category: "IDE", name: "Cursor GPUCache", relativePath: "Library/Application Support/Cursor/GPUCache", risk: .safe, note: "编辑器会自动重建"),
             CacheRule(category: "IDE", name: "Cursor workspaceStorage", relativePath: "Library/Application Support/Cursor/User/workspaceStorage", risk: .review, note: "工作区状态和扩展数据，确认后再清理"),
             CacheRule(category: "IDE", name: "JetBrains 缓存", relativePath: "Library/Caches/JetBrains", risk: .safe, note: "IDE 会自动重建"),
+            CacheRule(category: "IDE", name: "JetBrains 日志", relativePath: "Library/Logs/JetBrains", risk: .safe, note: "IDE 会重新生成日志"),
+            CacheRule(category: "IDE", name: "Android Studio 日志", relativePath: "Library/Logs/AndroidStudio", risk: .safe, note: "Android Studio 会重新生成日志"),
 
-            CacheRule(category: "其他开发缓存", name: "用户开发缓存目录", relativePath: ".cache", risk: .review, note: "包含多个工具的缓存，建议确认后清理")
         ]
 
         var items: [CacheItem] = []
@@ -268,8 +392,28 @@ struct CacheScanner {
         if let value = environment["PNPM_STORE_PATH"], let path = expandedPath(value, home: home) {
             add("包管理器", "pnpm 自定义 store", path, .safe, "来自 PNPM_STORE_PATH，pnpm 会重新下载依赖")
         }
+        if let value = environment["DENO_DIR"], let path = expandedPath(value, home: home) {
+            add("包管理器", "Deno 自定义缓存", path, .safe, "来自 DENO_DIR，Deno 会重新下载依赖和工具")
+        }
+        if let value = environment["PLAYWRIGHT_BROWSERS_PATH"], value != "0", let path = expandedPath(value, home: home) {
+            add("包管理器", "Playwright 自定义浏览器缓存", path, .review, "来自 PLAYWRIGHT_BROWSERS_PATH，浏览器会重新下载")
+        }
+        if let value = environment["PUPPETEER_CACHE_DIR"], let path = expandedPath(value, home: home) {
+            add("包管理器", "Puppeteer 自定义浏览器缓存", path, .review, "来自 PUPPETEER_CACHE_DIR，浏览器会重新下载")
+        }
         if let value = environment["CARGO_HOME"], let cargoHome = expandedPath(value, home: home) {
             addCargoItems(cargoHome: cargoHome, add: add)
+        }
+        if let value = environment["RUSTUP_HOME"], let rustupHome = expandedPath(value, home: home) {
+            add("语言工具链", "rustup 自定义下载缓存", rustupHome.appendingPathComponent("downloads"), .safe, "来自 RUSTUP_HOME，rustup 会重新下载工具链")
+            add("语言工具链", "rustup 自定义临时缓存", rustupHome.appendingPathComponent("tmp"), .safe, "来自 RUSTUP_HOME，rustup 会重新创建临时文件")
+        }
+        if let value = environment["CONDA_PKGS_DIRS"] {
+            for pathValue in value.split(separator: ":") {
+                if let path = expandedPath(String(pathValue), home: home) {
+                    add("语言工具链", "Conda 自定义包缓存", path, .safe, "来自 CONDA_PKGS_DIRS，Conda 会重新下载包")
+                }
+            }
         }
         if let value = environment["PIP_CACHE_DIR"], let path = expandedPath(value, home: home) {
             add("语言工具链", "pip 自定义缓存", path, .safe, "来自 PIP_CACHE_DIR，pip 会重新下载 wheel")
@@ -289,6 +433,16 @@ struct CacheScanner {
         if let value = environment["GRADLE_USER_HOME"], let gradleHome = expandedPath(value, home: home) {
             add("JVM", "Gradle 自定义 caches", gradleHome.appendingPathComponent("caches"), .safe, "来自 GRADLE_USER_HOME，Gradle 会重新下载依赖")
             add("JVM", "Gradle 自定义 wrapper", gradleHome.appendingPathComponent("wrapper/dists"), .safe, "来自 GRADLE_USER_HOME，Gradle wrapper 会重新下载")
+        }
+        if let value = environment["MAVEN_USER_HOME"], let mavenHome = expandedPath(value, home: home) {
+            add("JVM", "Maven 自定义 repository", mavenHome.appendingPathComponent("repository"), .review, "来自 MAVEN_USER_HOME，Maven 会重新下载依赖")
+            add("JVM", "Maven 自定义 wrapper", mavenHome.appendingPathComponent("wrapper/dists"), .safe, "来自 MAVEN_USER_HOME，Maven Wrapper 会重新下载")
+        }
+        if let value = environment["NUGET_PACKAGES"], let path = expandedPath(value, home: home) {
+            add("包管理器", "NuGet 自定义包缓存", path, .safe, "来自 NUGET_PACKAGES，NuGet 会重新下载包")
+        }
+        if let value = environment["BUN_INSTALL_CACHE_DIR"], let path = expandedPath(value, home: home) {
+            add("包管理器", "Bun 自定义缓存", path, .safe, "来自 BUN_INSTALL_CACHE_DIR，Bun 会重新下载依赖")
         }
 
         if let npmrc = try? String(contentsOf: home.appendingPathComponent(".npmrc"), encoding: .utf8),
@@ -330,10 +484,91 @@ struct CacheScanner {
         return items
     }
 
+    private static func dockerItems(
+        home: URL,
+        collector: inout ScanCollector,
+        progress: @escaping (ScanProgress) -> Void
+    ) -> [CacheItem] {
+        let dockerDataRoot = home.appendingPathComponent("Library/Containers/com.docker.docker")
+        let rawDisk = dockerDataRoot.appendingPathComponent("Data/vms/0/data/Docker.raw")
+        var items: [CacheItem] = []
+
+        if let rawDiskItem = makeItem(
+            category: "Docker",
+            name: "Docker Desktop 虚拟磁盘（只读）",
+            path: rawDisk,
+            risk: .manual,
+            note: "仅显示 Docker.raw 占用；不能直接删除虚拟磁盘，请使用 Docker 官方 CLI 或 Docker Desktop 的磁盘回收功能",
+            collector: &collector,
+            progress: progress,
+            details: rawDisk.devSweepDisplayPath,
+            isSelected: false,
+            kind: .dockerPrune
+        ) {
+            items.append(rawDiskItem)
+        }
+
+        guard DockerSupport.executableURL() != nil else { return items }
+        guard let output = DockerSupport.run(arguments: ["system", "df", "--format", "{{json .}}"])
+        else {
+            collector.skipped(
+                dockerDataRoot,
+                reason: "Docker CLI 无法启动或 Docker 引擎未运行",
+                kind: .unavailable
+            )
+            return items
+        }
+        guard output.status == 0 else {
+            let detail = String(data: output.stderr, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            collector.skipped(
+                dockerDataRoot,
+                reason: detail?.isEmpty == false ? detail! : "Docker CLI 可用，但 Docker 引擎未运行或当前 context 不可用",
+                kind: .unavailable
+            )
+            return items
+        }
+
+        collector.checked(dockerDataRoot)
+        for line in String(data: output.stdout, encoding: .utf8)?.split(whereSeparator: \.isNewline) ?? [] {
+            guard let data = line.data(using: .utf8),
+                  let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let type = payload["Type"] as? String,
+                  let target = DockerCleanupTarget(dockerType: type),
+                  let reclaimableText = payload["Reclaimable"] as? String,
+                  let reclaimable = DockerReclaimableSize.bytes(from: reclaimableText),
+                  reclaimable >= minimumItemSize else { continue }
+
+            let virtualPath = dockerDataRoot.appendingPathComponent(".devsweep/\(target.rawValue)")
+            items.append(CacheItem(
+                category: "Docker",
+                name: "\(target.displayName) · Docker",
+                path: virtualPath,
+                size: reclaimable,
+                details: "Docker \(type) · \(reclaimableText)",
+                risk: .review,
+                kind: .dockerPrune,
+                identifier: target.rawValue,
+                note: target.note,
+                isSelected: false
+            ))
+            progress(ScanProgress(
+                phase: "发现 Docker 可回收资源",
+                currentPath: "Docker \(type)",
+                checkedPaths: collector.checkedPaths,
+                matchedPaths: items.count,
+                skippedPaths: collector.skippedPaths,
+                permissionFailures: collector.permissionFailures
+            ))
+        }
+        return items
+    }
+
     private static func addCargoItems(
         cargoHome: URL,
         add: (String, String, URL, RiskLevel, String) -> Void
     ) {
+        add("语言工具链", "Cargo 自定义 registry index", cargoHome.appendingPathComponent("registry/index"), .safe, "来自 CARGO_HOME，Cargo 会重新获取 registry 索引")
         add("语言工具链", "Cargo 自定义 registry cache", cargoHome.appendingPathComponent("registry/cache"), .safe, "来自 CARGO_HOME，Cargo 会重新下载 crate")
         add("语言工具链", "Cargo 自定义 registry source", cargoHome.appendingPathComponent("registry/src"), .safe, "来自 CARGO_HOME，Cargo 会重新下载 crate 源码")
         add("语言工具链", "Cargo 自定义 git", cargoHome.appendingPathComponent("git"), .safe, "来自 CARGO_HOME，Cargo 会重新获取依赖")
@@ -578,13 +813,34 @@ struct CacheScanner {
         "__pycache__": GeneratedRule(category: "Python 项目", risk: .safe, note: "Python 字节码缓存，会自动重建"),
         ".mypy_cache": GeneratedRule(category: "Python 项目", risk: .safe, note: "mypy 缓存，会自动重建"),
         ".ruff_cache": GeneratedRule(category: "Python 项目", risk: .safe, note: "Ruff 缓存，会自动重建"),
+        ".venv": GeneratedRule(category: "Python 项目", risk: .review, note: "Python 虚拟环境，删除后需要重新创建并安装依赖"),
+        "venv": GeneratedRule(category: "Python 项目", risk: .review, note: "Python 虚拟环境，删除后需要重新创建并安装依赖"),
+        ".tox": GeneratedRule(category: "Python 项目", risk: .review, note: "tox 测试环境，删除后会重新创建"),
+        ".nox": GeneratedRule(category: "Python 项目", risk: .review, note: "nox 测试环境，删除后会重新创建"),
         ".terraform": GeneratedRule(category: "项目生成物", risk: .review, note: "Terraform 工作目录，删除后需要重新初始化"),
+        ".nx": GeneratedRule(category: "Node.js 项目", risk: .safe, note: "Nx 缓存，会自动重建"),
+        ".angular": GeneratedRule(category: "Node.js 项目", risk: .safe, note: "Angular 缓存，会自动重建"),
+        ".nuxt": GeneratedRule(category: "Node.js 项目", risk: .safe, note: "Nuxt 构建缓存，会自动重建"),
+        ".output": GeneratedRule(category: "Node.js 项目", risk: .review, note: "Nuxt 输出目录，可按需重新生成"),
+        ".expo": GeneratedRule(category: "Node.js 项目", risk: .review, note: "Expo 项目缓存，删除后会重新生成"),
+        "cmake-build-debug": GeneratedRule(category: "项目生成物", risk: .review, note: "CMake 构建产物，可按需重新生成"),
+        "cmake-build-release": GeneratedRule(category: "项目生成物", risk: .review, note: "CMake 构建产物，可按需重新生成"),
+        ".zig-cache": GeneratedRule(category: "项目生成物", risk: .safe, note: "Zig 构建缓存，会自动重建"),
+        "zig-cache": GeneratedRule(category: "项目生成物", risk: .safe, note: "Zig 构建缓存，会自动重建"),
+        "bazel-out": GeneratedRule(category: "项目生成物", risk: .safe, note: "Bazel 输出缓存，会自动重建"),
+        "buck-out": GeneratedRule(category: "项目生成物", risk: .safe, note: "Buck 输出缓存，会自动重建"),
         ".gradle": GeneratedRule(category: "JVM", risk: .safe, note: "项目级 Gradle 缓存，会自动重建")
     ]
 
     private static func generatedRule(for url: URL) -> GeneratedRule? {
         if url.lastPathComponent == "Build" && url.deletingLastPathComponent().lastPathComponent == "Carthage" {
             return GeneratedRule(category: "Apple 项目", risk: .review, note: "Carthage 构建产物，会重新下载或构建")
+        }
+        if url.lastPathComponent == "cache" && url.deletingLastPathComponent().lastPathComponent == ".yarn" {
+            return GeneratedRule(category: "Node.js 项目", risk: .review, note: "Yarn 离线缓存，会重新下载依赖")
+        }
+        if url.lastPathComponent.hasPrefix("cmake-build-") {
+            return GeneratedRule(category: "项目生成物", risk: .review, note: "CMake 构建产物，可按需重新生成")
         }
         return generatedRules[url.lastPathComponent]
     }
@@ -596,7 +852,11 @@ struct CacheScanner {
         risk: RiskLevel,
         note: String,
         collector: inout ScanCollector,
-        progress: @escaping (ScanProgress) -> Void
+        progress: @escaping (ScanProgress) -> Void,
+        details: String? = nil,
+        isSelected: Bool? = nil,
+        kind: CleanupKind = .trash,
+        identifier: String? = nil
     ) -> CacheItem? {
         let standardized = path.standardizedFileURL
         guard fileManager.fileExists(atPath: standardized.path) else { return nil }
@@ -627,9 +887,12 @@ struct CacheScanner {
             name: name,
             path: standardized,
             size: measuredSize,
-            details: standardized.devSweepDisplayPath,
+            details: details ?? standardized.devSweepDisplayPath,
             risk: risk,
-            note: note
+            kind: kind,
+            identifier: identifier,
+            note: note,
+            isSelected: isSelected
         )
     }
 
@@ -729,7 +992,7 @@ struct CacheScanner {
         return total
     }
 
-    private static func run(executable: String, arguments: [String]) -> ProcessOutput? {
+    fileprivate static func run(executable: String, arguments: [String]) -> ProcessOutput? {
         let task = Process()
         let outputPipe = Pipe()
         let errorPipe = Pipe()
@@ -767,6 +1030,12 @@ struct CacheCleaner {
                         throw NSError(domain: "DevSweep", code: 1, userInfo: [NSLocalizedDescriptionKey: "缺少模拟器 UDID"])
                     }
                     try runSimctlDelete(udid: udid)
+                case .dockerPrune:
+                    guard let rawTarget = item.identifier,
+                          let target = DockerCleanupTarget(rawValue: rawTarget) else {
+                        throw NSError(domain: "DevSweep", code: 2, userInfo: [NSLocalizedDescriptionKey: "缺少 Docker 清理目标"])
+                    }
+                    try runDockerPrune(target)
                 }
                 removed.append(item)
             } catch {
@@ -790,6 +1059,18 @@ struct CacheCleaner {
             let message = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
             throw NSError(domain: "DevSweep", code: Int(task.terminationStatus), userInfo: [
                 NSLocalizedDescriptionKey: message?.isEmpty == false ? message! : "simctl 删除失败"
+            ])
+        }
+    }
+
+    private static func runDockerPrune(_ target: DockerCleanupTarget) throws {
+        guard let output = DockerSupport.run(arguments: target.arguments) else {
+            throw NSError(domain: "DevSweep", code: 3, userInfo: [NSLocalizedDescriptionKey: "Docker CLI 不可用"])
+        }
+        guard output.status == 0 else {
+            let message = String(data: output.stderr, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            throw NSError(domain: "DevSweep", code: Int(output.status), userInfo: [
+                NSLocalizedDescriptionKey: message?.isEmpty == false ? message! : "Docker 清理命令失败"
             ])
         }
     }
@@ -825,7 +1106,7 @@ final class DevSweepStore: ObservableObject {
         let order = [
             "Xcode", "CoreSimulator", "XCTest", "Rust / Tauri 项目", "项目生成物", "Node.js 项目",
             "Apple 项目", "Swift 项目", "Flutter 项目", "Python 项目", "测试产物", "包管理器",
-            "语言工具链", "JVM", "IDE", "Android Studio", "设计工具", "其他开发缓存"
+            "语言工具链", "AI/ML", "Docker", "JVM", "IDE", "Android Studio", "设计工具", "其他开发缓存"
         ]
         let present = Set(items.map(\.category))
         return order.filter(present.contains) + present.subtracting(order).sorted()
@@ -881,7 +1162,7 @@ final class DevSweepStore: ObservableObject {
 
     func setAllSelected(_ selected: Bool, category: String? = nil) {
         for index in items.indices where category == nil || items[index].category == category {
-            if items[index].risk != .manual {
+            if items[index].risk != .manual && (selected == false || items[index].kind != .dockerPrune) {
                 items[index].isSelected = selected
             }
         }
@@ -921,7 +1202,9 @@ final class DevSweepStore: ObservableObject {
         let selected = items.filter { ids.contains($0.id) && $0.isSelected && $0.risk != .manual }
         guard !selected.isEmpty, !isCleaning else { return }
         isCleaning = true
-        statusMessage = "正在把选中项目移入废纸篓…"
+        lastError = nil
+        let includesDocker = selected.contains { $0.kind == .dockerPrune }
+        statusMessage = includesDocker ? "正在执行选中项目的清理…" : "正在把选中项目移入废纸篓…"
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let report = CacheCleaner.clean(selected)
             DispatchQueue.main.async {
@@ -930,11 +1213,15 @@ final class DevSweepStore: ObservableObject {
                 let remainingItems = CleanupSelection.remainingItems(from: self.items, removing: report.removed)
                 self.items = remainingItems
                 if report.failures.isEmpty {
-                    self.statusMessage = "已处理 \(report.removed.count) 项，文件可从废纸篓恢复"
+                    self.statusMessage = includesDocker
+                        ? "已处理 \(report.removed.count) 项，普通目录可从废纸篓恢复，Docker 资源不可恢复"
+                        : "已处理 \(report.removed.count) 项，文件可从废纸篓恢复"
                 } else {
                     let details = report.failures.map { "\($0.0.name)：\($0.1)" }.joined(separator: "\n")
                     self.lastError = "部分项目未能清理：\n\(details)"
-                    self.statusMessage = "已处理 \(report.removed.count) 项，\(report.failures.count) 项失败"
+                    self.statusMessage = includesDocker
+                        ? "已处理 \(report.removed.count) 项，\(report.failures.count) 项失败；Docker 资源请查看错误详情"
+                        : "已处理 \(report.removed.count) 项，\(report.failures.count) 项失败"
                 }
             }
         }
