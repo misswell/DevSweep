@@ -74,6 +74,33 @@ struct CleanupSelection {
     }
 }
 
+struct PathWhitelist {
+    static func normalized(_ paths: [URL]) -> [URL] {
+        let candidates = paths
+            .map(\.standardizedFileURL)
+            .sorted { $0.path.count < $1.path.count }
+
+        var result: [URL] = []
+        for candidate in candidates {
+            let candidatePath = candidate.path
+            guard !result.contains(where: { parent in
+                let parentPath = parent.path
+                return candidatePath == parentPath || candidatePath.hasPrefix(parentPath + "/")
+            }) else { continue }
+            result.append(candidate)
+        }
+        return result
+    }
+
+    static func contains(_ path: URL, in paths: [URL]) -> Bool {
+        let candidatePath = path.standardizedFileURL.path
+        return paths.contains { allowedPath in
+            let allowed = allowedPath.standardizedFileURL.path
+            return candidatePath == allowed || candidatePath.hasPrefix(allowed + "/")
+        }
+    }
+}
+
 struct CleanupReport {
     let removed: [CacheItem]
     let failures: [(CacheItem, String)]
