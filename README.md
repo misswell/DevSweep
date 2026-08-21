@@ -2,7 +2,7 @@
 
 DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcode、Rust/Tauri、Node、SwiftPM、Cargo、Gradle、Maven、Python、Go、Flutter、VS Code、Cursor 等开发环境。
 
-当前版本：0.1.4
+当前版本：0.1.6
 
 ## 当前功能
 
@@ -34,7 +34,16 @@ open ./DevSweep.app
 DEVSWEEP_ARCHS="arm64 x86_64" ./scripts/build_app.sh
 ```
 
-正式发布需要 Developer ID 签名和 Apple 公证。配置已验证的 `DEVSWEEP_NOTARY_PROFILE` 后，可使用 `scripts/distribute_app.sh` 生成经过公证的 `DevSweep-<version>-macos.zip`。在线更新要求 Release 资产使用这个文件名，并保留 GitHub 自动生成的 SHA-256 digest。包含在线更新功能的首个版本之前，旧安装需要手动安装一次。
+正式发布需要 Developer ID 签名和 Apple 公证。请在发布电脑上配置 Developer ID 证书及其私钥，并使用已验证的 `DEVSWEEP_NOTARY_PROFILE`：
+
+```bash
+export DEVSWEEP_DEVELOPER_ID='Developer ID Application: Your Name (TEAMID)'
+export DEVSWEEP_DEVELOPER_TEAM_ID='TEAMID'
+export DEVSWEEP_NOTARY_PROFILE='your-notary-profile'
+DEVSWEEP_ARCHS='arm64 x86_64' ./scripts/distribute_app.sh
+```
+
+`scripts/build_app.sh` 默认拒绝没有 Developer ID 的构建，避免误把 ad-hoc 包上传到 Release。只有本地开发时才显式使用 `DEVSWEEP_ALLOW_ADHOC=1`；这个包不能发布或用于在线更新。发布前必须确认 `codesign` 显示 `Developer ID Application`、`spctl` 通过且 `xcrun stapler validate` 成功。在线更新要求 Release 资产使用 `DevSweep-<version>-macos.zip` 文件名，并保留 GitHub 自动生成的 SHA-256 digest。包含在线更新功能的首个版本之前，旧安装需要手动安装一次。
 
 也可以直接在 Xcode 中打开 `Package.swift`。
 

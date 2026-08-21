@@ -8,6 +8,14 @@ ARCHS=(${=ARCH_LIST})
 
 cd "$PROJECT_DIR"
 
+DEVELOPER_ID="${DEVSWEEP_DEVELOPER_ID:-}"
+ALLOW_ADHOC="${DEVSWEEP_ALLOW_ADHOC:-0}"
+if [[ -z "$DEVELOPER_ID" && "$ALLOW_ADHOC" != "1" ]]; then
+    echo "DEVSWEEP_DEVELOPER_ID is required for distributable builds." >&2
+    echo "Set DEVSWEEP_ALLOW_ADHOC=1 only for local development builds." >&2
+    exit 1
+fi
+
 MAIN_BINARIES=()
 UPDATER_BINARIES=()
 SCRATCH_DIRS=()
@@ -45,7 +53,6 @@ cp "$PROJECT_DIR/Info.plist" "$APP_PATH/Contents/Info.plist"
 cp "$PROJECT_DIR/Resources/DevSweep.icns" "$APP_PATH/Contents/Resources/DevSweep.icns"
 chmod +x "$APP_PATH/Contents/MacOS/DevSweep" "$APP_PATH/Contents/MacOS/DevSweepUpdater"
 
-DEVELOPER_ID="${DEVSWEEP_DEVELOPER_ID:-}"
 if [[ -n "$DEVELOPER_ID" ]]; then
     codesign --force --options runtime --timestamp --sign "$DEVELOPER_ID" \
         "$APP_PATH/Contents/MacOS/DevSweepUpdater"
@@ -56,6 +63,23 @@ else
 fi
 
 codesign --verify --deep --strict "$APP_PATH"
+
+if [[ -n "$DEVELOPER_ID" ]]; then
+    EXPECTED_TEAM_ID="${DEVSWEEP_DEVELOPER_TEAM_ID:-U8U443D7ZL}"
+    for signed_path in \
+        "$APP_PATH/Contents/MacOS/DevSweepUpdater" \
+        "$APP_PATH"; do
+        signature_details="$(codesign --display --verbose=4 "$signed_path" 2>&1)"
+        if ! grep -q '^Authority=Developer ID Application:' <<<"$signature_details"; then
+            echo "Expected a Developer ID Application signature: $signed_path" >&2
+            exit 1
+        fi
+        if ! grep -q "^TeamIdentifier=$EXPECTED_TEAM_ID$" <<<"$signature_details"; then
+            echo "Unexpected signing team for $signed_path (expected $EXPECTED_TEAM_ID)" >&2
+            exit 1
+        fi
+    done
+fi
 
 for scratch_path in "${SCRATCH_DIRS[@]}"; do
     rm -rf "$scratch_path"
