@@ -14,7 +14,7 @@ struct DevSweepApp: App {
         .windowResizability(.contentSize)
 
         Settings {
-            HelpView()
+            SettingsView()
                 .environmentObject(updater)
         }
     }

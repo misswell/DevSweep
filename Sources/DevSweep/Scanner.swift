@@ -99,6 +99,7 @@ struct CacheScanner {
     static func scan(
         projectRoots: [URL],
         deepScan: Bool,
+        whitelistedPaths: [URL] = [],
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         progress: @escaping (ScanProgress) -> Void
     ) -> ScanReport {
@@ -154,11 +155,13 @@ struct CacheScanner {
             )
         }
 
-        let uniqueItems = nonOverlappingItems(items)
-            .filter { $0.size >= minimumItemSize }
-            .sorted {
-                if $0.size == $1.size { return $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-                return $0.size > $1.size
+        let uniqueItems = nonOverlappingItems(
+            items.filter { !PathWhitelist.contains($0.path, in: whitelistedPaths) }
+        )
+        .filter { $0.size >= minimumItemSize }
+        .sorted {
+            if $0.size == $1.size { return $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+            return $0.size > $1.size
         }
 
         let finalProgress = ScanProgress(
@@ -1079,6 +1082,7 @@ struct CacheCleaner {
 @MainActor
 final class DevSweepStore: ObservableObject {
     private static let projectRootsKey = "DevSweep.projectRoots"
+    private static let whitelistedPathsKey = "DevSweep.whitelistedPaths"
 
     @Published private(set) var items: [CacheItem] = []
     @Published private(set) var isScanning = false
@@ -1088,6 +1092,7 @@ final class DevSweepStore: ObservableObject {
     @Published private(set) var lastReport: ScanReport?
     @Published private(set) var scanProgress = ScanProgress()
     @Published var projectRoots: [URL]
+    @Published private(set) var whitelistedPaths: [URL]
     @Published var deepScan = true
 
     init() {
@@ -1100,6 +1105,8 @@ final class DevSweepStore: ObservableObject {
         } else {
             projectRoots = Self.defaultProjectRoots(home: home)
         }
+        let savedWhitelist = UserDefaults.standard.array(forKey: Self.whitelistedPathsKey) as? [String] ?? []
+        whitelistedPaths = PathWhitelist.normalized(savedWhitelist.map { URL(fileURLWithPath: $0) })
     }
 
     var categories: [String] {
@@ -1128,9 +1135,14 @@ final class DevSweepStore: ObservableObject {
         statusMessage = "正在扫描开发者缓存…"
         let roots = projectRoots
         let deepScan = self.deepScan
+        let whitelist = whitelistedPaths
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let report = CacheScanner.scan(projectRoots: roots, deepScan: deepScan) { progress in
+            let report = CacheScanner.scan(
+                projectRoots: roots,
+                deepScan: deepScan,
+                whitelistedPaths: whitelist
+            ) { progress in
                 DispatchQueue.main.async {
                     guard let self else { return }
                     self.scanProgress = progress
@@ -1198,8 +1210,25 @@ final class DevSweepStore: ObservableObject {
         persistProjectRoots()
     }
 
+    func addToWhitelist(_ items: [CacheItem]) {
+        guard !items.isEmpty, !isScanning, !isCleaning else { return }
+        let updated = PathWhitelist.normalized(whitelistedPaths + items.map(\.path))
+        guard updated != whitelistedPaths else { return }
+        whitelistedPaths = updated
+        persistWhitelist()
+        scan()
+    }
+
+    func removeFromWhitelist(_ path: URL) {
+        guard !isScanning, !isCleaning else { return }
+        let standardizedPath = path.standardizedFileURL.path
+        whitelistedPaths.removeAll { $0.standardizedFileURL.path == standardizedPath }
+        persistWhitelist()
+        scan()
+    }
+
     func cleanSelected(ids: Set<UUID>) {
-        let selected = items.filter { ids.contains($0.id) && $0.isSelected && $0.risk != .manual }
+        let selected = items.filter { ids.contains($0.id) && $0.risk != .manual }
         guard !selected.isEmpty, !isCleaning else { return }
         isCleaning = true
         lastError = nil
@@ -1233,6 +1262,10 @@ final class DevSweepStore: ObservableObject {
 
     private func persistProjectRoots() {
         UserDefaults.standard.set(projectRoots.map(\.path), forKey: Self.projectRootsKey)
+    }
+
+    private func persistWhitelist() {
+        UserDefaults.standard.set(whitelistedPaths.map(\.path), forKey: Self.whitelistedPathsKey)
     }
 
     private static func defaultProjectRoots(home: URL) -> [URL] {

@@ -2,6 +2,24 @@ import XCTest
 @testable import DevSweep
 
 final class CleanupSelectionTests: XCTestCase {
+    func testWhitelistMatchesThePathAndItsChildren() {
+        let whitelist = [URL(fileURLWithPath: "/tmp/project/target")]
+
+        XCTAssertTrue(PathWhitelist.contains(URL(fileURLWithPath: "/tmp/project/target"), in: whitelist))
+        XCTAssertTrue(PathWhitelist.contains(URL(fileURLWithPath: "/tmp/project/target/debug"), in: whitelist))
+        XCTAssertFalse(PathWhitelist.contains(URL(fileURLWithPath: "/tmp/project/target-copy"), in: whitelist))
+    }
+
+    func testWhitelistNormalizationRemovesNestedPaths() {
+        let paths = PathWhitelist.normalized([
+            URL(fileURLWithPath: "/tmp/project/target/debug"),
+            URL(fileURLWithPath: "/tmp/project/target"),
+            URL(fileURLWithPath: "/tmp/other")
+        ])
+
+        XCTAssertEqual(paths.map(\.path), ["/tmp/other", "/tmp/project/target"])
+    }
+
     func testSelectionIsScopedToVisibleItems() {
         let currentPageItem = CacheItem(
             category: "Rust / Tauri 项目",

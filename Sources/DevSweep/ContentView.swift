@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct ContentView: View {
@@ -9,7 +10,9 @@ struct ContentView: View {
     @State private var showingConfirmation = false
     @State private var showingError = false
     @State private var showingHelp = false
+    @State private var showingSettings = false
     @State private var showingScanDetails = false
+    @State private var pathCopied = false
     @State private var pendingCleanupItems: [CacheItem] = []
 
     private let largeThreshold: Int64 = 1 * 1024 * 1024 * 1024
@@ -24,6 +27,10 @@ struct ContentView: View {
 
     private var cleanupItems: [CacheItem] {
         CleanupSelection.selectedItems(from: store.items, visibleItems: visibleItems)
+    }
+
+    private var selectedVisibleItems: [CacheItem] {
+        visibleItems.filter(\.isSelected)
     }
 
     private var cleanupSize: Int64 {
@@ -67,6 +74,9 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showingHelp) {
             HelpView()
+        }
+        .sheet(isPresented: $showingSettings) {
+            SettingsView()
                 .environmentObject(updater)
         }
         .sheet(isPresented: $showingScanDetails) {
@@ -140,6 +150,11 @@ struct ContentView: View {
                 Text("已配置 \(store.projectRoots.count) 个项目根目录")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
+                if !store.whitelistedPaths.isEmpty {
+                    Text("已忽略 \(store.whitelistedPaths.count) 个目录")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
                 Text("文件默认移入废纸篓，可恢复")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
@@ -175,7 +190,10 @@ struct ContentView: View {
                     } else {
                         LazyVStack(spacing: 10) {
                             ForEach(visibleItems) { item in
-                                CacheItemRow(item: item)
+                                CacheItemRow(item: item) { item in
+                                    pendingCleanupItems = [item]
+                                    showingConfirmation = true
+                                }
                             }
                         }
                     }
@@ -190,7 +208,7 @@ struct ContentView: View {
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .confirmationDialog(
-            "确认清理选中的项目？",
+            pendingCleanupItems.count == 1 ? "确认清理这一项？" : "确认清理选中的项目？",
             isPresented: $showingConfirmation,
             titleVisibility: .visible
         ) {
@@ -233,7 +251,13 @@ struct ContentView: View {
                     .background(.quaternary.opacity(0.55))
                     .clipShape(Capsule())
             }
-            updateButton
+            Button {
+                showingSettings = true
+            } label: {
+                Image(systemName: "gearshape")
+            }
+            .buttonStyle(.bordered)
+            .help("设置和更新")
             Button {
                 showingHelp = true
             } label: {
@@ -255,54 +279,6 @@ struct ContentView: View {
         .controlSize(.large)
         .padding(.horizontal, 30)
         .padding(.vertical, 18)
-    }
-
-    @ViewBuilder
-    private var updateButton: some View {
-        switch updater.state {
-        case .available(let release):
-            Button {
-                showingHelp = true
-            } label: {
-                Label("发现 \(release.version.description)", systemImage: "arrow.down.circle.fill")
-            }
-            .buttonStyle(.borderless)
-            .foregroundStyle(.tint)
-            .help("查看在线更新")
-        case .checking:
-            updateProgress("检查更新…")
-        case .downloading:
-            updateProgress("下载更新…")
-        case .installing:
-            updateProgress("准备安装…")
-        case .failed:
-            Button {
-                showingHelp = true
-            } label: {
-                Image(systemName: "exclamationmark.triangle")
-                    .foregroundStyle(.orange)
-            }
-            .buttonStyle(.borderless)
-            .help("查看更新失败原因")
-        case .idle, .upToDate:
-            Button {
-                Task { await updater.checkForUpdates() }
-            } label: {
-                Image(systemName: "arrow.down.circle")
-            }
-            .buttonStyle(.borderless)
-            .help("检查在线更新")
-        }
-    }
-
-    private func updateProgress(_ message: String) -> some View {
-        HStack(spacing: 6) {
-            ProgressView()
-                .controlSize(.small)
-            Text(message)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
     }
 
     private var overviewCard: some View {
@@ -394,6 +370,9 @@ struct ContentView: View {
                         Text(root.devSweepDisplayPath)
                             .font(.caption.monospaced())
                             .lineLimit(1)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                            .help(root.path)
                         Spacer()
                         Button {
                             store.removeProjectRoot(root)
@@ -402,6 +381,35 @@ struct ContentView: View {
                         }
                         .buttonStyle(.borderless)
                         .help("移除此项目根目录")
+                    }
+                    .padding(.leading, 44)
+                }
+            }
+
+            if !store.whitelistedPaths.isEmpty {
+                Divider()
+                Text("忽略名单")
+                    .font(.subheadline.weight(.semibold))
+                    .padding(.leading, 44)
+                ForEach(store.whitelistedPaths, id: \.path) { path in
+                    HStack(spacing: 8) {
+                        Image(systemName: "checkmark.shield")
+                            .foregroundStyle(.green)
+                        Text(path.devSweepDisplayPath)
+                            .font(.caption.monospaced())
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                            .help(path.path)
+                        Spacer()
+                        Button {
+                            store.removeFromWhitelist(path)
+                        } label: {
+                            Image(systemName: "xmark.circle")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("移出忽略名单")
+                        .disabled(store.isScanning || store.isCleaning)
                     }
                     .padding(.leading, 44)
                 }
@@ -502,6 +510,37 @@ struct ContentView: View {
             Text("显示 \(visibleItems.count) 项")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            if !selectedVisibleItems.isEmpty {
+                Menu {
+                    Button {
+                        store.addToWhitelist(selectedVisibleItems)
+                    } label: {
+                        Label("加入白名单", systemImage: "checkmark.shield")
+                    }
+                    .disabled(store.isScanning || store.isCleaning)
+
+                    Button {
+                        openSelectedFolders(selectedVisibleItems)
+                    } label: {
+                        Label("打开文件夹", systemImage: "folder")
+                    }
+                    .disabled(store.isScanning || store.isCleaning)
+
+                    Button {
+                        copyFullPaths(selectedVisibleItems)
+                    } label: {
+                        Label(
+                            pathCopied ? "已复制完整路径" : "复制完整路径",
+                            systemImage: pathCopied ? "checkmark" : "doc.on.doc"
+                        )
+                    }
+                    .disabled(store.isScanning || store.isCleaning)
+                } label: {
+                    Label("操作 \(selectedVisibleItems.count) 项", systemImage: "ellipsis.circle")
+                }
+                .menuStyle(.borderlessButton)
+                .help("对当前勾选的目录执行操作")
+            }
             Menu {
                 Button("全选当前分类") {
                     store.setAllSelected(true, category: selectedCategory == "全部" ? nil : selectedCategory)
@@ -548,6 +587,26 @@ struct ContentView: View {
         .padding(.horizontal, 24)
         .padding(.vertical, 12)
         .background(.regularMaterial)
+    }
+
+    private func openSelectedFolders(_ items: [CacheItem]) {
+        let paths = items.map(\.path)
+        if paths.count == 1, let path = paths.first {
+            NSWorkspace.shared.open(path)
+        } else {
+            NSWorkspace.shared.activateFileViewerSelecting(paths)
+        }
+    }
+
+    private func copyFullPaths(_ items: [CacheItem]) {
+        let fullPaths = items.map { $0.path.path }.joined(separator: "\n")
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(fullPaths, forType: .string)
+        pathCopied = true
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            pathCopied = false
+        }
     }
 
     private func categorySubtitle(_ category: String) -> String {
@@ -607,6 +666,7 @@ private struct SidebarRow: View {
 private struct CacheItemRow: View {
     @EnvironmentObject private var store: DevSweepStore
     let item: CacheItem
+    let onClean: (CacheItem) -> Void
 
     var body: some View {
         HStack(spacing: 12) {
@@ -636,6 +696,9 @@ private struct CacheItemRow: View {
                     .font(.caption2.monospaced())
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+                    .help(item.path.path)
                 if !item.note.isEmpty {
                     Text(item.note)
                         .font(.caption2)
@@ -652,6 +715,15 @@ private struct CacheItemRow: View {
                     .foregroundStyle(.tertiary)
             }
             .frame(minWidth: 92, alignment: .trailing)
+            Button {
+                onClean(item)
+            } label: {
+                Image(systemName: "trash")
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+            .help("仅清理这一项")
+            .disabled(item.risk == .manual || store.isScanning || store.isCleaning)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
@@ -788,7 +860,6 @@ private struct ScanDetailsView: View {
 
 struct HelpView: View {
     @Environment(\.dismiss) private var dismiss
-    @EnvironmentObject private var updater: DevSweepSoftwareUpdater
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -814,7 +885,6 @@ struct HelpView: View {
                 .font(.headline)
             Text("普通缓存和 XCTest 克隆设备移入 macOS 废纸篓；CoreSimulator 设备使用 simctl 删除以保持设备注册一致；Docker 资源使用官方 CLI 清理且不可恢复。红色项目不会自动删除，橙色项目默认不勾选。")
                 .foregroundStyle(.secondary)
-            SoftwareUpdateView(updater: updater)
             Text("开源参考")
                 .font(.headline)
             Link("macOS-dev-cache-cleaner", destination: URL(string: "https://github.com/k-angama/macOS-dev-cache-cleaner")!)
@@ -823,6 +893,30 @@ struct HelpView: View {
         }
         .padding(24)
         .frame(width: 620, height: 680)
+    }
+}
+
+struct SettingsView: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var updater: DevSweepSoftwareUpdater
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Image(systemName: "gearshape.fill")
+                    .font(.title)
+                    .foregroundStyle(.tint)
+                Text("设置")
+                    .font(.title2.weight(.bold))
+                Spacer()
+                Button("完成") { dismiss() }
+            }
+            Divider()
+            SoftwareUpdateView(updater: updater)
+            Spacer()
+        }
+        .padding(24)
+        .frame(width: 620, height: 500)
     }
 }
 
