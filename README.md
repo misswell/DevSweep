@@ -2,7 +2,7 @@
 
 DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcode、Rust/Tauri、Node、SwiftPM、Cargo、Gradle、Maven、Python、Go、Flutter、VS Code、Cursor 等开发环境。
 
-当前版本：0.1.6
+当前版本：0.1.7
 
 ## 当前功能
 
@@ -24,14 +24,14 @@ DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcod
 要求 macOS 13+、Swift 5.9+：
 
 ```bash
-./scripts/build_app.sh
+DEVSWEEP_ALLOW_ADHOC=1 ./scripts/build_app.sh
 open ./DevSweep.app
 ```
 
-默认按当前机器架构构建；发布 Universal 包时使用：
+上面是仅供本地调试的 ad-hoc 构建，默认按当前机器架构构建；需要 Universal 调试包时使用：
 
 ```bash
-DEVSWEEP_ARCHS="arm64 x86_64" ./scripts/build_app.sh
+DEVSWEEP_ALLOW_ADHOC=1 DEVSWEEP_ARCHS="arm64 x86_64" ./scripts/build_app.sh
 ```
 
 正式发布需要 Developer ID 签名和 Apple 公证。请在发布电脑上配置 Developer ID 证书及其私钥，并使用已验证的 `DEVSWEEP_NOTARY_PROFILE`：
