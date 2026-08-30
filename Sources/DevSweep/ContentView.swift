@@ -474,20 +474,29 @@ struct ContentView: View {
         VStack(spacing: 12) {
             ProgressView()
                 .controlSize(.large)
+                .frame(height: 32)
             Text(store.statusMessage)
                 .font(.headline)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+                .frame(maxWidth: 760, minHeight: 24, maxHeight: 24)
             Text("已检查 \(store.scanProgress.checkedPaths) 个路径 · 命中 \(store.scanProgress.matchedPaths) 项 · 跳过 \(store.scanProgress.skippedPaths) 个路径")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            if !store.scanProgress.currentPath.isEmpty {
-                Text(store.scanProgress.currentPath)
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.center)
-            }
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+                .frame(maxWidth: 760, minHeight: 18, maxHeight: 18)
+            Text(store.scanProgress.currentPath.isEmpty ? " " : store.scanProgress.currentPath)
+                .font(.caption2.monospaced())
+                .foregroundStyle(.tertiary)
+                .lineLimit(2)
+                .truncationMode(.middle)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 760, minHeight: 34, maxHeight: 34)
+                .opacity(store.scanProgress.currentPath.isEmpty ? 0 : 1)
+                .help(store.scanProgress.currentPath)
         }
-        .frame(maxWidth: .infinity, minHeight: 260)
+        .frame(maxWidth: .infinity, minHeight: 260, maxHeight: 260)
     }
 
     private var toolbar: some View {
