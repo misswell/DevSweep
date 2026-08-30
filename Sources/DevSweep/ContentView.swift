@@ -12,7 +12,6 @@ struct ContentView: View {
     @State private var showingHelp = false
     @State private var showingSettings = false
     @State private var showingScanDetails = false
-    @State private var pathCopied = false
     @State private var pendingCleanupItems: [CacheItem] = []
 
     private let largeThreshold: Int64 = 1 * 1024 * 1024 * 1024
@@ -27,10 +26,6 @@ struct ContentView: View {
 
     private var cleanupItems: [CacheItem] {
         CleanupSelection.selectedItems(from: store.items, visibleItems: visibleItems)
-    }
-
-    private var selectedVisibleItems: [CacheItem] {
-        visibleItems.filter(\.isSelected)
     }
 
     private var cleanupSize: Int64 {
@@ -511,43 +506,6 @@ struct ContentView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Menu {
-                if selectedVisibleItems.isEmpty {
-                    Button("请先勾选项目") {}
-                        .disabled(true)
-                } else {
-                    Button {
-                        store.addToWhitelist(selectedVisibleItems)
-                    } label: {
-                        Label("加入白名单", systemImage: "checkmark.shield")
-                    }
-                    .disabled(store.isScanning || store.isCleaning)
-
-                    Button {
-                        openSelectedFolders(selectedVisibleItems)
-                    } label: {
-                        Label("打开文件夹", systemImage: "folder")
-                    }
-                    .disabled(store.isScanning || store.isCleaning)
-
-                    Button {
-                        copyFullPaths(selectedVisibleItems)
-                    } label: {
-                        Label(
-                            pathCopied ? "已复制完整路径" : "复制完整路径",
-                            systemImage: pathCopied ? "checkmark" : "doc.on.doc"
-                        )
-                    }
-                    .disabled(store.isScanning || store.isCleaning)
-                }
-            } label: {
-                Label(
-                    selectedVisibleItems.isEmpty ? "操作" : "操作 \(selectedVisibleItems.count) 项",
-                    systemImage: "ellipsis.circle"
-                )
-            }
-            .menuStyle(.borderlessButton)
-            .help(selectedVisibleItems.isEmpty ? "请先勾选目录" : "对当前勾选的目录执行操作")
-            Menu {
                 Button("全选当前分类") {
                     store.setAllSelected(true, category: selectedCategory == "全部" ? nil : selectedCategory)
                 }
@@ -593,26 +551,6 @@ struct ContentView: View {
         .padding(.horizontal, 24)
         .padding(.vertical, 12)
         .background(.regularMaterial)
-    }
-
-    private func openSelectedFolders(_ items: [CacheItem]) {
-        let paths = items.map(\.path)
-        if paths.count == 1, let path = paths.first {
-            NSWorkspace.shared.open(path)
-        } else {
-            NSWorkspace.shared.activateFileViewerSelecting(paths)
-        }
-    }
-
-    private func copyFullPaths(_ items: [CacheItem]) {
-        let fullPaths = items.map { $0.path.path }.joined(separator: "\n")
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(fullPaths, forType: .string)
-        pathCopied = true
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            pathCopied = false
-        }
     }
 
     private func categorySubtitle(_ category: String) -> String {
@@ -721,33 +659,42 @@ private struct CacheItemRow: View {
                     .foregroundStyle(.tertiary)
             }
             .frame(minWidth: 92, alignment: .trailing)
-            Button {
-                store.addToWhitelist([item])
+            Menu {
+                Button {
+                    store.addToWhitelist([item])
+                } label: {
+                    Label("加入白名单", systemImage: "checkmark.shield")
+                }
+                .disabled(store.isScanning || store.isCleaning)
+
+                Button {
+                    NSWorkspace.shared.open(item.path)
+                } label: {
+                    Label("打开文件夹", systemImage: "folder")
+                }
+                .disabled(item.kind == .dockerPrune || store.isScanning || store.isCleaning)
+
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(item.path.path, forType: .string)
+                } label: {
+                    Label("复制完整路径", systemImage: "doc.on.doc")
+                }
+                .disabled(store.isScanning || store.isCleaning)
+
+                Divider()
+
+                Button(role: .destructive) {
+                    onClean(item)
+                } label: {
+                    Label("清理这一项", systemImage: "trash")
+                }
+                .disabled(item.risk == .manual || store.isScanning || store.isCleaning)
             } label: {
-                Image(systemName: "checkmark.shield")
+                Image(systemName: "ellipsis.circle")
             }
-            .buttonStyle(.borderless)
-            .foregroundStyle(.green)
-            .help("加入白名单")
-            .disabled(store.isScanning || store.isCleaning)
-            Button {
-                NSWorkspace.shared.open(item.path)
-            } label: {
-                Image(systemName: "folder")
-            }
-            .buttonStyle(.borderless)
-            .foregroundStyle(.secondary)
-            .help("打开文件夹")
-            .disabled(item.kind == .dockerPrune || store.isScanning || store.isCleaning)
-            Button {
-                onClean(item)
-            } label: {
-                Image(systemName: "trash")
-            }
-            .buttonStyle(.borderless)
-            .foregroundStyle(.secondary)
-            .help("仅清理这一项")
-            .disabled(item.risk == .manual || store.isScanning || store.isCleaning)
+            .menuStyle(.borderlessButton)
+            .help("操作")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
