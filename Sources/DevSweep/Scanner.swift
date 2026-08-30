@@ -1082,6 +1082,7 @@ struct CacheCleaner {
 @MainActor
 final class DevSweepStore: ObservableObject {
     private static let projectRootsKey = "DevSweep.projectRoots"
+    private static let selectionStatesKey = "DevSweep.selectionStates"
     private static let whitelistedPathsKey = "DevSweep.whitelistedPaths"
 
     @Published private(set) var items: [CacheItem] = []
@@ -1094,6 +1095,7 @@ final class DevSweepStore: ObservableObject {
     @Published var projectRoots: [URL]
     @Published private(set) var whitelistedPaths: [URL]
     @Published var deepScan = true
+    private var selectionStates: [String: Bool]
 
     init() {
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -1107,6 +1109,12 @@ final class DevSweepStore: ObservableObject {
         }
         let savedWhitelist = UserDefaults.standard.array(forKey: Self.whitelistedPathsKey) as? [String] ?? []
         whitelistedPaths = PathWhitelist.normalized(savedWhitelist.map { URL(fileURLWithPath: $0) })
+        if let data = UserDefaults.standard.data(forKey: Self.selectionStatesKey),
+           let savedStates = try? JSONDecoder().decode([String: Bool].self, from: data) {
+            selectionStates = savedStates
+        } else {
+            selectionStates = [:]
+        }
     }
 
     var categories: [String] {
@@ -1151,7 +1159,7 @@ final class DevSweepStore: ObservableObject {
             }
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.items = report.items
+                self.items = SelectionMemory.restore(report.items, from: self.selectionStates)
                 self.lastReport = report
                 self.scanProgress = ScanProgress(
                     phase: "扫描完成",
@@ -1170,14 +1178,22 @@ final class DevSweepStore: ObservableObject {
         guard let index = items.firstIndex(where: { $0.id == id }) else { return }
         guard items[index].risk != .manual else { return }
         items[index].isSelected = selected
+        selectionStates[SelectionMemory.key(for: items[index].path)] = selected
+        persistSelectionStates()
     }
 
     func setAllSelected(_ selected: Bool, category: String? = nil) {
+        var didChange = false
         for index in items.indices where category == nil || items[index].category == category {
             if items[index].risk != .manual && (selected == false || items[index].kind != .dockerPrune) {
-                items[index].isSelected = selected
+                if items[index].isSelected != selected {
+                    items[index].isSelected = selected
+                    selectionStates[SelectionMemory.key(for: items[index].path)] = selected
+                    didChange = true
+                }
             }
         }
+        if didChange { persistSelectionStates() }
     }
 
     func chooseProjectRoots() {
@@ -1241,6 +1257,10 @@ final class DevSweepStore: ObservableObject {
                 self.isCleaning = false
                 let remainingItems = CleanupSelection.remainingItems(from: self.items, removing: report.removed)
                 self.items = remainingItems
+                for item in report.removed {
+                    self.selectionStates.removeValue(forKey: SelectionMemory.key(for: item.path))
+                }
+                if !report.removed.isEmpty { self.persistSelectionStates() }
                 if report.failures.isEmpty {
                     self.statusMessage = includesDocker
                         ? "已处理 \(report.removed.count) 项，普通目录可从废纸篓恢复，Docker 资源不可恢复"
@@ -1266,6 +1286,11 @@ final class DevSweepStore: ObservableObject {
 
     private func persistWhitelist() {
         UserDefaults.standard.set(whitelistedPaths.map(\.path), forKey: Self.whitelistedPathsKey)
+    }
+
+    private func persistSelectionStates() {
+        guard let data = try? JSONEncoder().encode(selectionStates) else { return }
+        UserDefaults.standard.set(data, forKey: Self.selectionStatesKey)
     }
 
     private static func defaultProjectRoots(home: URL) -> [URL] {

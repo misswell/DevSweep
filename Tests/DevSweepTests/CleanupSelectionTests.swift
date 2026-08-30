@@ -2,6 +2,31 @@ import XCTest
 @testable import DevSweep
 
 final class CleanupSelectionTests: XCTestCase {
+    func testSelectionMemoryRestoresExplicitSelectionStates() {
+        let selectedItem = CacheItem(
+            category: "Xcode",
+            name: "DerivedData",
+            path: URL(fileURLWithPath: "/tmp/derived-data"),
+            size: 1,
+            isSelected: true
+        )
+        let unselectedItem = CacheItem(
+            category: "Xcode",
+            name: "ModuleCache",
+            path: URL(fileURLWithPath: "/tmp/module-cache"),
+            size: 1,
+            isSelected: true
+        )
+
+        let restored = SelectionMemory.restore(
+            [selectedItem, unselectedItem],
+            from: [SelectionMemory.key(for: unselectedItem.path): false]
+        )
+
+        XCTAssertTrue(restored[0].isSelected)
+        XCTAssertFalse(restored[1].isSelected)
+    }
+
     func testWhitelistMatchesThePathAndItsChildren() {
         let whitelist = [URL(fileURLWithPath: "/tmp/project/target")]
 

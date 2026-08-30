@@ -171,6 +171,21 @@ struct CleanupSelection {
     }
 }
 
+struct SelectionMemory {
+    static func key(for path: URL) -> String {
+        path.standardizedFileURL.path
+    }
+
+    static func restore(_ items: [CacheItem], from states: [String: Bool]) -> [CacheItem] {
+        items.map { item in
+            guard let savedSelection = states[key(for: item.path)] else { return item }
+            var restoredItem = item
+            restoredItem.isSelected = savedSelection
+            return restoredItem
+        }
+    }
+}
+
 struct PathWhitelist {
     static func normalized(_ paths: [URL]) -> [URL] {
         let candidates = paths
