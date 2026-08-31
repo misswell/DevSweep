@@ -33,6 +33,37 @@ final class ScannerCoverageTests: XCTestCase {
         }
     }
 
+    func testFixedScannerFindsScriptInspiredApplicationCaches() throws {
+        let home = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: home) }
+
+        let expectedPaths = [
+            "Library/Caches/Microsoft Edge",
+            "Library/Caches/Firefox",
+            "Library/Application Support/Google/GoogleUpdater/crx_cache",
+            "Library/Containers/com.apple.mediaanalysisd/Data/Library/Caches",
+            "Movies/JianyingPro/User Data/Cache",
+            "Library/Caches/Google",
+            "logs"
+        ]
+        for relativePath in expectedPaths {
+            try createAllocatedCache(at: home.appendingPathComponent(relativePath))
+        }
+
+        let report = CacheScanner.scan(
+            projectRoots: [],
+            deepScan: false,
+            home: home,
+            includeSystemCaches: false,
+            progress: { _ in }
+        )
+        let scannedPaths = Set(report.items.map(\.path))
+
+        for relativePath in expectedPaths {
+            XCTAssertTrue(scannedPaths.contains(home.appendingPathComponent(relativePath).standardizedFileURL))
+        }
+    }
+
     func testAmbiguousProjectArtifactsRequireMatchingProjectMarkers() throws {
         let root = try temporaryDirectory()
         defer { try? fileManager.removeItem(at: root) }
@@ -72,6 +103,86 @@ final class ScannerCoverageTests: XCTestCase {
         try Data().write(to: android.appendingPathComponent("build.gradle"))
         XCTAssertEqual(CacheScanner.generatedRule(for: android.appendingPathComponent(".cxx"))?.category, "Android 项目")
         XCTAssertNil(CacheScanner.generatedRule(for: root.appendingPathComponent(".cxx")))
+    }
+
+    func testProjectLogsRequireAProjectMarker() throws {
+        let root = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: root) }
+
+        let service = root.appendingPathComponent("service")
+        let nestedApp = service.appendingPathComponent("app")
+        let ordinary = root.appendingPathComponent("ordinary")
+        try fileManager.createDirectory(at: nestedApp, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: ordinary, withIntermediateDirectories: true)
+        try Data().write(to: service.appendingPathComponent("pom.xml"))
+
+        let nacos = root.appendingPathComponent("nacos")
+        try fileManager.createDirectory(at: nacos.appendingPathComponent("conf"), withIntermediateDirectories: true)
+        try Data().write(to: nacos.appendingPathComponent("conf/application.properties"))
+
+        let directRule = CacheScanner.generatedRule(for: service.appendingPathComponent("logs"))
+        let nestedRule = CacheScanner.generatedRule(for: nestedApp.appendingPathComponent("log"))
+
+        XCTAssertEqual(directRule?.category, "项目日志")
+        XCTAssertEqual(directRule?.risk, .review)
+        XCTAssertEqual(nestedRule?.category, "项目日志")
+        XCTAssertEqual(CacheScanner.generatedRule(for: nacos.appendingPathComponent("logs"))?.category, "项目日志")
+        XCTAssertNil(CacheScanner.generatedRule(for: ordinary.appendingPathComponent("logs")))
+    }
+
+    func testScannerFindsNestedSoftwareUpdateResidues() throws {
+        let home = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: home) }
+
+        let expectedPaths = [
+            "Library/Caches/Mozilla/updates/0/update.mar",
+            "Library/Caches/SomeUpdater/staging/update.zip",
+            "Library/Caches/TencentDocs/downloads/TencentDocs-9.9.9.zip"
+        ]
+        for relativePath in expectedPaths {
+            let file = home.appendingPathComponent(relativePath)
+            try fileManager.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(repeating: 0xA5, count: 1_100_000).write(to: file)
+        }
+
+        let report = CacheScanner.scan(
+            projectRoots: [],
+            deepScan: false,
+            home: home,
+            includeSystemCaches: false,
+            progress: { _ in }
+        )
+        let scannedPaths = Set(report.items.map(\.path))
+
+        for relativePath in expectedPaths {
+            XCTAssertTrue(scannedPaths.contains(home.appendingPathComponent(relativePath).standardizedFileURL))
+        }
+    }
+
+    func testScannerFindsCachesInCustomChromiumProfiles() throws {
+        let home = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: home) }
+
+        let expectedPaths = [
+            "Documents/chrome/Default/Cache",
+            "Documents/chrome2/Profile 1/Code Cache"
+        ]
+        for relativePath in expectedPaths {
+            try createAllocatedCache(at: home.appendingPathComponent(relativePath))
+        }
+
+        let report = CacheScanner.scan(
+            projectRoots: [],
+            deepScan: false,
+            home: home,
+            includeSystemCaches: false,
+            progress: { _ in }
+        )
+        let scannedPaths = Set(report.items.map(\.path))
+
+        for relativePath in expectedPaths {
+            XCTAssertTrue(scannedPaths.contains(home.appendingPathComponent(relativePath).standardizedFileURL))
+        }
     }
 
     private func temporaryDirectory() throws -> URL {
