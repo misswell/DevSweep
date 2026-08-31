@@ -165,10 +165,6 @@ struct CleanupSelection {
         return items.filter { visibleIDs.contains($0.id) && $0.isSelected && $0.risk != .manual }
     }
 
-    static func excludingWhitelistedItems(from items: [CacheItem], whitelist: [URL]) -> [CacheItem] {
-        items.filter { !PathWhitelist.contains($0.path, in: whitelist) }
-    }
-
     static func remainingItems(from items: [CacheItem], removing removedItems: [CacheItem]) -> [CacheItem] {
         let removedIDs = Set(removedItems.map(\.id))
         return items.filter { !removedIDs.contains($0.id) }

@@ -1674,15 +1674,12 @@ final class DevSweepStore: ObservableObject {
     func addToWhitelist(_ items: [CacheItem]) {
         guard !items.isEmpty, !isScanning, !isCleaning else { return }
         let updated = PathWhitelist.normalized(whitelistedPaths + items.map(\.path))
-        let remainingItems = CleanupSelection.excludingWhitelistedItems(from: self.items, whitelist: updated)
-        let removedCount = self.items.count - remainingItems.count
-        guard updated != whitelistedPaths || removedCount > 0 else { return }
+        guard updated != whitelistedPaths else { return }
         whitelistedPaths = updated
         persistWhitelist()
-        self.items = remainingItems
-        statusMessage = removedCount > 0
-            ? "已将 \(removedCount) 项加入白名单"
-            : "白名单已更新"
+        statusMessage = items.count == 1
+            ? "已加入白名单"
+            : "已加入白名单 \(items.count) 项"
     }
 
     func removeFromWhitelist(_ path: URL) {
