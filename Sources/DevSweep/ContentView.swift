@@ -494,7 +494,7 @@ struct ContentView: View {
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 760, minHeight: 34, maxHeight: 34)
                 .opacity(store.scanProgress.currentPath.isEmpty ? 0 : 1)
-                .help(store.scanProgress.currentPath)
+                .help(Text(verbatim: store.scanProgress.currentPath))
         }
         .frame(maxWidth: .infinity, minHeight: 260, maxHeight: 260)
     }
@@ -651,7 +651,7 @@ private struct CacheItemRow: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .textSelection(.enabled)
-                    .help(item.path.path)
+                    .help(Text(verbatim: item.path.path))
                 if !item.note.isEmpty {
                     Text(item.note)
                         .font(.caption2)
@@ -798,6 +798,7 @@ private struct ScanDetailsView: View {
                 ForEach(report.scannedRoots, id: \.path) { root in
                     Label(root.devSweepDisplayPath, systemImage: "folder")
                         .font(.caption.monospaced())
+                        .help(Text(verbatim: root.path))
                 }
             }
             Text("扫描统计")
@@ -822,6 +823,8 @@ private struct ScanDetailsView: View {
                                     Text(diagnostic.path.devSweepDisplayPath)
                                         .font(.caption.monospaced())
                                         .lineLimit(1)
+                                        .truncationMode(.middle)
+                                        .help(Text(verbatim: diagnostic.path.path))
                                 }
                                 Text(diagnostic.reason)
                                     .font(.caption2)
