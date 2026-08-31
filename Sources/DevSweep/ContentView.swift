@@ -13,6 +13,7 @@ struct ContentView: View {
     @State private var showingSettings = false
     @State private var showingScanDetails = false
     @State private var pendingCleanupItems: [CacheItem] = []
+    @AppStorage("DevSweep.miniMode") private var miniMode = false
 
     private let largeThreshold: Int64 = 1 * 1024 * 1024 * 1024
 
@@ -45,13 +46,46 @@ struct ContentView: View {
     }
 
     var body: some View {
-        NavigationSplitView {
-            sidebar
-                .navigationSplitViewColumnWidth(min: 240, ideal: 290, max: 360)
-        } detail: {
-            dashboard
+        Group {
+            if miniMode {
+                MiniModeView(
+                    hasScanReport: hasScanReport,
+                    onExit: { miniMode = false },
+                    onCleanup: { items in
+                        pendingCleanupItems = items
+                        showingConfirmation = true
+                    }
+                )
+            } else {
+                NavigationSplitView {
+                    sidebar
+                        .navigationSplitViewColumnWidth(min: 240, ideal: 290, max: 360)
+                } detail: {
+                    dashboard
+                }
+                .frame(minWidth: 1_040, minHeight: 700)
+            }
         }
-        .frame(minWidth: 1_040, minHeight: 700)
+        .confirmationDialog(
+            pendingCleanupItems.count == 1 ? "确认清理这一项？" : "确认清理选中的项目？",
+            isPresented: $showingConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button(pendingCleanupIncludesDocker ? "执行清理" : "移入废纸篓", role: .destructive) {
+                let ids = Set(pendingCleanupItems.map(\.id))
+                pendingCleanupItems = []
+                store.cleanSelected(ids: ids)
+            }
+            Button("取消", role: .cancel) {
+                pendingCleanupItems = []
+            }
+        } message: {
+            Text(
+                pendingCleanupIncludesDocker
+                    ? "将处理 \(pendingCleanupItems.count) 项，共 \(pendingCleanupItems.reduce(0) { $0 + $1.size }.devSweepFileSize)。Docker 资源会通过官方 CLI 直接清理，不能从废纸篓恢复；普通目录会移入废纸篓。"
+                    : "将处理 \(pendingCleanupItems.count) 项，共 \(pendingCleanupItems.reduce(0) { $0 + $1.size }.devSweepFileSize)。运行中的模拟器、未登记目录和手动项目不会自动删除。"
+            )
+        }
         .task {
             try? await Task.sleep(nanoseconds: 2_000_000_000)
             guard !Task.isCancelled else { return }
@@ -202,26 +236,6 @@ struct ContentView: View {
             bottomBar
         }
         .background(Color(nsColor: .windowBackgroundColor))
-        .confirmationDialog(
-            pendingCleanupItems.count == 1 ? "确认清理这一项？" : "确认清理选中的项目？",
-            isPresented: $showingConfirmation,
-            titleVisibility: .visible
-        ) {
-            Button(pendingCleanupIncludesDocker ? "执行清理" : "移入废纸篓", role: .destructive) {
-                let ids = Set(pendingCleanupItems.map(\.id))
-                pendingCleanupItems = []
-                store.cleanSelected(ids: ids)
-            }
-            Button("取消", role: .cancel) {
-                pendingCleanupItems = []
-            }
-        } message: {
-            Text(
-                pendingCleanupIncludesDocker
-                    ? "将处理 \(pendingCleanupItems.count) 项，共 \(pendingCleanupItems.reduce(0) { $0 + $1.size }.devSweepFileSize)。Docker 资源会通过官方 CLI 直接清理，不能从废纸篓恢复；普通目录会移入废纸篓。"
-                    : "将处理 \(pendingCleanupItems.count) 项，共 \(pendingCleanupItems.reduce(0) { $0 + $1.size }.devSweepFileSize)。运行中的模拟器、未登记目录和手动项目不会自动删除。"
-            )
-        }
     }
 
     private var header: some View {
@@ -246,6 +260,13 @@ struct ContentView: View {
                     .background(.quaternary.opacity(0.55))
                     .clipShape(Capsule())
             }
+            Button {
+                miniMode = true
+            } label: {
+                Label("迷你", systemImage: "rectangle.compress.vertical")
+            }
+            .buttonStyle(.bordered)
+            .help("切换到迷你模式")
             Button {
                 showingSettings = true
             } label: {
@@ -586,6 +607,233 @@ struct ContentView: View {
         case "设计工具": return "paintbrush"
         default: return "externaldrive"
         }
+    }
+}
+
+private struct MiniModeView: View {
+    @EnvironmentObject private var store: DevSweepStore
+
+    let hasScanReport: Bool
+    let onExit: () -> Void
+    let onCleanup: ([CacheItem]) -> Void
+
+    private var cleanupItems: [CacheItem] {
+        CleanupSelection.selectedItems(from: store.items, visibleItems: store.items)
+    }
+
+    private var cleanupSize: Int64 {
+        cleanupItems.reduce(0) { $0 + $1.size }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            miniHeader
+            Divider()
+            mainContent
+            miniBottomBar
+        }
+        .frame(minWidth: 420, minHeight: 360)
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var miniHeader: some View {
+        HStack(spacing: 10) {
+            Label("DevSweep", systemImage: "sparkles")
+                .font(.headline.weight(.semibold))
+            Text("迷你模式")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+            if !store.isScanning && !store.isCleaning {
+                Text("\(store.items.count) 项")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Button {
+                onExit()
+            } label: {
+                Label("完整", systemImage: "rectangle.expand.vertical")
+            }
+            .buttonStyle(.bordered)
+            .help("返回完整模式")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+    }
+
+    @ViewBuilder
+    private var mainContent: some View {
+        if store.isScanning {
+            scanningState
+        } else {
+            VStack(alignment: .leading, spacing: 12) {
+                summary
+                if store.items.isEmpty {
+                    emptyState
+                } else {
+                    itemList
+                }
+            }
+            .padding(16)
+        }
+    }
+
+    private var summary: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("可回收空间")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(store.totalSize.devSweepFileSize)
+                    .font(.system(size: 25, weight: .bold, design: .rounded))
+            }
+            Spacer()
+            VStack(alignment: .trailing, spacing: 2) {
+                Text("待清理")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("\(cleanupItems.count) 项 · \(cleanupSize.devSweepFileSize)")
+                    .font(.subheadline.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(.tint)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .background(Color.accentColor.opacity(0.1))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private var itemList: some View {
+        ScrollView {
+            LazyVStack(spacing: 6) {
+                ForEach(store.items) { item in
+                    MiniItemRow(item: item)
+                }
+            }
+        }
+        .frame(maxHeight: 255)
+    }
+
+    private var scanningState: some View {
+        VStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.large)
+            Text(store.statusMessage)
+                .font(.headline)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+            Text("已检查 \(store.scanProgress.checkedPaths) 个路径 · 命中 \(store.scanProgress.matchedPaths) 项")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            if !store.scanProgress.currentPath.isEmpty {
+                Text(store.scanProgress.currentPath)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(Text(verbatim: store.scanProgress.currentPath))
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 190, maxHeight: 190)
+        .padding(.horizontal, 16)
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 8) {
+            Image(systemName: hasScanReport ? "checkmark.circle" : "sparkles")
+                .font(.system(size: 34))
+                .foregroundStyle(.green)
+            Text(hasScanReport ? "没有可清理项目" : "准备开始扫描")
+                .font(.headline)
+            Text(hasScanReport ? "当前扫描范围内没有符合条件的项目" : "点击下方“扫描”查找开发者缓存和生成物")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity, minHeight: 150, maxHeight: 150)
+    }
+
+    private var miniBottomBar: some View {
+        HStack(spacing: 8) {
+            Menu {
+                Button("全选可清理项目") {
+                    store.setAllSelected(true)
+                }
+                Button("取消选择") {
+                    store.setAllSelected(false)
+                }
+            } label: {
+                Image(systemName: "checkmark.circle")
+            }
+            .menuStyle(.borderlessButton)
+            .help("选择项目")
+            .disabled(store.items.isEmpty || store.isScanning || store.isCleaning)
+
+            Spacer()
+
+            Button {
+                store.scan()
+            } label: {
+                Label(hasScanReport ? "重新扫描" : "扫描", systemImage: hasScanReport ? "arrow.clockwise" : "play.fill")
+            }
+            .buttonStyle(.bordered)
+            .disabled(store.isScanning || store.isCleaning)
+
+            Button {
+                onCleanup(cleanupItems)
+            } label: {
+                Label("清理 \(cleanupItems.count) 项", systemImage: "trash")
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(cleanupItems.isEmpty || store.isScanning || store.isCleaning)
+        }
+        .controlSize(.regular)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(.regularMaterial)
+    }
+}
+
+private struct MiniItemRow: View {
+    @EnvironmentObject private var store: DevSweepStore
+    let item: CacheItem
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Toggle("", isOn: Binding(
+                get: { item.isSelected },
+                set: { store.setSelected(item.id, selected: $0) }
+            ))
+            .labelsHidden()
+            .toggleStyle(.checkbox)
+            .disabled(item.risk == .manual)
+
+            Circle()
+                .fill(item.risk.color)
+                .frame(width: 7, height: 7)
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(item.name)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                Text(item.details)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(Text(verbatim: item.path.path))
+            }
+            Spacer(minLength: 8)
+            Text(item.size.devSweepFileSize)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 7)
+        .background(.background)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .contentShape(Rectangle())
     }
 }
 
