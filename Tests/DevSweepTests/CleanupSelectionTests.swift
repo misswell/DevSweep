@@ -45,6 +45,37 @@ final class CleanupSelectionTests: XCTestCase {
         XCTAssertEqual(paths.map(\.path), ["/tmp/other", "/tmp/project/target"])
     }
 
+    func testExcludingWhitelistedItemsRemovesCoveredItemsOnly() {
+        let parent = CacheItem(
+            category: "Rust / Tauri 项目",
+            name: "target",
+            path: URL(fileURLWithPath: "/tmp/project/target"),
+            size: 3,
+            isSelected: true
+        )
+        let child = CacheItem(
+            category: "Rust / Tauri 项目",
+            name: "debug",
+            path: URL(fileURLWithPath: "/tmp/project/target/debug"),
+            size: 2,
+            isSelected: false
+        )
+        let sibling = CacheItem(
+            category: "Xcode",
+            name: "DerivedData",
+            path: URL(fileURLWithPath: "/tmp/project/DerivedData"),
+            size: 1,
+            isSelected: false
+        )
+
+        let remaining = CleanupSelection.excludingWhitelistedItems(
+            from: [parent, child, sibling],
+            whitelist: [parent.path]
+        )
+
+        XCTAssertEqual(remaining.map(\.id), [sibling.id])
+    }
+
     func testSelectionIsScopedToVisibleItems() {
         let currentPageItem = CacheItem(
             category: "Rust / Tauri 项目",
