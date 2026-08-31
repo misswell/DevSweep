@@ -625,6 +625,10 @@ private struct MiniModeView: View {
         cleanupItems.reduce(0) { $0 + $1.size }
     }
 
+    private var cleanupIncludesDocker: Bool {
+        cleanupItems.contains { $0.kind == .dockerPrune }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             miniHeader
@@ -632,115 +636,206 @@ private struct MiniModeView: View {
             mainContent
             miniBottomBar
         }
-        .frame(minWidth: 420, minHeight: 360)
+        .frame(width: 360, height: 640)
         .background(Color(nsColor: .windowBackgroundColor))
     }
 
     private var miniHeader: some View {
-        HStack(spacing: 10) {
-            Label("DevSweep", systemImage: "sparkles")
-                .font(.headline.weight(.semibold))
-            Text("迷你模式")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Spacer()
-            if !store.isScanning && !store.isCleaning {
-                Text("\(store.items.count) 项")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Image(systemName: "sparkles")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(.tint)
+                    .frame(width: 34, height: 34)
+                    .background(Color.accentColor.opacity(0.12))
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("DevSweep")
+                        .font(.headline.weight(.semibold))
+                    Text("迷你模式")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 4)
+                Button {
+                    onExit()
+                } label: {
+                    Image(systemName: "rectangle.expand.vertical")
+                }
+                .buttonStyle(.borderless)
+                .help("返回完整模式")
             }
-            Button {
-                onExit()
-            } label: {
-                Label("完整", systemImage: "rectangle.expand.vertical")
-            }
-            .buttonStyle(.bordered)
-            .help("返回完整模式")
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
-    }
 
-    @ViewBuilder
-    private var mainContent: some View {
-        if store.isScanning {
-            scanningState
-        } else {
-            VStack(alignment: .leading, spacing: 12) {
-                summary
-                if store.items.isEmpty {
-                    emptyState
+            HStack(spacing: 8) {
+                Label(
+                    hasScanReport ? "\(store.items.count) 项" : "尚未扫描",
+                    systemImage: "square.stack.3d.up"
+                )
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                Spacer(minLength: 8)
+                if store.isScanning || store.isCleaning {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text(store.statusMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 } else {
-                    itemList
+                    Text("\(cleanupItems.count) 项待清理")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
                 }
             }
-            .padding(16)
         }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+    }
+
+    private var mainContent: some View {
+        Group {
+            if store.isScanning {
+                scanningState
+            } else {
+                VStack(alignment: .leading, spacing: 12) {
+                    summary
+                    HStack(spacing: 8) {
+                        Text("缓存项目")
+                            .font(.subheadline.weight(.semibold))
+                        Spacer(minLength: 8)
+                        Text("\(store.items.count) 项")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    if store.items.isEmpty {
+                        emptyState
+                    } else {
+                        itemList
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .padding(.horizontal, 14)
+        .padding(.top, 14)
+        .padding(.bottom, 10)
     }
 
     private var summary: some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("可回收空间")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text(store.totalSize.devSweepFileSize)
-                    .font(.system(size: 25, weight: .bold, design: .rounded))
-            }
-            Spacer()
-            VStack(alignment: .trailing, spacing: 2) {
-                Text("待清理")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text("\(cleanupItems.count) 项 · \(cleanupSize.devSweepFileSize)")
-                    .font(.subheadline.monospacedDigit().weight(.semibold))
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 12) {
+                Image(systemName: "externaldrive.badge.minus")
+                    .font(.title2.weight(.semibold))
                     .foregroundStyle(.tint)
+                    .frame(width: 42, height: 42)
+                    .background(Color.accentColor.opacity(0.13))
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("可回收空间")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(store.totalSize.devSweepFileSize)
+                        .font(.system(size: 30, weight: .bold, design: .rounded))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.72)
+                }
+                Spacer(minLength: 8)
+            }
+
+            Divider()
+                .opacity(0.65)
+
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("待清理")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("\(cleanupItems.count) 项")
+                        .font(.subheadline.weight(.semibold))
+                }
+                Spacer(minLength: 8)
+                Text(cleanupSize.devSweepFileSize)
+                    .font(.title3.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(.tint)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+            }
+
+            if !hasScanReport {
+                Text("点击下方“扫描”查找开发者缓存和生成物")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
-        .background(Color.accentColor.opacity(0.1))
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .padding(16)
+        .background(
+            LinearGradient(
+                colors: [Color.accentColor.opacity(0.16), Color.accentColor.opacity(0.05)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(Color.accentColor.opacity(0.15))
+        }
     }
 
     private var itemList: some View {
         ScrollView {
-            LazyVStack(spacing: 6) {
+            LazyVStack(spacing: 8) {
                 ForEach(store.items) { item in
                     MiniItemRow(item: item)
                 }
             }
+            .padding(.bottom, 2)
         }
-        .frame(maxHeight: 255)
+        .scrollIndicators(.automatic)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var scanningState: some View {
         VStack(spacing: 10) {
+            Spacer(minLength: 0)
+            Image(systemName: "magnifyingglass.circle.fill")
+                .font(.system(size: 40))
+                .foregroundStyle(.tint)
             ProgressView()
                 .controlSize(.large)
             Text(store.statusMessage)
                 .font(.headline)
                 .lineLimit(1)
                 .minimumScaleFactor(0.8)
-            Text("已检查 \(store.scanProgress.checkedPaths) 个路径 · 命中 \(store.scanProgress.matchedPaths) 项")
+            Text("已检查 \(store.scanProgress.checkedPaths) 个路径 · 命中 \(store.scanProgress.matchedPaths) 项 · 跳过 \(store.scanProgress.skippedPaths) 个")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .lineLimit(1)
+                .multilineTextAlignment(.center)
+                .lineLimit(2)
+                .minimumScaleFactor(0.8)
             if !store.scanProgress.currentPath.isEmpty {
                 Text(store.scanProgress.currentPath)
                     .font(.caption2.monospaced())
                     .foregroundStyle(.tertiary)
-                    .lineLimit(1)
+                    .lineLimit(3)
                     .truncationMode(.middle)
+                    .multilineTextAlignment(.center)
+                    .textSelection(.enabled)
                     .help(Text(verbatim: store.scanProgress.currentPath))
             }
+            Spacer(minLength: 0)
         }
-        .frame(maxWidth: .infinity, minHeight: 190, maxHeight: 190)
-        .padding(.horizontal, 16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.horizontal, 8)
     }
 
     private var emptyState: some View {
         VStack(spacing: 8) {
+            Spacer(minLength: 0)
             Image(systemName: hasScanReport ? "checkmark.circle" : "sparkles")
                 .font(.system(size: 34))
                 .foregroundStyle(.green)
@@ -750,47 +845,76 @@ private struct MiniModeView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
+                .lineLimit(3)
+                .minimumScaleFactor(0.85)
+            Spacer(minLength: 0)
         }
-        .frame(maxWidth: .infinity, minHeight: 150, maxHeight: 150)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var miniBottomBar: some View {
-        HStack(spacing: 8) {
-            Menu {
-                Button("全选可清理项目") {
-                    store.setAllSelected(true)
+        VStack(spacing: 10) {
+            HStack(spacing: 8) {
+                Menu {
+                    Button("全选可清理项目") {
+                        store.setAllSelected(true)
+                    }
+                    Button("取消选择") {
+                        store.setAllSelected(false)
+                    }
+                } label: {
+                    Label("选择", systemImage: "checkmark.circle")
                 }
-                Button("取消选择") {
-                    store.setAllSelected(false)
+                .menuStyle(.borderlessButton)
+                .help("选择项目")
+                .disabled(store.items.isEmpty || store.isScanning || store.isCleaning)
+
+                Spacer(minLength: 8)
+
+                Text(cleanupItems.isEmpty ? "未选择项目" : "已选 \(cleanupItems.count) 项")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    store.scan()
+                } label: {
+                    Label(
+                        hasScanReport ? "重新扫描" : "扫描",
+                        systemImage: hasScanReport ? "arrow.clockwise" : "play.fill"
+                    )
+                    .frame(maxWidth: .infinity)
                 }
-            } label: {
-                Image(systemName: "checkmark.circle")
-            }
-            .menuStyle(.borderlessButton)
-            .help("选择项目")
-            .disabled(store.items.isEmpty || store.isScanning || store.isCleaning)
+                .buttonStyle(.bordered)
+                .disabled(store.isScanning || store.isCleaning)
 
-            Spacer()
-
-            Button {
-                store.scan()
-            } label: {
-                Label(hasScanReport ? "重新扫描" : "扫描", systemImage: hasScanReport ? "arrow.clockwise" : "play.fill")
+                Button {
+                    onCleanup(cleanupItems)
+                } label: {
+                    Label("清理", systemImage: "trash")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(cleanupItems.isEmpty || store.isScanning || store.isCleaning)
             }
-            .buttonStyle(.bordered)
-            .disabled(store.isScanning || store.isCleaning)
 
-            Button {
-                onCleanup(cleanupItems)
-            } label: {
-                Label("清理 \(cleanupItems.count) 项", systemImage: "trash")
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(cleanupItems.isEmpty || store.isScanning || store.isCleaning)
+            Text(
+                cleanupItems.isEmpty
+                    ? "扫描后选择项目即可清理"
+                    : cleanupIncludesDocker
+                        ? "Docker 资源清理后不可恢复"
+                        : "普通目录会优先移入废纸篓"
+            )
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .truncationMode(.middle)
         }
         .controlSize(.regular)
         .padding(.horizontal, 14)
-        .padding(.vertical, 10)
+        .padding(.vertical, 12)
         .background(.regularMaterial)
     }
 }
@@ -822,6 +946,7 @@ private struct MiniItemRow: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    .textSelection(.enabled)
                     .help(Text(verbatim: item.path.path))
             }
             Spacer(minLength: 8)
