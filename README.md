@@ -2,7 +2,7 @@
 
 DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcode、Rust/Tauri、Node、SwiftPM、Cargo、Gradle、Maven、Python、Go、Flutter、VS Code、Cursor 等开发环境。
 
-当前版本：0.1.21
+当前版本：0.1.22
 
 ## 当前功能
 
@@ -15,6 +15,7 @@ DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcod
 - 覆盖 Docker 官方 CLI 可回收的未使用镜像、已停止容器、未使用卷和 Build Cache，并显示 Docker Desktop 虚拟磁盘占用；虚拟磁盘只读，Docker CLI 清理需单独确认且不能从废纸篓恢复。
 - 覆盖 Deno、Corepack、Playwright、Puppeteer、rustup、Conda、Bazel、Android SDK、NuGet、mise、asdf、ccache/sccache、Hugging Face、PyTorch、Whisper、Keras、TensorFlow Hub、Ollama、LM Studio 及 JetBrains/Android Studio 日志等常见开发工具数据；同时识别各工具的自定义缓存环境变量。
 - 补充 npx、Ruby/Bundler、node-gyp、VS Code/Cursor 扩展安装包、前端工具链、云 CLI、Terraform/Helm、Cypress/Selenium 和多平台 Xcode DeviceSupport；系统级 CoreSimulator/Xcode 缓存只读展示为手动处理。
+- 补充 nvm、Volta、SonarQube、pnpm registry 元数据、SwiftPM XDG/旧缓存、Scala/sbt/Ivy/Coursier/Metals，以及 Instruments、SourceKitService 和 Xcode Previews 缓存；同时覆盖 Lingma、Trae CN、Windsurf、Zed、OpenCode Desktop、Nova 等开发工具的明确缓存叶子，并识别 NVM_DIR、VOLTA_HOME、SONAR_USER_HOME、COURSIER_CACHE 和 CocoaPods 自定义目录。
 - 覆盖 Edge、Firefox、Google 应用、媒体分析、剪映和自定义 Chromium 资料目录缓存；跨 Caches、Application Support、Containers、Group Containers、HTTPStorages 和临时目录识别 Sparkle/Squirrel 等软件升级残留，系统级位置仅展示为手动项；存在项目标志时识别项目运行日志与 Nacos 日志。
 - 项目扫描覆盖 `.terragrunt-cache`、`.astro`、`zig-out`、`.cxx` 和项目内 DerivedData；对 Composer `vendor` 与 .NET `bin`/`obj` 必须先验证项目标志，避免按同名目录误报源码或运行时文件。
 - 识别 CoreSimulator 设备，通过 `xcrun simctl delete` 删除，避免直接破坏设备注册。
@@ -75,4 +76,4 @@ GitHub Actions 的 tag 发布还需要配置仓库 Secrets：`APPLE_CERTIFICATE_
 
 ## 安全边界
 
-DevSweep 不会直接删除 Docker 虚拟磁盘、用户源码、Git 仓库、照片或文档。Docker 镜像、容器、卷和 Build Cache 通过官方 CLI 清理，不能移入废纸篓，必须由用户逐项确认；只允许当前 Docker CLI 指向本机 Unix socket 或 localhost，拒绝远程 context；Docker.raw 只展示占用。删除项目生成物和模拟器设备会让下次构建/运行重新生成数据，可能需要重新下载依赖。运行测试、模拟器或 Docker 构建时，请先停止相关进程再处理对应资源。
+DevSweep 不会直接删除 Docker 虚拟磁盘、用户源码、Git 仓库、照片或文档。Docker 镜像、容器、卷和 Build Cache 通过官方 CLI 清理，不能移入废纸篓，必须由用户逐项确认；只允许当前 Docker CLI 指向本机 Unix socket 或 localhost，拒绝远程 context；Docker.raw 只展示占用。开发工具的 Electron 数据只按明确应用和缓存叶子白名单识别，不扫描整个 Application Support，也不触碰 IDE 用户数据、会话历史或工作区状态。删除项目生成物和模拟器设备会让下次构建/运行重新生成数据，可能需要重新下载依赖。运行测试、模拟器或 Docker 构建时，请先停止相关进程再处理对应资源。
