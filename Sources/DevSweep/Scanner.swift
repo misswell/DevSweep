@@ -130,7 +130,12 @@ struct CacheScanner {
             skippedPaths: collector.skippedPaths,
             permissionFailures: collector.permissionFailures
         ))
-        items += softwareUpdateResidues(home: home, collector: &collector, progress: progress)
+        items += softwareUpdateResidues(
+            home: home,
+            includeSystemLocations: includeSystemCaches,
+            collector: &collector,
+            progress: progress
+        )
 
         progress(ScanProgress(
             phase: "检查 Docker 容器资源",
@@ -610,10 +615,72 @@ struct CacheScanner {
 
     private static func softwareUpdateResidues(
         home: URL,
+        includeSystemLocations: Bool,
         collector: inout ScanCollector,
         progress: @escaping (ScanProgress) -> Void
     ) -> [CacheItem] {
-        let root = home.appendingPathComponent("Library/Caches")
+        var roots: [(url: URL, maxDepth: Int, risk: RiskLevel)] = [
+            (home.appendingPathComponent("Library/Caches"), 10, .review),
+            (home.appendingPathComponent("Library/Application Support"), 8, .review),
+            (home.appendingPathComponent("Library/HTTPStorages"), 8, .review)
+        ]
+
+        for container in childDirectories(
+            at: home.appendingPathComponent("Library/Containers"),
+            collector: &collector,
+            progress: progress
+        ) {
+            let data = container.appendingPathComponent("Data")
+            roots.append((data.appendingPathComponent("Library/Caches"), 8, .review))
+            roots.append((data.appendingPathComponent("Library/Application Support"), 8, .review))
+            roots.append((data.appendingPathComponent("Library/HTTPStorages"), 8, .review))
+            roots.append((data.appendingPathComponent("tmp"), 6, .review))
+        }
+
+        for container in childDirectories(
+            at: home.appendingPathComponent("Library/Group Containers"),
+            collector: &collector,
+            progress: progress
+        ) {
+            roots.append((container.appendingPathComponent("Library/Caches"), 8, .review))
+            roots.append((container.appendingPathComponent("Library/Application Support"), 8, .review))
+            roots.append((container.appendingPathComponent("Library/HTTPStorages"), 8, .review))
+            roots.append((container.appendingPathComponent("tmp"), 6, .review))
+        }
+
+        if home.standardizedFileURL == fileManager.homeDirectoryForCurrentUser.standardizedFileURL {
+            roots.append((fileManager.temporaryDirectory, 8, .review))
+        }
+
+        if includeSystemLocations {
+            roots.append((URL(fileURLWithPath: "/Library/Caches"), 8, .manual))
+            roots.append((URL(fileURLWithPath: "/Library/Application Support"), 6, .manual))
+            roots.append((URL(fileURLWithPath: "/Library/Updates"), 6, .manual))
+        }
+
+        var items: [CacheItem] = []
+        var scannedRoots: Set<String> = []
+        for root in roots {
+            let standardized = root.url.standardizedFileURL
+            guard scannedRoots.insert(standardized.path).inserted else { continue }
+            items += softwareUpdateResidues(
+                in: standardized,
+                maxDepth: root.maxDepth,
+                risk: root.risk,
+                collector: &collector,
+                progress: progress
+            )
+        }
+        return items
+    }
+
+    private static func softwareUpdateResidues(
+        in root: URL,
+        maxDepth: Int,
+        risk: RiskLevel,
+        collector: inout ScanCollector,
+        progress: @escaping (ScanProgress) -> Void
+    ) -> [CacheItem] {
         guard fileManager.fileExists(atPath: root.path),
               let enumerator = fileManager.enumerator(
                 at: root,
@@ -622,9 +689,13 @@ struct CacheScanner {
               ) else { return [] }
 
         var items: [CacheItem] = []
+        let skippedDirectoryNames: Set<String> = [
+            "attachments", "databases", "documents", "indexeddb", "local storage",
+            "media", "messages", "profiles", "session storage", "user", "webstorage"
+        ]
         for case let url as URL in enumerator {
             let depth = url.pathComponents.count - root.pathComponents.count
-            if depth > 10 {
+            if depth > maxDepth {
                 collector.skippedPaths += 1
                 enumerator.skipDescendants()
                 continue
@@ -637,29 +708,98 @@ struct CacheScanner {
                 continue
             }
 
-            let name = url.lastPathComponent
-            let matchesArchive = name == "update.zip"
-                || url.pathExtension.lowercased() == "mar"
-                || (name.hasPrefix("TencentDocs") && url.pathExtension.lowercased() == "zip")
-            let matchesStagedApp = name == "Updated.app" && values.isDirectory == true
-            guard matchesArchive || matchesStagedApp else { continue }
+            let lowercasedName = url.lastPathComponent.lowercased()
+            if values.isDirectory == true,
+               skippedDirectoryNames.contains(lowercasedName),
+               !hasSoftwareUpdateContext(url) {
+                collector.skippedPaths += 1
+                enumerator.skipDescendants()
+                continue
+            }
+
+            guard let residueName = softwareUpdateResidueName(
+                for: url,
+                isDirectory: values.isDirectory == true
+            ) else {
+                let currentDirectorySignalsUpdate = isSoftwareUpdateContextComponent(lowercasedName)
+                if values.isDirectory == true,
+                   depth >= 4,
+                   !hasSoftwareUpdateContext(url),
+                   !currentDirectorySignalsUpdate {
+                    collector.skippedPaths += 1
+                    enumerator.skipDescendants()
+                }
+                continue
+            }
 
             if let item = makeItem(
                 category: "应用缓存",
-                name: matchesStagedApp ? "暂存的软件更新" : "软件更新安装包",
+                name: residueName,
                 path: url,
-                risk: matchesStagedApp ? .review : .safe,
-                note: matchesStagedApp
-                    ? "更新程序留下的暂存应用；确认相关应用未在更新后再清理"
-                    : "软件更新下载残留；需要时会重新下载",
+                risk: risk,
+                note: risk == .manual
+                    ? "系统级软件更新残留；仅展示占用，请通过对应更新程序或系统工具处理"
+                    : "软件更新下载或暂存残留；确认相关应用未在更新后再清理",
                 collector: &collector,
                 progress: progress
             ) {
                 items.append(item)
             }
-            if matchesStagedApp { enumerator.skipDescendants() }
+            if values.isDirectory == true { enumerator.skipDescendants() }
         }
         return items
+    }
+
+    private static func softwareUpdateResidueName(for url: URL, isDirectory: Bool) -> String? {
+        let name = url.lastPathComponent
+        let lowercasedName = name.lowercased()
+        let hasContext = hasSoftwareUpdateContext(url)
+
+        if isDirectory {
+            if lowercasedName == "updated.app"
+                || (lowercasedName.hasSuffix(".app") && hasContext) {
+                return "暂存的软件更新"
+            }
+            if hasContext && (lowercasedName.hasSuffix(".download") || lowercasedName.hasSuffix(".partial")) {
+                return "未完成的软件更新下载"
+            }
+            return nil
+        }
+
+        let archiveSuffixes = [
+            ".zip", ".pkg", ".dmg", ".mar", ".patch", ".delta", ".download", ".partial",
+            ".tar", ".tar.gz", ".tar.bz2", ".tar.xz"
+        ]
+        guard archiveSuffixes.contains(where: lowercasedName.hasSuffix) else { return nil }
+
+        let isKnownGenericResidue = lowercasedName == "update.zip"
+            || lowercasedName.hasSuffix(".mar")
+            || (lowercasedName.hasPrefix("tencentdocs") && lowercasedName.hasSuffix(".zip"))
+        guard isKnownGenericResidue || hasContext else { return nil }
+        return "软件更新安装包"
+    }
+
+    private static func hasSoftwareUpdateContext(_ url: URL) -> Bool {
+        url.deletingLastPathComponent().pathComponents.contains {
+            isSoftwareUpdateContextComponent($0.lowercased())
+        }
+    }
+
+    private static func isSoftwareUpdateContextComponent(_ component: String) -> Bool {
+        let tokens = component
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+        let exactSignals: Set<String> = [
+            "update", "updates", "updater", "updaters", "upgrade", "upgrades",
+            "sparkle", "squirrel", "staging", "pending"
+        ]
+        return tokens.contains { token in
+            exactSignals.contains(token)
+                || token.hasPrefix("autoupdate")
+                || token.contains("softwareupdate")
+                || token.hasPrefix("squirrel")
+                || token.hasSuffix("updater")
+        }
     }
 
     private static func dockerItems(

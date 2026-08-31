@@ -180,6 +180,50 @@ final class ScannerCoverageTests: XCTestCase {
         }
     }
 
+    func testScannerFindsUpdateResiduesAcrossCommonUserLocations() throws {
+        let home = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: home) }
+
+        let expectedPaths = [
+            "Library/Application Support/Acme/Updater/staging/Acme-2.0.dmg",
+            "Library/Application Support/Acme/Updater/downloads/archive.tar",
+            "Library/Containers/com.acme.app/Data/Library/Application Support/Squirrel/pending/update.pkg",
+            "Library/Containers/com.acme.app/Data/Library/HTTPStorages/Updater/pending/update.delta",
+            "Library/Group Containers/group.acme/Library/Caches/Sparkle/downloads/release.zip",
+            "Library/Group Containers/group.acme/Library/HTTPStorages/Sparkle/downloads/release.patch",
+            "Library/HTTPStorages/com.acme/updates/update.patch"
+        ]
+        for relativePath in expectedPaths {
+            let file = home.appendingPathComponent(relativePath)
+            try fileManager.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(repeating: 0xA5, count: 1_100_000).write(to: file)
+        }
+
+        let unrelatedArchive = home.appendingPathComponent("Library/Application Support/Acme/Documents/archive.zip")
+        try fileManager.createDirectory(at: unrelatedArchive.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(repeating: 0xA5, count: 1_100_000).write(to: unrelatedArchive)
+        let misleadingArchive = home.appendingPathComponent("Library/Application Support/Acme/customer-update.zip")
+        try Data(repeating: 0xA5, count: 1_100_000).write(to: misleadingArchive)
+        let partialDownload = home.appendingPathComponent("Library/Application Support/Acme/Updater/pending/App.download")
+        try createAllocatedCache(at: partialDownload)
+
+        let report = CacheScanner.scan(
+            projectRoots: [],
+            deepScan: false,
+            home: home,
+            includeSystemCaches: false,
+            progress: { _ in }
+        )
+        let scannedPaths = Set(report.items.map(\.path))
+
+        for relativePath in expectedPaths {
+            XCTAssertTrue(scannedPaths.contains(home.appendingPathComponent(relativePath).standardizedFileURL))
+        }
+        XCTAssertTrue(scannedPaths.contains(partialDownload.standardizedFileURL))
+        XCTAssertFalse(scannedPaths.contains(unrelatedArchive.standardizedFileURL))
+        XCTAssertFalse(scannedPaths.contains(misleadingArchive.standardizedFileURL))
+    }
+
     func testScannerFindsCachesInCustomChromiumProfiles() throws {
         let home = try temporaryDirectory()
         defer { try? fileManager.removeItem(at: home) }
