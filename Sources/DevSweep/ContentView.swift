@@ -1,6 +1,36 @@
 import AppKit
 import SwiftUI
 
+struct MiniModeWindowPlacement {
+    static func expandedFrame(
+        from miniFrame: CGRect,
+        normalFrame: CGRect?,
+        visibleFrame: CGRect,
+        fallbackSize: CGSize = CGSize(width: 1_040, height: 700)
+    ) -> CGRect {
+        let requestedSize = normalFrame?.size ?? fallbackSize
+        let width = min(max(requestedSize.width, 1), max(visibleFrame.width, 1))
+        let height = min(max(requestedSize.height, 1), max(visibleFrame.height, 1))
+
+        // Keep the edge closest to the screen center fixed while expanding away
+        // from the edge where the mini window currently lives.
+        let isOnRightSide = miniFrame.midX >= visibleFrame.midX
+        let proposedX = isOnRightSide ? miniFrame.maxX - width : miniFrame.minX
+        let proposedY = miniFrame.maxY - height
+        let minX = visibleFrame.minX
+        let maxX = visibleFrame.maxX - width
+        let minY = visibleFrame.minY
+        let maxY = visibleFrame.maxY - height
+
+        return CGRect(
+            x: min(max(proposedX, minX), maxX),
+            y: min(max(proposedY, minY), maxY),
+            width: width,
+            height: height
+        )
+    }
+}
+
 struct ContentView: View {
     @EnvironmentObject private var store: DevSweepStore
     @EnvironmentObject private var updater: DevSweepSoftwareUpdater
@@ -13,6 +43,7 @@ struct ContentView: View {
     @State private var showingSettings = false
     @State private var showingScanDetails = false
     @State private var pendingCleanupItems: [CacheItem] = []
+    @State private var savedNormalWindowFrame: NSRect?
     @AppStorage("DevSweep.miniMode") private var miniMode = false
 
     private let largeThreshold: Int64 = 1 * 1024 * 1024 * 1024
@@ -50,7 +81,7 @@ struct ContentView: View {
             if miniMode {
                 MiniModeView(
                     hasScanReport: hasScanReport,
-                    onExit: { miniMode = false },
+                    onExit: exitMiniMode,
                     onCleanup: { items in
                         pendingCleanupItems = items
                         showingConfirmation = true
@@ -261,7 +292,7 @@ struct ContentView: View {
                     .clipShape(Capsule())
             }
             Button {
-                miniMode = true
+                enterMiniMode()
             } label: {
                 Label("迷你", systemImage: "rectangle.compress.vertical")
             }
@@ -295,6 +326,59 @@ struct ContentView: View {
         .controlSize(.large)
         .padding(.horizontal, 30)
         .padding(.vertical, 18)
+    }
+
+    private func enterMiniMode() {
+        if let window = activeDevSweepWindow() {
+            savedNormalWindowFrame = window.frame
+        }
+        miniMode = true
+    }
+
+    private func exitMiniMode() {
+        let window = activeDevSweepWindow()
+        let miniFrame = window?.frame
+        let normalFrame = savedNormalWindowFrame
+        let fallbackSize = window.map {
+            $0.frameRect(
+                forContentRect: NSRect(
+                    origin: .zero,
+                    size: CGSize(width: 1_040, height: 700)
+                )
+            ).size
+        } ?? CGSize(width: 1_040, height: 700)
+
+        miniMode = false
+
+        guard let window, let miniFrame else { return }
+
+        // SwiftUI applies the full-mode content size on the next run loop. Apply
+        // the placement after that update, and once more after its window resize
+        // animation has settled so the window remains inside the visible frame.
+        let applyPlacement = {
+            guard let visibleFrame = (window.screen ?? NSScreen.main)?.visibleFrame else { return }
+            let targetFrame = MiniModeWindowPlacement.expandedFrame(
+                from: miniFrame,
+                normalFrame: normalFrame,
+                visibleFrame: visibleFrame,
+                fallbackSize: fallbackSize
+            )
+            window.setFrame(targetFrame, display: true, animate: true)
+        }
+
+        DispatchQueue.main.async {
+            applyPlacement()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                applyPlacement()
+            }
+        }
+    }
+
+    private func activeDevSweepWindow() -> NSWindow? {
+        if let keyWindow = NSApp.keyWindow, keyWindow.isVisible {
+            return keyWindow
+        }
+        return NSApp.windows.first { $0.isVisible && $0.contentView != nil }
     }
 
     private var overviewCard: some View {
