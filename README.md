@@ -2,7 +2,7 @@
 
 DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcode、Rust/Tauri、Node、SwiftPM、Cargo、Gradle、Maven、Python、Go、Flutter、VS Code、Cursor 等开发环境。
 
-当前版本：0.1.18
+当前版本：0.1.19
 
 ## 当前功能
 
@@ -14,6 +14,8 @@ DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcod
 - 读取 npm、Cargo、Go、pip、uv、Poetry、Gradle 等自定义环境变量和 npm 配置，尽量覆盖不在默认路径的缓存。
 - 覆盖 Docker 官方 CLI 可回收的未使用镜像、已停止容器、未使用卷和 Build Cache，并显示 Docker Desktop 虚拟磁盘占用；虚拟磁盘只读，Docker CLI 清理需单独确认且不能从废纸篓恢复。
 - 覆盖 Deno、Corepack、Playwright、Puppeteer、rustup、Conda、Bazel、Android SDK、NuGet、mise、asdf、ccache/sccache、Hugging Face、PyTorch、Whisper、Keras、TensorFlow Hub、Ollama、LM Studio 及 JetBrains/Android Studio 日志等常见开发工具数据；同时识别各工具的自定义缓存环境变量。
+- 补充 npx、Ruby/Bundler、node-gyp、VS Code/Cursor 扩展安装包、前端工具链、云 CLI、Terraform/Helm、Cypress/Selenium 和多平台 Xcode DeviceSupport；系统级 CoreSimulator/Xcode 缓存只读展示为手动处理。
+- 项目扫描覆盖 `.terragrunt-cache`、`.astro`、`zig-out`、`.cxx` 和项目内 DerivedData；对 Composer `vendor` 与 .NET `bin`/`obj` 必须先验证项目标志，避免按同名目录误报源码或运行时文件。
 - 识别 CoreSimulator 设备，通过 `xcrun simctl delete` 删除，避免直接破坏设备注册。
 - 对 Xcode Archives、iOS DeviceSupport、SourcePackages、XCTest 克隆设备、项目生成物标记为“建议确认”或“手动处理”。
 - 扫描过程中显示当前路径、已检查数量、跳过数量和权限异常；扫描完成后可查看实际扫描范围和诊断详情。
@@ -65,6 +67,8 @@ GitHub Actions 的 tag 发布还需要配置仓库 Secrets：`APPLE_CERTIFICATE_
 - [jemishavasoya/dev-cleaner](https://github.com/jemishavasoya/dev-cleaner)：开发工具缓存覆盖范围。
 - [riponcm/Jharu](https://github.com/riponcm/Jharu)：Docker、AI/ML 模型、Playwright/Puppeteer、Conda 等开发者数据覆盖，以及按安全等级解释清理后果。
 - [georgekhananaev/spark-clean](https://github.com/georgekhananaev/spark-clean)：Docker/Ollama 使用官方 CLI、命令型清理不可恢复的安全提示和 review-first 流程。
+- [tw93/Mole](https://github.com/tw93/Mole)：多语言工具链、系统级 Xcode 缓存和带项目标志保护的生成物覆盖思路。
+- [momenbasel/PureMac](https://github.com/momenbasel/PureMac)：IDE、语言工具链和可重建缓存分类思路。
 
 代码仅借鉴公开项目描述和使用策略，没有复制其源代码。
 

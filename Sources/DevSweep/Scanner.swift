@@ -10,7 +10,7 @@ private struct CacheRule {
     let note: String
 }
 
-private struct GeneratedRule {
+struct GeneratedRule {
     let category: String
     let risk: RiskLevel
     let note: String
@@ -101,6 +101,7 @@ struct CacheScanner {
         deepScan: Bool,
         whitelistedPaths: [URL] = [],
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
+        includeSystemCaches: Bool = true,
         progress: @escaping (ScanProgress) -> Void
     ) -> ScanReport {
         let startedAt = Date()
@@ -109,6 +110,9 @@ struct CacheScanner {
 
         progress(ScanProgress(phase: "扫描固定开发者缓存"))
         var items = fixedItems(home: home, collector: &collector, progress: progress)
+        if includeSystemCaches {
+            items += systemItems(collector: &collector, progress: progress)
+        }
 
         progress(ScanProgress(
             phase: "发现可配置的工具链缓存",
@@ -256,14 +260,22 @@ struct CacheScanner {
             CacheRule(category: "Xcode", name: "Archives", relativePath: "Library/Developer/Xcode/Archives", risk: .review, note: "可能包含发布归档，请确认后清理"),
             CacheRule(category: "Xcode", name: "Products", relativePath: "Library/Developer/Xcode/Products", risk: .review, note: "项目产物，可按需重新构建"),
             CacheRule(category: "Xcode", name: "iOS DeviceSupport", relativePath: "Library/Developer/Xcode/iOS DeviceSupport", risk: .manual, note: "删除后真机调试可能需要重新下载"),
+            CacheRule(category: "Xcode", name: "watchOS DeviceSupport", relativePath: "Library/Developer/Xcode/watchOS DeviceSupport", risk: .manual, note: "删除后 Apple Watch 真机调试可能需要重新下载符号"),
+            CacheRule(category: "Xcode", name: "tvOS DeviceSupport", relativePath: "Library/Developer/Xcode/tvOS DeviceSupport", risk: .manual, note: "删除后 Apple TV 真机调试可能需要重新下载符号"),
+            CacheRule(category: "Xcode", name: "macOS DeviceSupport", relativePath: "Library/Developer/Xcode/macOS DeviceSupport", risk: .manual, note: "删除后 macOS 设备调试可能需要重新下载符号"),
+            CacheRule(category: "Xcode", name: "visionOS DeviceSupport", relativePath: "Library/Developer/Xcode/visionOS DeviceSupport", risk: .manual, note: "删除后 Vision Pro 真机调试可能需要重新下载符号"),
+            CacheRule(category: "Xcode", name: "Playgrounds", relativePath: "Library/Developer/Xcode/UserData/Playgrounds", risk: .review, note: "Playground 生成数据和缓存；请确认没有需要保留的结果"),
             CacheRule(category: "CoreSimulator", name: "模拟器缓存", relativePath: "Library/Developer/CoreSimulator/Caches", risk: .safe, note: "模拟器缓存，不含设备数据"),
             CacheRule(category: "CoreSimulator", name: "模拟器日志", relativePath: "Library/Logs/CoreSimulator", risk: .safe, note: "模拟器会重新生成日志"),
 
             CacheRule(category: "包管理器", name: "npm 下载缓存", relativePath: ".npm/_cacache", risk: .safe, note: "npm 会重新下载依赖"),
             CacheRule(category: "包管理器", name: "npm 日志", relativePath: ".npm/_logs", risk: .safe, note: "仅为 npm 日志"),
+            CacheRule(category: "包管理器", name: "npx 临时包", relativePath: ".npm/_npx", risk: .safe, note: "npx 会在下次执行时重新下载临时包"),
+            CacheRule(category: "包管理器", name: "npm 预编译缓存", relativePath: ".npm/_prebuilds", risk: .safe, note: "原生模块会在需要时重新下载或编译"),
             CacheRule(category: "包管理器", name: "npm（旧路径）", relativePath: ".npm-cache-user/_cacache", risk: .safe, note: "npm 会重新下载依赖"),
             CacheRule(category: "包管理器", name: "Yarn", relativePath: "Library/Caches/Yarn", risk: .safe, note: "Yarn 会重新下载依赖"),
             CacheRule(category: "包管理器", name: "Yarn（旧缓存）", relativePath: ".cache/yarn", risk: .safe, note: "Yarn 会重新下载依赖"),
+            CacheRule(category: "包管理器", name: "Yarn 离线缓存", relativePath: ".yarn/cache", risk: .review, note: "Yarn 会重新下载依赖；离线环境下请保留"),
             CacheRule(category: "包管理器", name: "pnpm store", relativePath: "Library/pnpm/store", risk: .safe, note: "pnpm 会重新下载依赖"),
             CacheRule(category: "包管理器", name: "pnpm store（Linux 兼容路径）", relativePath: ".local/share/pnpm/store", risk: .safe, note: "pnpm 会重新下载依赖"),
             CacheRule(category: "包管理器", name: "Bun", relativePath: ".bun/install/cache", risk: .safe, note: "Bun 会重新下载依赖"),
@@ -327,22 +339,57 @@ struct CacheScanner {
             CacheRule(category: "语言工具链", name: "sccache", relativePath: ".cache/sccache", risk: .safe, note: "编译器会重新编译"),
             CacheRule(category: "语言工具链", name: "ccache（macOS）", relativePath: "Library/Caches/ccache", risk: .safe, note: "编译器会重新编译"),
             CacheRule(category: "语言工具链", name: "sccache（macOS）", relativePath: "Library/Caches/sccache", risk: .safe, note: "编译器会重新编译"),
+            CacheRule(category: "语言工具链", name: "ccache（经典路径）", relativePath: ".ccache", risk: .safe, note: "编译器会重新编译"),
+            CacheRule(category: "语言工具链", name: "Zig 全局缓存", relativePath: ".cache/zig", risk: .safe, note: "Zig 会重新生成构建缓存"),
+            CacheRule(category: "Ruby", name: "Bundler 下载缓存", relativePath: ".bundle/cache", risk: .safe, note: "Bundler 会重新下载 gem"),
+            CacheRule(category: "Ruby", name: "RubyGems 索引缓存", relativePath: ".gem/specs", risk: .safe, note: "RubyGems 会重新获取索引"),
+            CacheRule(category: "Ruby", name: "rbenv 下载缓存", relativePath: ".rbenv/cache", risk: .safe, note: "rbenv 会重新下载安装包"),
+            CacheRule(category: "Ruby", name: "CPAN 构建缓存", relativePath: ".cpan/build", risk: .safe, note: "CPAN 会重新创建构建目录"),
+            CacheRule(category: "语言工具链", name: "Hex 缓存", relativePath: ".hex/cache", risk: .safe, note: "Hex 会重新下载 Elixir/Erlang 包"),
             CacheRule(category: "Python 项目", name: "pipx 缓存", relativePath: ".cache/pipx", risk: .safe, note: "pipx 会重新下载包"),
             CacheRule(category: "Python 项目", name: "pre-commit 缓存", relativePath: ".cache/pre-commit", risk: .safe, note: "pre-commit 会重新下载环境"),
             CacheRule(category: "Python 项目", name: "Jupyter 缓存", relativePath: ".cache/jupyter", risk: .safe, note: "Jupyter 会重新生成缓存"),
 
             CacheRule(category: "IDE", name: "VS Code Cache", relativePath: "Library/Application Support/Code/Cache", risk: .safe, note: "编辑器会自动重建"),
             CacheRule(category: "IDE", name: "VS Code CachedData", relativePath: "Library/Application Support/Code/CachedData", risk: .safe, note: "编辑器会自动重建"),
+            CacheRule(category: "IDE", name: "VS Code 扩展安装包缓存", relativePath: "Library/Application Support/Code/CachedExtensionVSIXs", risk: .safe, note: "扩展更新时会重新下载安装包"),
+            CacheRule(category: "IDE", name: "VS Code Code Cache", relativePath: "Library/Application Support/Code/Code Cache", risk: .safe, note: "编辑器会自动重建"),
+            CacheRule(category: "IDE", name: "VS Code Service Worker", relativePath: "Library/Application Support/Code/Service Worker", risk: .review, note: "编辑器会重建；清理前建议退出 VS Code"),
+            CacheRule(category: "IDE", name: "VS Code 日志", relativePath: "Library/Application Support/Code/logs", risk: .safe, note: "仅为编辑器日志"),
             CacheRule(category: "IDE", name: "VS Code 系统缓存", relativePath: "Library/Caches/com.microsoft.VSCode", risk: .safe, note: "编辑器会自动重建"),
             CacheRule(category: "IDE", name: "VS Code workspaceStorage", relativePath: "Library/Application Support/Code/User/workspaceStorage", risk: .review, note: "工作区状态和扩展数据，确认后再清理"),
             CacheRule(category: "IDE", name: "Cursor Cache", relativePath: "Library/Application Support/Cursor/Cache", risk: .safe, note: "编辑器会自动重建"),
             CacheRule(category: "IDE", name: "Cursor CachedData", relativePath: "Library/Application Support/Cursor/CachedData", risk: .safe, note: "编辑器会自动重建"),
             CacheRule(category: "IDE", name: "Cursor Code Cache", relativePath: "Library/Application Support/Cursor/Code Cache", risk: .safe, note: "编辑器会自动重建"),
             CacheRule(category: "IDE", name: "Cursor GPUCache", relativePath: "Library/Application Support/Cursor/GPUCache", risk: .safe, note: "编辑器会自动重建"),
+            CacheRule(category: "IDE", name: "Cursor 扩展安装包缓存", relativePath: "Library/Application Support/Cursor/CachedExtensionVSIXs", risk: .safe, note: "扩展更新时会重新下载安装包"),
+            CacheRule(category: "IDE", name: "Cursor Service Worker", relativePath: "Library/Application Support/Cursor/Service Worker", risk: .review, note: "编辑器会重建；清理前建议退出 Cursor"),
+            CacheRule(category: "IDE", name: "Cursor 日志", relativePath: "Library/Application Support/Cursor/logs", risk: .safe, note: "仅为编辑器日志"),
             CacheRule(category: "IDE", name: "Cursor workspaceStorage", relativePath: "Library/Application Support/Cursor/User/workspaceStorage", risk: .review, note: "工作区状态和扩展数据，确认后再清理"),
             CacheRule(category: "IDE", name: "JetBrains 缓存", relativePath: "Library/Caches/JetBrains", risk: .safe, note: "IDE 会自动重建"),
             CacheRule(category: "IDE", name: "JetBrains 日志", relativePath: "Library/Logs/JetBrains", risk: .safe, note: "IDE 会重新生成日志"),
             CacheRule(category: "IDE", name: "Android Studio 日志", relativePath: "Library/Logs/AndroidStudio", risk: .safe, note: "Android Studio 会重新生成日志"),
+            CacheRule(category: "IDE", name: "Unity Hub 缓存", relativePath: "Library/Caches/com.unity3d.unityhub", risk: .safe, note: "Unity Hub 会自动重建缓存"),
+
+            CacheRule(category: "前端工具链", name: "TypeScript 缓存", relativePath: ".cache/typescript", risk: .safe, note: "TypeScript 工具会重新生成缓存"),
+            CacheRule(category: "前端工具链", name: "Electron 缓存", relativePath: ".cache/electron", risk: .safe, note: "Electron 会重新下载或生成缓存"),
+            CacheRule(category: "前端工具链", name: "node-gyp 缓存", relativePath: ".cache/node-gyp", risk: .safe, note: "node-gyp 会重新下载头文件并编译"),
+            CacheRule(category: "前端工具链", name: "node-gyp（经典路径）", relativePath: ".node-gyp", risk: .safe, note: "node-gyp 会重新下载头文件并编译"),
+            CacheRule(category: "前端工具链", name: "Turborepo 全局缓存", relativePath: ".turbo/cache", risk: .safe, note: "Turborepo 会重新生成缓存"),
+            CacheRule(category: "前端工具链", name: "Webpack 缓存", relativePath: ".cache/webpack", risk: .safe, note: "Webpack 会重新生成缓存"),
+            CacheRule(category: "前端工具链", name: "ESLint 缓存", relativePath: ".cache/eslint", risk: .safe, note: "ESLint 会重新生成缓存"),
+            CacheRule(category: "前端工具链", name: "Prettier 缓存", relativePath: ".cache/prettier", risk: .safe, note: "Prettier 会重新生成缓存"),
+            CacheRule(category: "测试工具", name: "Cypress 浏览器缓存", relativePath: "Library/Caches/Cypress", risk: .review, note: "Cypress 会重新下载浏览器组件"),
+            CacheRule(category: "测试工具", name: "Selenium 缓存", relativePath: ".cache/selenium", risk: .review, note: "Selenium Manager 会重新下载驱动和浏览器组件"),
+
+            CacheRule(category: "云与基础设施", name: "Terraform Provider 缓存", relativePath: ".terraform.d/plugin-cache", risk: .safe, note: "Terraform 会重新下载 provider"),
+            CacheRule(category: "云与基础设施", name: "Helm 缓存", relativePath: "Library/Caches/helm", risk: .safe, note: "Helm 会重新获取仓库数据"),
+            CacheRule(category: "云与基础设施", name: "Kubernetes 缓存", relativePath: ".kube/cache", risk: .safe, note: "kubectl 会重新获取服务端数据"),
+            CacheRule(category: "云与基础设施", name: "AWS CLI 缓存", relativePath: ".aws/cli/cache", risk: .safe, note: "AWS CLI 会重新获取临时缓存"),
+            CacheRule(category: "云与基础设施", name: "Google Cloud 日志", relativePath: ".config/gcloud/logs", risk: .safe, note: "仅为 gcloud 日志"),
+            CacheRule(category: "云与基础设施", name: "Azure CLI 日志", relativePath: ".azure/logs", risk: .safe, note: "仅为 Azure CLI 日志"),
+            CacheRule(category: "Docker", name: "Docker BuildX 缓存", relativePath: ".docker/buildx/cache", risk: .safe, note: "BuildX 会重新生成构建缓存"),
+            CacheRule(category: "包管理器", name: "Homebrew 日志", relativePath: "Library/Logs/Homebrew", risk: .safe, note: "仅为 Homebrew 构建和安装日志"),
 
         ]
 
@@ -362,6 +409,39 @@ struct CacheScanner {
             }
         }
         return items
+    }
+
+    private static func systemItems(
+        collector: inout ScanCollector,
+        progress: @escaping (ScanProgress) -> Void
+    ) -> [CacheItem] {
+        let rules: [(String, String, URL, String)] = [
+            (
+                "CoreSimulator",
+                "系统级模拟器缓存（只读）",
+                URL(fileURLWithPath: "/Library/Developer/CoreSimulator/Caches"),
+                "系统级缓存可能需要管理员权限；请先退出 Xcode 和所有模拟器，再手动处理"
+            ),
+            (
+                "Xcode",
+                "系统级文档缓存（只读）",
+                URL(fileURLWithPath: "/Library/Developer/Xcode/DocumentationCache"),
+                "系统级文档索引可能需要管理员权限；请先退出 Xcode，再手动处理"
+            )
+        ]
+
+        return rules.compactMap { category, name, path, note in
+            makeItem(
+                category: category,
+                name: name,
+                path: path,
+                risk: .manual,
+                note: note,
+                collector: &collector,
+                progress: progress,
+                isSelected: false
+            )
+        }
     }
 
     private static func dynamicItems(
@@ -452,6 +532,11 @@ struct CacheScanner {
            let configuredPath = configuredValue(named: "cache", in: npmrc),
            let path = expandedPath(configuredPath, home: home) {
             add("包管理器", "npm 配置缓存", path, .safe, "来自 ~/.npmrc，npm 会重新下载依赖")
+        }
+
+        let rubyGemsRoot = home.appendingPathComponent(".gem/ruby")
+        for version in childDirectories(at: rubyGemsRoot, collector: &collector, progress: progress) {
+            add("Ruby", "RubyGems 包缓存 · \(version.lastPathComponent)", version.appendingPathComponent("cache"), .safe, "RubyGems 会重新下载 gem 包")
         }
 
         let googleCache = home.appendingPathComponent("Library/Caches/Google")
@@ -821,21 +906,45 @@ struct CacheScanner {
         ".tox": GeneratedRule(category: "Python 项目", risk: .review, note: "tox 测试环境，删除后会重新创建"),
         ".nox": GeneratedRule(category: "Python 项目", risk: .review, note: "nox 测试环境，删除后会重新创建"),
         ".terraform": GeneratedRule(category: "项目生成物", risk: .review, note: "Terraform 工作目录，删除后需要重新初始化"),
+        ".terragrunt-cache": GeneratedRule(category: "项目生成物", risk: .safe, note: "Terragrunt 下载的模块和 provider 缓存，会自动重建"),
         ".nx": GeneratedRule(category: "Node.js 项目", risk: .safe, note: "Nx 缓存，会自动重建"),
         ".angular": GeneratedRule(category: "Node.js 项目", risk: .safe, note: "Angular 缓存，会自动重建"),
         ".nuxt": GeneratedRule(category: "Node.js 项目", risk: .safe, note: "Nuxt 构建缓存，会自动重建"),
         ".output": GeneratedRule(category: "Node.js 项目", risk: .review, note: "Nuxt 输出目录，可按需重新生成"),
         ".expo": GeneratedRule(category: "Node.js 项目", risk: .review, note: "Expo 项目缓存，删除后会重新生成"),
+        ".astro": GeneratedRule(category: "Node.js 项目", risk: .safe, note: "Astro 构建缓存，会自动重建"),
         "cmake-build-debug": GeneratedRule(category: "项目生成物", risk: .review, note: "CMake 构建产物，可按需重新生成"),
         "cmake-build-release": GeneratedRule(category: "项目生成物", risk: .review, note: "CMake 构建产物，可按需重新生成"),
         ".zig-cache": GeneratedRule(category: "项目生成物", risk: .safe, note: "Zig 构建缓存，会自动重建"),
         "zig-cache": GeneratedRule(category: "项目生成物", risk: .safe, note: "Zig 构建缓存，会自动重建"),
+        "zig-out": GeneratedRule(category: "项目生成物", risk: .review, note: "Zig 构建输出，可按需重新生成"),
+        ".cxx": GeneratedRule(category: "Android 项目", risk: .safe, note: "Android NDK/CMake 构建缓存，会自动重建"),
         "bazel-out": GeneratedRule(category: "项目生成物", risk: .safe, note: "Bazel 输出缓存，会自动重建"),
         "buck-out": GeneratedRule(category: "项目生成物", risk: .safe, note: "Buck 输出缓存，会自动重建"),
         ".gradle": GeneratedRule(category: "JVM", risk: .safe, note: "项目级 Gradle 缓存，会自动重建")
     ]
 
-    private static func generatedRule(for url: URL) -> GeneratedRule? {
+    static func generatedRule(for url: URL) -> GeneratedRule? {
+        let name = url.lastPathComponent
+        let parent = url.deletingLastPathComponent()
+        if name == "vendor" {
+            guard fileManager.fileExists(atPath: parent.appendingPathComponent("composer.json").path) else { return nil }
+            return GeneratedRule(category: "PHP 项目", risk: .review, note: "Composer 依赖，删除后 composer install 会重新安装")
+        }
+        if name == "bin" || name == "obj" {
+            guard directoryContainsProjectFile(parent, extensions: ["csproj", "fsproj", "vbproj"]) else { return nil }
+            return GeneratedRule(category: ".NET 项目", risk: .review, note: ".NET 构建产物，删除后 dotnet build 会重新生成")
+        }
+        if name == "DerivedData" {
+            guard directoryContainsProjectFile(parent, extensions: ["xcodeproj", "xcworkspace"]) else { return nil }
+            return GeneratedRule(category: "Apple 项目", risk: .review, note: "项目内 Xcode DerivedData，删除后会重新构建")
+        }
+        if name == ".cxx" {
+            let grandparent = parent.deletingLastPathComponent()
+            guard directoryContainsNamedFile(parent, names: ["build.gradle", "build.gradle.kts"])
+                    || directoryContainsNamedFile(grandparent, names: ["build.gradle", "build.gradle.kts"])
+            else { return nil }
+        }
         if url.lastPathComponent == "Build" && url.deletingLastPathComponent().lastPathComponent == "Carthage" {
             return GeneratedRule(category: "Apple 项目", risk: .review, note: "Carthage 构建产物，会重新下载或构建")
         }
@@ -846,6 +955,19 @@ struct CacheScanner {
             return GeneratedRule(category: "项目生成物", risk: .review, note: "CMake 构建产物，可按需重新生成")
         }
         return generatedRules[url.lastPathComponent]
+    }
+
+    private static func directoryContainsProjectFile(_ directory: URL, extensions: Set<String>) -> Bool {
+        guard let children = try? fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return false }
+        return children.contains { extensions.contains($0.pathExtension.lowercased()) }
+    }
+
+    private static func directoryContainsNamedFile(_ directory: URL, names: Set<String>) -> Bool {
+        names.contains { fileManager.fileExists(atPath: directory.appendingPathComponent($0).path) }
     }
 
     private static func makeItem(
@@ -1120,8 +1242,9 @@ final class DevSweepStore: ObservableObject {
     var categories: [String] {
         let order = [
             "Xcode", "CoreSimulator", "XCTest", "Rust / Tauri 项目", "项目生成物", "Node.js 项目",
-            "Apple 项目", "Swift 项目", "Flutter 项目", "Python 项目", "测试产物", "包管理器",
-            "语言工具链", "AI/ML", "Docker", "JVM", "IDE", "Android Studio", "设计工具", "其他开发缓存"
+            "Apple 项目", "Swift 项目", "Flutter 项目", "Python 项目", "PHP 项目", ".NET 项目",
+            "Android 项目", "测试产物", "测试工具", "包管理器", "语言工具链", "Ruby", "前端工具链",
+            "云与基础设施", "AI/ML", "Docker", "JVM", "IDE", "Android Studio", "设计工具", "其他开发缓存"
         ]
         let present = Set(items.map(\.category))
         return order.filter(present.contains) + present.subtracting(order).sorted()
