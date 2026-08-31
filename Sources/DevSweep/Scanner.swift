@@ -124,6 +124,15 @@ struct CacheScanner {
         items += dynamicItems(home: home, collector: &collector, progress: progress)
 
         progress(ScanProgress(
+            phase: "扫描软件升级残留",
+            checkedPaths: collector.checkedPaths,
+            matchedPaths: items.count,
+            skippedPaths: collector.skippedPaths,
+            permissionFailures: collector.permissionFailures
+        ))
+        items += softwareUpdateResidues(home: home, collector: &collector, progress: progress)
+
+        progress(ScanProgress(
             phase: "检查 Docker 容器资源",
             checkedPaths: collector.checkedPaths,
             matchedPaths: items.count,
@@ -371,6 +380,16 @@ struct CacheScanner {
             CacheRule(category: "IDE", name: "Android Studio 日志", relativePath: "Library/Logs/AndroidStudio", risk: .safe, note: "Android Studio 会重新生成日志"),
             CacheRule(category: "IDE", name: "Unity Hub 缓存", relativePath: "Library/Caches/com.unity3d.unityhub", risk: .safe, note: "Unity Hub 会自动重建缓存"),
 
+            CacheRule(category: "浏览器缓存", name: "Microsoft Edge 缓存", relativePath: "Library/Caches/Microsoft Edge", risk: .safe, note: "退出 Edge 后清理；浏览器会自动重建缓存"),
+            CacheRule(category: "浏览器缓存", name: "Microsoft Edge Dev 缓存", relativePath: "Library/Caches/Microsoft Edge Dev", risk: .safe, note: "退出 Edge Dev 后清理；浏览器会自动重建缓存"),
+            CacheRule(category: "浏览器缓存", name: "Microsoft Edge Beta 缓存", relativePath: "Library/Caches/Microsoft Edge Beta", risk: .safe, note: "退出 Edge Beta 后清理；浏览器会自动重建缓存"),
+            CacheRule(category: "浏览器缓存", name: "Firefox 缓存", relativePath: "Library/Caches/Firefox", risk: .safe, note: "退出 Firefox 后清理；浏览器会自动重建缓存"),
+            CacheRule(category: "浏览器缓存", name: "Google 应用缓存", relativePath: "Library/Caches/Google", risk: .safe, note: "退出 Chrome、Android Studio 等 Google 应用后清理；缓存会自动重建"),
+            CacheRule(category: "应用缓存", name: "Google 更新下载缓存", relativePath: "Library/Application Support/Google/GoogleUpdater/crx_cache", risk: .safe, note: "Google Updater 会在需要时重新下载安装包"),
+            CacheRule(category: "应用缓存", name: "媒体分析缓存", relativePath: "Library/Containers/com.apple.mediaanalysisd/Data/Library/Caches", risk: .safe, note: "macOS 媒体分析服务会重新生成缓存"),
+            CacheRule(category: "应用缓存", name: "剪映缓存", relativePath: "Movies/JianyingPro/User Data/Cache", risk: .review, note: "退出剪映后清理；请先确认没有仍需使用的草稿缓存"),
+            CacheRule(category: "项目日志", name: "用户日志目录", relativePath: "logs", risk: .review, note: "用户主目录下的日志；确认不再需要排查问题后清理"),
+
             CacheRule(category: "前端工具链", name: "TypeScript 缓存", relativePath: ".cache/typescript", risk: .safe, note: "TypeScript 工具会重新生成缓存"),
             CacheRule(category: "前端工具链", name: "Electron 缓存", relativePath: ".cache/electron", risk: .safe, note: "Electron 会重新下载或生成缓存"),
             CacheRule(category: "前端工具链", name: "node-gyp 缓存", relativePath: ".cache/node-gyp", risk: .safe, note: "node-gyp 会重新下载头文件并编译"),
@@ -559,6 +578,23 @@ struct CacheScanner {
             }
         }
 
+        let documents = home.appendingPathComponent("Documents")
+        for browserRoot in childDirectories(at: documents, collector: &collector, progress: progress)
+            where browserRoot.lastPathComponent.lowercased().hasPrefix("chrome") {
+            for profile in childDirectories(at: browserRoot, collector: &collector, progress: progress)
+                where profile.lastPathComponent == "Default" || profile.lastPathComponent.hasPrefix("Profile ") {
+                for cacheName in ["Cache", "Code Cache"] {
+                    add(
+                        "浏览器缓存",
+                        "自定义 Chromium \(profile.lastPathComponent) · \(cacheName)",
+                        profile.appendingPathComponent(cacheName),
+                        .safe,
+                        "退出使用该资料目录的 Chromium 浏览器后清理；缓存会自动重建"
+                    )
+                }
+            }
+        }
+
         let appCache = home.appendingPathComponent("Library/Caches")
         let vendorPrefixes: [(String, String, String)] = [
             ("com.figma.", "Figma", "设计工具会自动重建缓存"),
@@ -569,6 +605,60 @@ struct CacheScanner {
             add("设计工具", "\(match.1) · \(child.lastPathComponent)", child, .safe, match.2)
         }
 
+        return items
+    }
+
+    private static func softwareUpdateResidues(
+        home: URL,
+        collector: inout ScanCollector,
+        progress: @escaping (ScanProgress) -> Void
+    ) -> [CacheItem] {
+        let root = home.appendingPathComponent("Library/Caches")
+        guard fileManager.fileExists(atPath: root.path),
+              let enumerator = fileManager.enumerator(
+                at: root,
+                includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+                options: []
+              ) else { return [] }
+
+        var items: [CacheItem] = []
+        for case let url as URL in enumerator {
+            let depth = url.pathComponents.count - root.pathComponents.count
+            if depth > 10 {
+                collector.skippedPaths += 1
+                enumerator.skipDescendants()
+                continue
+            }
+
+            collector.checked(url)
+            guard let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+                  values.isSymbolicLink != true else {
+                enumerator.skipDescendants()
+                continue
+            }
+
+            let name = url.lastPathComponent
+            let matchesArchive = name == "update.zip"
+                || url.pathExtension.lowercased() == "mar"
+                || (name.hasPrefix("TencentDocs") && url.pathExtension.lowercased() == "zip")
+            let matchesStagedApp = name == "Updated.app" && values.isDirectory == true
+            guard matchesArchive || matchesStagedApp else { continue }
+
+            if let item = makeItem(
+                category: "应用缓存",
+                name: matchesStagedApp ? "暂存的软件更新" : "软件更新安装包",
+                path: url,
+                risk: matchesStagedApp ? .review : .safe,
+                note: matchesStagedApp
+                    ? "更新程序留下的暂存应用；确认相关应用未在更新后再清理"
+                    : "软件更新下载残留；需要时会重新下载",
+                collector: &collector,
+                progress: progress
+            ) {
+                items.append(item)
+            }
+            if matchesStagedApp { enumerator.skipDescendants() }
+        }
         return items
     }
 
@@ -927,6 +1017,11 @@ struct CacheScanner {
     static func generatedRule(for url: URL) -> GeneratedRule? {
         let name = url.lastPathComponent
         let parent = url.deletingLastPathComponent()
+        if name == "logs" || name == "log" {
+            let projectDirectories = [parent, parent.deletingLastPathComponent()]
+            guard projectDirectories.contains(where: hasProjectMarker) else { return nil }
+            return GeneratedRule(category: "项目日志", risk: .review, note: "项目运行日志；确认不再需要排查问题后清理")
+        }
         if name == "vendor" {
             guard fileManager.fileExists(atPath: parent.appendingPathComponent("composer.json").path) else { return nil }
             return GeneratedRule(category: "PHP 项目", risk: .review, note: "Composer 依赖，删除后 composer install 会重新安装")
@@ -955,6 +1050,18 @@ struct CacheScanner {
             return GeneratedRule(category: "项目生成物", risk: .review, note: "CMake 构建产物，可按需重新生成")
         }
         return generatedRules[url.lastPathComponent]
+    }
+
+    private static func hasProjectMarker(_ directory: URL) -> Bool {
+        let markerNames: Set<String> = [
+            "pom.xml", "package.json", "Cargo.toml", "Package.swift", "composer.json",
+            "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
+            "go.mod", "pyproject.toml", "requirements.txt", "conf/application.properties"
+        ]
+        return directoryContainsNamedFile(directory, names: markerNames)
+            || directoryContainsProjectFile(directory, extensions: [
+                "xcodeproj", "xcworkspace", "csproj", "fsproj", "vbproj"
+            ])
     }
 
     private static func directoryContainsProjectFile(_ directory: URL, extensions: Set<String>) -> Bool {
@@ -1244,7 +1351,8 @@ final class DevSweepStore: ObservableObject {
             "Xcode", "CoreSimulator", "XCTest", "Rust / Tauri 项目", "项目生成物", "Node.js 项目",
             "Apple 项目", "Swift 项目", "Flutter 项目", "Python 项目", "PHP 项目", ".NET 项目",
             "Android 项目", "测试产物", "测试工具", "包管理器", "语言工具链", "Ruby", "前端工具链",
-            "云与基础设施", "AI/ML", "Docker", "JVM", "IDE", "Android Studio", "设计工具", "其他开发缓存"
+            "云与基础设施", "AI/ML", "Docker", "JVM", "IDE", "Android Studio", "设计工具",
+            "浏览器缓存", "应用缓存", "项目日志", "其他开发缓存"
         ]
         let present = Set(items.map(\.category))
         return order.filter(present.contains) + present.subtracting(order).sorted()
@@ -1418,7 +1526,7 @@ final class DevSweepStore: ObservableObject {
 
     private static func defaultProjectRoots(home: URL) -> [URL] {
         let candidates = [
-            "Code", "Projects", "Developer", "Work", "src", "workspace", "Repos", "Repositories", "dev"
+            "Code", "Projects", "Developer", "Work", "src", "workspace", "Repos", "Repositories", "dev", "software"
         ]
             .map { home.appendingPathComponent($0) }
         return normalizeProjectRoots(candidates)
