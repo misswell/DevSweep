@@ -580,6 +580,7 @@ struct ContentView: View {
         case "包管理器": return "shippingbox.fill"
         case "语言工具链": return "chevron.left.forwardslash.chevron.right"
         case "AI/ML": return "brain"
+        case "AI Agent": return "sparkles"
         case "Docker": return "shippingbox"
         case "JVM": return "cup.and.saucer"
         case "IDE", "Android Studio": return "text.cursor"
@@ -723,6 +724,7 @@ private struct CacheItemRow: View {
         case .trash:
             if item.category.contains("Xcode") || item.category == "XCTest" { return "hammer" }
             if item.category.contains("项目") { return "folder.badge.gearshape" }
+            if item.category == "AI Agent" { return "sparkles" }
             return "archivebox"
         }
     }

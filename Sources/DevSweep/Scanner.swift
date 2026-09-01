@@ -102,6 +102,7 @@ struct CacheScanner {
         whitelistedPaths: [URL] = [],
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         includeSystemCaches: Bool = true,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
         progress: @escaping (ScanProgress) -> Void
     ) -> ScanReport {
         let startedAt = Date()
@@ -121,7 +122,12 @@ struct CacheScanner {
             skippedPaths: collector.skippedPaths,
             permissionFailures: collector.permissionFailures
         ))
-        items += dynamicItems(home: home, collector: &collector, progress: progress)
+        items += dynamicItems(
+            home: home,
+            environment: environment,
+            collector: &collector,
+            progress: progress
+        )
 
         progress(ScanProgress(
             phase: "扫描软件升级残留",
@@ -281,6 +287,19 @@ struct CacheScanner {
             CacheRule(category: "Xcode", name: "Playgrounds", relativePath: "Library/Developer/Xcode/UserData/Playgrounds", risk: .review, note: "Playground 生成数据和缓存；请确认没有需要保留的结果"),
             CacheRule(category: "CoreSimulator", name: "模拟器缓存", relativePath: "Library/Developer/CoreSimulator/Caches", risk: .safe, note: "模拟器缓存，不含设备数据"),
             CacheRule(category: "CoreSimulator", name: "模拟器日志", relativePath: "Library/Logs/CoreSimulator", risk: .safe, note: "模拟器会重新生成日志"),
+
+            // AI coding agents: only disposable caches and logs are included.
+            // Codex databases that hold goals, memories, queue, and thread history
+            // are intentionally not listed here because they are agent state.
+            CacheRule(category: "AI Agent", name: "Codex 日志数据库", relativePath: ".codex/logs_2.sqlite", risk: .review, note: "Codex 日志数据库可能包含会话调试信息；确认不再需要后清理，不会触碰目标、记忆、队列或线程历史"),
+            CacheRule(category: "AI Agent", name: "OpenCode 缓存", relativePath: ".cache/opencode", risk: .safe, note: "OpenCode 可重建缓存；数据、配置、状态和仓库目录不会清理"),
+            CacheRule(category: "AI Agent", name: "OpenCode 日志", relativePath: ".local/share/opencode/log", risk: .review, note: "OpenCode 日志；确认不再需要排查问题后清理，数据和仓库目录不会清理"),
+            // OpenCode's CLI follows XDG paths; desktop wrappers on macOS may
+            // use the conventional Library locations instead.
+            CacheRule(category: "AI Agent", name: "OpenCode 缓存（macOS）", relativePath: "Library/Caches/opencode", risk: .safe, note: "OpenCode 可重建缓存；数据、配置、状态和仓库目录不会清理"),
+            CacheRule(category: "AI Agent", name: "OpenCode 日志（macOS）", relativePath: "Library/Application Support/opencode/log", risk: .review, note: "OpenCode 日志；确认不再需要排查问题后清理，数据、配置、状态和仓库目录不会清理"),
+            CacheRule(category: "AI Agent", name: "Claude Code 调试日志", relativePath: ".claude/debug-logs", risk: .review, note: "Claude Code 调试日志可能包含提示词和路径；确认不再需要后清理，不会触碰项目、历史、凭据或任务状态"),
+            CacheRule(category: "AI Agent", name: "Goose 更新缓存", relativePath: "Library/Caches/goose-updater", risk: .review, note: "Goose 更新程序下载缓存；确认没有正在进行的更新后清理"),
 
             CacheRule(category: "包管理器", name: "npm 下载缓存", relativePath: ".npm/_cacache", risk: .safe, note: "npm 会重新下载依赖"),
             CacheRule(category: "包管理器", name: "npm 日志", relativePath: ".npm/_logs", risk: .safe, note: "仅为 npm 日志"),
@@ -470,11 +489,11 @@ struct CacheScanner {
 
     private static func dynamicItems(
         home: URL,
+        environment: [String: String],
         collector: inout ScanCollector,
         progress: @escaping (ScanProgress) -> Void
     ) -> [CacheItem] {
         var items: [CacheItem] = []
-        let environment = ProcessInfo.processInfo.environment
 
         func add(_ category: String, _ name: String, _ path: URL, _ risk: RiskLevel, _ note: String) {
             guard path.standardizedFileURL.path != "/", path.standardizedFileURL.path != home.path else { return }
@@ -488,6 +507,43 @@ struct CacheScanner {
                 progress: progress
             ) else { return }
             items.append(item)
+        }
+
+        if let value = environment["CODEX_HOME"], let codexHome = expandedPath(value, home: home) {
+            add(
+                "AI Agent",
+                "Codex 日志数据库（自定义）",
+                codexHome.appendingPathComponent("logs_2.sqlite"),
+                .review,
+                "来自 CODEX_HOME；日志数据库可能包含会话调试信息，确认不再需要后清理"
+            )
+        }
+        if let value = environment["XDG_CACHE_HOME"], let xdgCacheHome = expandedPath(value, home: home) {
+            add(
+                "AI Agent",
+                "OpenCode 缓存（XDG 自定义）",
+                xdgCacheHome.appendingPathComponent("opencode"),
+                .safe,
+                "来自 XDG_CACHE_HOME；OpenCode 会重新生成缓存，数据、配置、状态和仓库目录不会清理"
+            )
+        }
+        if let value = environment["XDG_DATA_HOME"], let xdgDataHome = expandedPath(value, home: home) {
+            add(
+                "AI Agent",
+                "OpenCode 日志（XDG 自定义）",
+                xdgDataHome.appendingPathComponent("opencode/log"),
+                .review,
+                "来自 XDG_DATA_HOME；OpenCode 日志可能包含会话信息，数据、配置、状态和仓库目录不会清理"
+            )
+        }
+        if let value = environment["CLAUDE_CONFIG_DIR"], let claudeConfig = expandedPath(value, home: home) {
+            add(
+                "AI Agent",
+                "Claude Code 调试日志（自定义）",
+                claudeConfig.appendingPathComponent("debug-logs"),
+                .review,
+                "来自 CLAUDE_CONFIG_DIR；调试日志可能包含提示词和路径，确认不再需要后清理"
+            )
         }
 
         if let value = environment["NPM_CONFIG_CACHE"], let path = expandedPath(value, home: home) {
@@ -1491,7 +1547,7 @@ final class DevSweepStore: ObservableObject {
             "Xcode", "CoreSimulator", "XCTest", "Rust / Tauri 项目", "项目生成物", "Node.js 项目",
             "Apple 项目", "Swift 项目", "Flutter 项目", "Python 项目", "PHP 项目", ".NET 项目",
             "Android 项目", "测试产物", "测试工具", "包管理器", "语言工具链", "Ruby", "前端工具链",
-            "云与基础设施", "AI/ML", "Docker", "JVM", "IDE", "Android Studio", "设计工具",
+            "云与基础设施", "AI/ML", "AI Agent", "Docker", "JVM", "IDE", "Android Studio", "设计工具",
             "浏览器缓存", "应用缓存", "项目日志", "其他开发缓存"
         ]
         let present = Set(items.map(\.category))
