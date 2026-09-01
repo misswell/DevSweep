@@ -102,8 +102,8 @@ struct CacheScanner {
         whitelistedPaths: [URL] = [],
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         includeSystemCaches: Bool = true,
-        environment: [String: String] = ProcessInfo.processInfo.environment,
-        progress: @escaping (ScanProgress) -> Void
+        progress: @escaping (ScanProgress) -> Void,
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> ScanReport {
         let startedAt = Date()
         var collector = ScanCollector()
@@ -277,6 +277,10 @@ struct CacheScanner {
             CacheRule(category: "Xcode", name: "xcodebuild 缓存", relativePath: "Library/Caches/com.apple.dt.xcodebuild", risk: .safe, note: "构建缓存，可重新生成"),
             CacheRule(category: "Xcode", name: "源码控制 Git 缓存", relativePath: "Library/Caches/com.apple.dt.Xcode.sourcecontrol.Git", risk: .safe, note: "Xcode 会重新获取 Git 数据"),
             CacheRule(category: "Xcode", name: "文档缓存", relativePath: "Library/Developer/Xcode/DocumentationCache", risk: .safe, note: "需要时会重新下载"),
+            CacheRule(category: "Xcode", name: "Instruments 缓存", relativePath: "Library/Caches/com.apple.dt.instruments", risk: .safe, note: "Instruments 会自动重建缓存"),
+            CacheRule(category: "Xcode", name: "SourceKitService 缓存", relativePath: "Library/Caches/com.apple.dt.SourceKitService", risk: .safe, note: "SourceKit 会自动重建缓存"),
+            CacheRule(category: "Xcode", name: "Xcode Previews 缓存", relativePath: "Library/Caches/com.apple.dt.XcodePreviews", risk: .safe, note: "Preview 会自动重建缓存"),
+            CacheRule(category: "Xcode", name: "iOS Device Logs", relativePath: "Library/Developer/Xcode/iOS Device Logs", risk: .review, note: "真机诊断日志；确认不再需要排查问题后清理"),
             CacheRule(category: "Xcode", name: "Archives", relativePath: "Library/Developer/Xcode/Archives", risk: .review, note: "可能包含发布归档，请确认后清理"),
             CacheRule(category: "Xcode", name: "Products", relativePath: "Library/Developer/Xcode/Products", risk: .review, note: "项目产物，可按需重新构建"),
             CacheRule(category: "Xcode", name: "iOS DeviceSupport", relativePath: "Library/Developer/Xcode/iOS DeviceSupport", risk: .manual, note: "删除后真机调试可能需要重新下载"),
@@ -310,6 +314,7 @@ struct CacheScanner {
             CacheRule(category: "包管理器", name: "Yarn（旧缓存）", relativePath: ".cache/yarn", risk: .safe, note: "Yarn 会重新下载依赖"),
             CacheRule(category: "包管理器", name: "Yarn 离线缓存", relativePath: ".yarn/cache", risk: .review, note: "Yarn 会重新下载依赖；离线环境下请保留"),
             CacheRule(category: "包管理器", name: "pnpm store", relativePath: "Library/pnpm/store", risk: .safe, note: "pnpm 会重新下载依赖"),
+            CacheRule(category: "包管理器", name: "pnpm 元数据缓存", relativePath: "Library/Caches/pnpm", risk: .safe, note: "pnpm 会重新获取 registry 元数据"),
             CacheRule(category: "包管理器", name: "pnpm store（Linux 兼容路径）", relativePath: ".local/share/pnpm/store", risk: .safe, note: "pnpm 会重新下载依赖"),
             CacheRule(category: "包管理器", name: "Bun", relativePath: ".bun/install/cache", risk: .safe, note: "Bun 会重新下载依赖"),
             CacheRule(category: "包管理器", name: "Deno", relativePath: "Library/Caches/deno", risk: .safe, note: "Deno 会重新下载依赖和工具"),
@@ -321,8 +326,12 @@ struct CacheScanner {
             CacheRule(category: "包管理器", name: "CocoaPods", relativePath: "Library/Caches/CocoaPods", risk: .safe, note: "Pods 会重新下载"),
             CacheRule(category: "包管理器", name: "Homebrew 下载缓存", relativePath: "Library/Caches/Homebrew", risk: .safe, note: "Homebrew 会重新下载包"),
             CacheRule(category: "包管理器", name: "SwiftPM 下载缓存", relativePath: "Library/Caches/org.swift.swiftpm", risk: .safe, note: "SwiftPM 会重新解析依赖"),
+            CacheRule(category: "包管理器", name: "SwiftPM（XDG 缓存）", relativePath: ".cache/org.swift.swiftpm", risk: .safe, note: "SwiftPM 会重新解析依赖"),
+            CacheRule(category: "包管理器", name: "SwiftPM（旧缓存）", relativePath: ".swiftpm/cache", risk: .safe, note: "SwiftPM 会重新解析依赖"),
+            CacheRule(category: "包管理器", name: "SwiftPM 仓库缓存", relativePath: ".swiftpm/repositories", risk: .review, note: "可能包含依赖仓库 checkout；删除后会重新下载，请确认后清理"),
             CacheRule(category: "包管理器", name: "Composer", relativePath: "Library/Caches/composer", risk: .safe, note: "Composer 会重新下载依赖"),
             CacheRule(category: "包管理器", name: "NuGet 全局包缓存", relativePath: ".nuget/packages", risk: .safe, note: "NuGet 会重新下载包"),
+            CacheRule(category: "包管理器", name: "CocoaPods Specs 仓库", relativePath: ".cocoapods/repos", risk: .review, note: "Specs 索引会重新下载；离线环境下请保留"),
 
             CacheRule(category: "语言工具链", name: "Cargo registry cache", relativePath: ".cargo/registry/cache", risk: .safe, note: "Cargo 会重新下载 crate"),
             CacheRule(category: "语言工具链", name: "Cargo registry index", relativePath: ".cargo/registry/index", risk: .safe, note: "Cargo 会重新获取 registry 索引"),
@@ -358,6 +367,12 @@ struct CacheScanner {
             CacheRule(category: "JVM", name: "Gradle daemon", relativePath: ".gradle/daemon", risk: .review, note: "建议停止 Gradle 构建后清理"),
             CacheRule(category: "JVM", name: "Maven repository", relativePath: ".m2/repository", risk: .review, note: "Maven 会重新下载依赖"),
             CacheRule(category: "JVM", name: "Maven wrapper distributions", relativePath: ".m2/wrapper/dists", risk: .safe, note: "Maven Wrapper 会重新下载发行版"),
+            CacheRule(category: "JVM", name: "sbt boot 缓存", relativePath: ".sbt/boot", risk: .review, note: "Scala/sbt 工具组件会重新下载；请确认后清理"),
+            CacheRule(category: "JVM", name: "sbt launcher 缓存", relativePath: ".sbt/launchers", risk: .review, note: "sbt 启动器会重新下载；请确认后清理"),
+            CacheRule(category: "JVM", name: "Ivy 依赖缓存", relativePath: ".ivy2/cache", risk: .review, note: "sbt/Ivy 依赖会重新下载；离线环境下请保留"),
+            CacheRule(category: "JVM", name: "Coursier 缓存", relativePath: ".coursier/cache", risk: .review, note: "Scala/JVM 依赖会重新下载；请确认后清理"),
+            CacheRule(category: "JVM", name: "Ammonite 缓存", relativePath: ".ammonite/cache", risk: .review, note: "Ammonite 会重新下载依赖；请确认后清理"),
+            CacheRule(category: "JVM", name: "Metals 缓存", relativePath: ".cache/metals", risk: .review, note: "Scala IDE 索引会重新生成；请确认后清理"),
             CacheRule(category: "JVM", name: "Android SDK 临时下载", relativePath: "Library/Android/sdk/.temp", risk: .safe, note: "Android SDK 会重新下载组件"),
             CacheRule(category: "JVM", name: "Android SDK 缓存", relativePath: "Library/Android/sdk/.cache", risk: .safe, note: "Android SDK 会自动重建缓存"),
             CacheRule(category: "JVM", name: "Android 用户缓存", relativePath: ".android/cache", risk: .safe, note: "Android 工具会自动重建缓存"),
@@ -368,6 +383,8 @@ struct CacheScanner {
             CacheRule(category: "语言工具链", name: "mise 缓存", relativePath: ".cache/mise", risk: .safe, note: "mise 会重新下载工具"),
             CacheRule(category: "语言工具链", name: "asdf 下载缓存", relativePath: ".asdf/downloads", risk: .safe, note: "asdf 会重新下载工具"),
             CacheRule(category: "语言工具链", name: "asdf 临时缓存", relativePath: ".asdf/tmp", risk: .safe, note: "asdf 会重新创建临时文件"),
+            CacheRule(category: "语言工具链", name: "nvm 下载缓存", relativePath: ".nvm/.cache", risk: .safe, note: "nvm 会重新下载 Node.js 安装包"),
+            CacheRule(category: "语言工具链", name: "Volta 下载缓存", relativePath: ".volta/cache", risk: .safe, note: "Volta 会重新下载工具链"),
             CacheRule(category: "语言工具链", name: "ccache", relativePath: ".cache/ccache", risk: .safe, note: "编译器会重新编译"),
             CacheRule(category: "语言工具链", name: "sccache", relativePath: ".cache/sccache", risk: .safe, note: "编译器会重新编译"),
             CacheRule(category: "语言工具链", name: "ccache（macOS）", relativePath: "Library/Caches/ccache", risk: .safe, note: "编译器会重新编译"),
@@ -387,6 +404,7 @@ struct CacheScanner {
             CacheRule(category: "IDE", name: "VS Code CachedData", relativePath: "Library/Application Support/Code/CachedData", risk: .safe, note: "编辑器会自动重建"),
             CacheRule(category: "IDE", name: "VS Code 扩展安装包缓存", relativePath: "Library/Application Support/Code/CachedExtensionVSIXs", risk: .safe, note: "扩展更新时会重新下载安装包"),
             CacheRule(category: "IDE", name: "VS Code Code Cache", relativePath: "Library/Application Support/Code/Code Cache", risk: .safe, note: "编辑器会自动重建"),
+            CacheRule(category: "IDE", name: "VS Code GPUCache", relativePath: "Library/Application Support/Code/GPUCache", risk: .safe, note: "编辑器会自动重建"),
             CacheRule(category: "IDE", name: "VS Code Service Worker", relativePath: "Library/Application Support/Code/Service Worker", risk: .review, note: "编辑器会重建；清理前建议退出 VS Code"),
             CacheRule(category: "IDE", name: "VS Code 日志", relativePath: "Library/Application Support/Code/logs", risk: .safe, note: "仅为编辑器日志"),
             CacheRule(category: "IDE", name: "VS Code 系统缓存", relativePath: "Library/Caches/com.microsoft.VSCode", risk: .safe, note: "编辑器会自动重建"),
@@ -399,6 +417,35 @@ struct CacheScanner {
             CacheRule(category: "IDE", name: "Cursor Service Worker", relativePath: "Library/Application Support/Cursor/Service Worker", risk: .review, note: "编辑器会重建；清理前建议退出 Cursor"),
             CacheRule(category: "IDE", name: "Cursor 日志", relativePath: "Library/Application Support/Cursor/logs", risk: .safe, note: "仅为编辑器日志"),
             CacheRule(category: "IDE", name: "Cursor workspaceStorage", relativePath: "Library/Application Support/Cursor/User/workspaceStorage", risk: .review, note: "工作区状态和扩展数据，确认后再清理"),
+            CacheRule(category: "IDE", name: "Lingma Cache", relativePath: "Library/Application Support/Lingma/Cache", risk: .safe, note: "Lingma 会自动重建缓存"),
+            CacheRule(category: "IDE", name: "Lingma CachedData", relativePath: "Library/Application Support/Lingma/CachedData", risk: .safe, note: "Lingma 会自动重建缓存"),
+            CacheRule(category: "IDE", name: "Lingma 扩展安装包缓存", relativePath: "Library/Application Support/Lingma/CachedExtensionVSIXs", risk: .safe, note: "扩展更新时会重新下载安装包"),
+            CacheRule(category: "IDE", name: "Lingma CachedProfilesData", relativePath: "Library/Application Support/Lingma/CachedProfilesData", risk: .safe, note: "Lingma 会自动重建缓存"),
+            CacheRule(category: "IDE", name: "Lingma Code Cache", relativePath: "Library/Application Support/Lingma/Code Cache", risk: .safe, note: "Lingma 会自动重建缓存"),
+            CacheRule(category: "IDE", name: "Lingma GPUCache", relativePath: "Library/Application Support/Lingma/GPUCache", risk: .safe, note: "Lingma 会自动重建缓存"),
+            CacheRule(category: "IDE", name: "Lingma DawnWebGPUCache", relativePath: "Library/Application Support/Lingma/DawnWebGPUCache", risk: .safe, note: "Lingma 会自动重建缓存"),
+            CacheRule(category: "IDE", name: "Lingma DawnGraphiteCache", relativePath: "Library/Application Support/Lingma/DawnGraphiteCache", risk: .safe, note: "Lingma 会自动重建缓存"),
+            CacheRule(category: "IDE", name: "Trae CN Cache", relativePath: "Library/Application Support/Trae CN/Cache", risk: .safe, note: "Trae 会自动重建缓存"),
+            CacheRule(category: "IDE", name: "Trae CN CachedData", relativePath: "Library/Application Support/Trae CN/CachedData", risk: .safe, note: "Trae 会自动重建缓存"),
+            CacheRule(category: "IDE", name: "Trae CN 扩展安装包缓存", relativePath: "Library/Application Support/Trae CN/CachedExtensionVSIXs", risk: .safe, note: "扩展更新时会重新下载安装包"),
+            CacheRule(category: "IDE", name: "Trae CN CachedProfilesData", relativePath: "Library/Application Support/Trae CN/CachedProfilesData", risk: .safe, note: "Trae 会自动重建缓存"),
+            CacheRule(category: "IDE", name: "Trae CN Code Cache", relativePath: "Library/Application Support/Trae CN/Code Cache", risk: .safe, note: "Trae 会自动重建缓存"),
+            CacheRule(category: "IDE", name: "Trae CN GPUCache", relativePath: "Library/Application Support/Trae CN/GPUCache", risk: .safe, note: "Trae 会自动重建缓存"),
+            CacheRule(category: "IDE", name: "Trae CN DawnWebGPUCache", relativePath: "Library/Application Support/Trae CN/DawnWebGPUCache", risk: .safe, note: "Trae 会自动重建缓存"),
+            CacheRule(category: "IDE", name: "Trae CN DawnGraphiteCache", relativePath: "Library/Application Support/Trae CN/DawnGraphiteCache", risk: .safe, note: "Trae 会自动重建缓存"),
+            CacheRule(category: "IDE", name: "Windsurf Cache", relativePath: "Library/Application Support/Windsurf/Cache", risk: .safe, note: "Windsurf 会自动重建缓存"),
+            CacheRule(category: "IDE", name: "Windsurf CachedData", relativePath: "Library/Application Support/Windsurf/CachedData", risk: .safe, note: "Windsurf 会自动重建缓存"),
+            CacheRule(category: "IDE", name: "Windsurf 扩展安装包缓存", relativePath: "Library/Application Support/Windsurf/CachedExtensionVSIXs", risk: .safe, note: "扩展更新时会重新下载安装包"),
+            CacheRule(category: "IDE", name: "Windsurf Code Cache", relativePath: "Library/Application Support/Windsurf/Code Cache", risk: .safe, note: "Windsurf 会自动重建缓存"),
+            CacheRule(category: "IDE", name: "Windsurf GPUCache", relativePath: "Library/Application Support/Windsurf/GPUCache", risk: .safe, note: "Windsurf 会自动重建缓存"),
+            CacheRule(category: "IDE", name: "Zed 缓存", relativePath: "Library/Caches/Zed", risk: .safe, note: "Zed 会自动重建缓存"),
+            CacheRule(category: "IDE", name: "Zed Node 缓存", relativePath: "Library/Application Support/Zed/node/cache", risk: .safe, note: "Zed 会自动重建缓存"),
+            CacheRule(category: "IDE", name: "OpenCode Desktop Cache", relativePath: "Library/Application Support/ai.opencode.desktop/Cache", risk: .safe, note: "OpenCode Desktop 会自动重建缓存"),
+            CacheRule(category: "IDE", name: "OpenCode Desktop CachedData", relativePath: "Library/Application Support/ai.opencode.desktop/CachedData", risk: .safe, note: "OpenCode Desktop 会自动重建缓存"),
+            CacheRule(category: "IDE", name: "OpenCode Desktop Code Cache", relativePath: "Library/Application Support/ai.opencode.desktop/Code Cache", risk: .safe, note: "OpenCode Desktop 会自动重建缓存"),
+            CacheRule(category: "IDE", name: "OpenCode Desktop GPUCache", relativePath: "Library/Application Support/ai.opencode.desktop/GPUCache", risk: .safe, note: "OpenCode Desktop 会自动重建缓存"),
+            CacheRule(category: "IDE", name: "OpenCode Desktop 扩展安装包缓存", relativePath: "Library/Application Support/ai.opencode.desktop/CachedExtensionVSIXs", risk: .safe, note: "扩展更新时会重新下载安装包"),
+            CacheRule(category: "IDE", name: "Nova 缓存", relativePath: "Library/Application Support/Nova/Caches", risk: .safe, note: "Nova 会自动重建缓存"),
             CacheRule(category: "IDE", name: "JetBrains 缓存", relativePath: "Library/Caches/JetBrains", risk: .safe, note: "IDE 会自动重建"),
             CacheRule(category: "IDE", name: "JetBrains 日志", relativePath: "Library/Logs/JetBrains", risk: .safe, note: "IDE 会重新生成日志"),
             CacheRule(category: "IDE", name: "Android Studio 日志", relativePath: "Library/Logs/AndroidStudio", risk: .safe, note: "Android Studio 会重新生成日志"),
@@ -424,6 +471,7 @@ struct CacheScanner {
             CacheRule(category: "前端工具链", name: "Prettier 缓存", relativePath: ".cache/prettier", risk: .safe, note: "Prettier 会重新生成缓存"),
             CacheRule(category: "测试工具", name: "Cypress 浏览器缓存", relativePath: "Library/Caches/Cypress", risk: .review, note: "Cypress 会重新下载浏览器组件"),
             CacheRule(category: "测试工具", name: "Selenium 缓存", relativePath: ".cache/selenium", risk: .review, note: "Selenium Manager 会重新下载驱动和浏览器组件"),
+            CacheRule(category: "测试工具", name: "SonarQube 缓存", relativePath: ".sonar/cache", risk: .safe, note: "Sonar 扫描器会重新下载分析器和插件"),
 
             CacheRule(category: "云与基础设施", name: "Terraform Provider 缓存", relativePath: ".terraform.d/plugin-cache", risk: .safe, note: "Terraform 会重新下载 provider"),
             CacheRule(category: "云与基础设施", name: "Helm 缓存", relativePath: "Library/Caches/helm", risk: .safe, note: "Helm 会重新获取仓库数据"),
@@ -606,6 +654,26 @@ struct CacheScanner {
         }
         if let value = environment["BUN_INSTALL_CACHE_DIR"], let path = expandedPath(value, home: home) {
             add("包管理器", "Bun 自定义缓存", path, .safe, "来自 BUN_INSTALL_CACHE_DIR，Bun 会重新下载依赖")
+        }
+        if let value = environment["NVM_DIR"], let nvmHome = expandedPath(value, home: home) {
+            add("语言工具链", "nvm 自定义下载缓存", nvmHome.appendingPathComponent(".cache"), .safe, "来自 NVM_DIR，nvm 会重新下载 Node.js 安装包")
+        }
+        if let value = environment["VOLTA_HOME"], let voltaHome = expandedPath(value, home: home) {
+            add("语言工具链", "Volta 自定义下载缓存", voltaHome.appendingPathComponent("cache"), .safe, "来自 VOLTA_HOME，Volta 会重新下载工具链")
+        }
+        if let value = environment["SONAR_USER_HOME"], let sonarHome = expandedPath(value, home: home) {
+            add("测试工具", "SonarQube 自定义缓存", sonarHome.appendingPathComponent("cache"), .safe, "来自 SONAR_USER_HOME，Sonar 扫描器会重新下载分析器和插件")
+        }
+        if let value = environment["COURSIER_CACHE"], let path = expandedPath(value, home: home) {
+            add("JVM", "Coursier 自定义缓存", path, .review, "来自 COURSIER_CACHE，Scala/JVM 依赖会重新下载")
+        }
+        if let value = environment["CP_CACHE_DIR"], let path = expandedPath(value, home: home) {
+            add("包管理器", "CocoaPods 自定义缓存", path, .review, "来自 CP_CACHE_DIR，CocoaPods 会重新下载缓存；请确认后清理")
+        }
+        if let value = environment["CP_REPOS_DIR"], let path = expandedPath(value, home: home) {
+            add("包管理器", "CocoaPods 自定义 Specs 仓库", path, .review, "来自 CP_REPOS_DIR，Specs 索引会重新下载；请确认后清理")
+        } else if let value = environment["CP_HOME_DIR"], let cpHome = expandedPath(value, home: home) {
+            add("包管理器", "CocoaPods 自定义 Specs 仓库", cpHome.appendingPathComponent("repos"), .review, "来自 CP_HOME_DIR，Specs 索引会重新下载；请确认后清理")
         }
 
         if let npmrc = try? String(contentsOf: home.appendingPathComponent(".npmrc"), encoding: .utf8),
@@ -1659,7 +1727,9 @@ final class DevSweepStore: ObservableObject {
         guard updated != whitelistedPaths else { return }
         whitelistedPaths = updated
         persistWhitelist()
-        scan()
+        statusMessage = items.count == 1
+            ? "已加入白名单"
+            : "已加入白名单 \(items.count) 项"
     }
 
     func removeFromWhitelist(_ path: URL) {

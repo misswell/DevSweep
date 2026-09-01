@@ -2,7 +2,7 @@
 
 DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcode、Rust/Tauri、Node、SwiftPM、Cargo、Gradle、Maven、Python、Go、Flutter、VS Code、Cursor 以及 OpenAI Codex、OpenCode、Claude Code、Goose 等 AI agent 开发环境。
 
-当前版本：0.1.22
+当前版本：0.1.29
 
 ## 当前功能
 
@@ -16,13 +16,15 @@ DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcod
 - 覆盖 Deno、Corepack、Playwright、Puppeteer、rustup、Conda、Bazel、Android SDK、NuGet、mise、asdf、ccache/sccache、Hugging Face、PyTorch、Whisper、Keras、TensorFlow Hub、Ollama、LM Studio 及 JetBrains/Android Studio 日志等常见开发工具数据；同时识别各工具的自定义缓存环境变量。
 - 增加 AI Agent 分类：识别 OpenAI Codex 日志数据库、OpenCode 的 XDG 缓存/日志及 macOS Library 兼容路径、Claude Code 调试日志，以及 Goose updater 缓存；支持 `CODEX_HOME`、`XDG_CACHE_HOME`、`XDG_DATA_HOME` 和 `CLAUDE_CONFIG_DIR` 自定义位置；只清理可重建缓存、日志和更新下载，不触碰 Codex 目标/记忆/队列/线程历史、OpenCode 数据/配置/状态/仓库、Claude Code 项目/历史/凭据/任务状态或 Cline 的 VS Code globalStorage。
 - 补充 npx、Ruby/Bundler、node-gyp、VS Code/Cursor 扩展安装包、前端工具链、云 CLI、Terraform/Helm、Cypress/Selenium 和多平台 Xcode DeviceSupport；系统级 CoreSimulator/Xcode 缓存只读展示为手动处理。
+- 补充 nvm、Volta、SonarQube、pnpm registry 元数据、SwiftPM XDG/旧缓存、Scala/sbt/Ivy/Coursier/Metals，以及 Instruments、SourceKitService 和 Xcode Previews 缓存；同时覆盖 Lingma、Trae CN、Windsurf、Zed、OpenCode Desktop、Nova 等开发工具的明确缓存叶子，并识别 NVM_DIR、VOLTA_HOME、SONAR_USER_HOME、COURSIER_CACHE 和 CocoaPods 自定义目录。
 - 覆盖 Edge、Firefox、Google 应用、媒体分析、剪映和自定义 Chromium 资料目录缓存；跨 Caches、Application Support、Containers、Group Containers、HTTPStorages 和临时目录识别 Sparkle/Squirrel 等软件升级残留，系统级位置仅展示为手动项；存在项目标志时识别项目运行日志与 Nacos 日志。
 - 项目扫描覆盖 `.terragrunt-cache`、`.astro`、`zig-out`、`.cxx` 和项目内 DerivedData；对 Composer `vendor` 与 .NET `bin`/`obj` 必须先验证项目标志，避免按同名目录误报源码或运行时文件。
 - 识别 CoreSimulator 设备，通过 `xcrun simctl delete` 删除，避免直接破坏设备注册。
 - 对 Xcode Archives、iOS DeviceSupport、SourcePackages、XCTest 克隆设备、项目生成物标记为“建议确认”或“手动处理”。
 - 扫描过程中显示当前路径、已检查数量、跳过数量和权限异常；扫描完成后可查看实际扫描范围和诊断详情。
 - 默认只勾选低风险缓存；清理前二次确认。
-- 每个项目都提供操作下拉菜单，可加入忽略名单、在 Finder 中打开目录、复制完整路径或单独清理；长路径可悬浮查看。
+- 每个项目都提供操作下拉菜单，可加入忽略名单、在 Finder 中打开目录、复制完整路径或单独清理；加入忽略名单只保存路径，不触发重新扫描，下次扫描时生效；长路径可悬浮查看。
+- 支持迷你模式：以 360×640 的手机式竖屏窗口隐藏侧栏和说明卡，只保留扫描进度、缓存列表、选择、扫描和清理操作，并记住上次模式；从迷你模式切回普通模式时会根据窗口所在屏幕边缘向内展开，避免超出屏幕。
 - 勾选仅用于批量清理；设置页支持手动检查和执行在线更新。
 - 会按目录完整路径记住上次的勾选状态，下次扫描或启动后可以直接继续清理。
 - 普通目录优先移入 macOS 废纸篓，便于恢复。
@@ -81,4 +83,4 @@ GitHub Actions 的 tag 发布还需要配置仓库 Secrets：`APPLE_CERTIFICATE_
 
 ## 安全边界
 
-DevSweep 不会直接删除 Docker 虚拟磁盘、用户源码、Git 仓库、照片或文档。Docker 镜像、容器、卷和 Build Cache 通过官方 CLI 清理，不能移入废纸篓，必须由用户逐项确认；只允许当前 Docker CLI 指向本机 Unix socket 或 localhost，拒绝远程 context；Docker.raw 只展示占用。AI Agent 只纳入可重建缓存、调试日志和更新下载，所有会话、项目、凭据、记忆、队列、配置、状态和仓库数据都排除在扫描规则之外。删除项目生成物和模拟器设备会让下次构建/运行重新生成数据，可能需要重新下载依赖。运行测试、模拟器、Docker 构建或 agent 更新时，请先停止相关进程再处理对应资源。
+DevSweep 不会直接删除 Docker 虚拟磁盘、用户源码、Git 仓库、照片或文档。Docker 镜像、容器、卷和 Build Cache 通过官方 CLI 清理，不能移入废纸篓，必须由用户逐项确认；只允许当前 Docker CLI 指向本机 Unix socket 或 localhost，拒绝远程 context；Docker.raw 只展示占用。AI Agent 只纳入可重建缓存、调试日志和更新下载，所有会话、项目、凭据、记忆、队列、配置、状态和仓库数据都排除在扫描规则之外。开发工具的 Electron 数据也只按明确应用和缓存叶子白名单识别，不扫描整个 Application Support，不触碰 IDE 用户数据、会话历史或工作区状态。删除项目生成物和模拟器设备会让下次构建/运行重新生成数据，可能需要重新下载依赖。运行测试、模拟器、Docker 构建或 agent 更新时，请先停止相关进程再处理对应资源。

@@ -24,8 +24,8 @@ final class ScannerCoverageTests: XCTestCase {
             deepScan: false,
             home: home,
             includeSystemCaches: false,
-            environment: [:],
-            progress: { _ in }
+            progress: { _ in },
+            environment: [:]
         )
         let scannedPaths = Set(report.items.map(\.path))
 
@@ -75,8 +75,8 @@ final class ScannerCoverageTests: XCTestCase {
             deepScan: false,
             home: home,
             includeSystemCaches: false,
-            environment: [:],
-            progress: { _ in }
+            progress: { _ in },
+            environment: [:]
         )
         let agentItems = report.items.filter { $0.category == "AI Agent" }
         let scannedPaths = Set(agentItems.map(\.path))
@@ -139,13 +139,13 @@ final class ScannerCoverageTests: XCTestCase {
             deepScan: false,
             home: home,
             includeSystemCaches: false,
+            progress: { _ in },
             environment: [
                 "CODEX_HOME": codexHome.path,
                 "XDG_CACHE_HOME": xdgCacheHome.path,
                 "XDG_DATA_HOME": xdgDataHome.path,
                 "CLAUDE_CONFIG_DIR": claudeConfig.path
-            ],
-            progress: { _ in }
+            ]
         )
         let scannedPaths = Set(report.items.filter { $0.category == "AI Agent" }.map(\.path))
 
@@ -153,6 +153,115 @@ final class ScannerCoverageTests: XCTestCase {
         XCTAssertTrue(scannedPaths.contains(xdgCacheHome.appendingPathComponent("opencode")))
         XCTAssertTrue(scannedPaths.contains(xdgDataHome.appendingPathComponent("opencode/log")))
         XCTAssertTrue(scannedPaths.contains(claudeConfig.appendingPathComponent("debug-logs")))
+
+    }
+
+    func testFixedScannerFindsAuditedToolchainAndIDECaches() throws {
+        let home = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: home) }
+
+        let expectedRisks: [String: RiskLevel] = [
+            ".nvm/.cache": .safe,
+            ".volta/cache": .safe,
+            ".sonar/cache": .safe,
+            "Library/Caches/pnpm": .safe,
+            "Library/Caches/com.apple.dt.instruments": .safe,
+            "Library/Caches/com.apple.dt.SourceKitService": .safe,
+            "Library/Caches/com.apple.dt.XcodePreviews": .safe,
+            ".cache/org.swift.swiftpm": .safe,
+            ".swiftpm/cache": .safe,
+            ".swiftpm/repositories": .review,
+            ".cocoapods/repos": .review,
+            ".sbt/boot": .review,
+            ".ivy2/cache": .review,
+            ".coursier/cache": .review,
+            ".cache/metals": .review,
+            "Library/Application Support/Code/GPUCache": .safe,
+            "Library/Application Support/Lingma/CachedExtensionVSIXs": .safe,
+            "Library/Application Support/Trae CN/CachedData": .safe,
+            "Library/Application Support/Trae CN/CachedProfilesData": .safe,
+            "Library/Application Support/Windsurf/GPUCache": .safe,
+            "Library/Caches/Zed": .safe,
+            "Library/Application Support/ai.opencode.desktop/Cache": .safe,
+            "Library/Application Support/Nova/Caches": .safe
+        ]
+        for relativePath in expectedRisks.keys {
+            try createAllocatedCache(at: home.appendingPathComponent(relativePath))
+        }
+
+        let report = CacheScanner.scan(
+            projectRoots: [],
+            deepScan: false,
+            home: home,
+            includeSystemCaches: false,
+            progress: { _ in },
+            environment: [:]
+        )
+        let scannedItems = Dictionary(uniqueKeysWithValues: report.items.map { ($0.path, $0) })
+
+        for (relativePath, expectedRisk) in expectedRisks {
+            let path = home.appendingPathComponent(relativePath).standardizedFileURL
+            XCTAssertEqual(scannedItems[path]?.risk, expectedRisk, relativePath)
+        }
+    }
+
+    func testDynamicScannerFindsRelocatedToolCaches() throws {
+        let home = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: home) }
+
+        let expectedRisks: [String: RiskLevel] = [
+            "relocated/nvm/.cache": .safe,
+            "relocated/volta/cache": .safe,
+            "relocated/sonar/cache": .safe,
+            "relocated/coursier-cache": .review,
+            "relocated/cocoapods-cache": .review,
+            "relocated/cocoapods-repos": .review
+        ]
+        for relativePath in expectedRisks.keys {
+            try createAllocatedCache(at: home.appendingPathComponent(relativePath))
+        }
+
+        let report = CacheScanner.scan(
+            projectRoots: [],
+            deepScan: false,
+            home: home,
+            includeSystemCaches: false,
+            progress: { _ in },
+            environment: [
+                "NVM_DIR": "relocated/nvm",
+                "VOLTA_HOME": "relocated/volta",
+                "SONAR_USER_HOME": "relocated/sonar",
+                "COURSIER_CACHE": "relocated/coursier-cache",
+                "CP_CACHE_DIR": "relocated/cocoapods-cache",
+                "CP_REPOS_DIR": "relocated/cocoapods-repos"
+            ]
+        )
+        let scannedItems = Dictionary(uniqueKeysWithValues: report.items.map { ($0.path, $0) })
+
+        for (relativePath, expectedRisk) in expectedRisks {
+            let path = home.appendingPathComponent(relativePath).standardizedFileURL
+            XCTAssertEqual(scannedItems[path]?.risk, expectedRisk, relativePath)
+        }
+    }
+
+    func testDynamicScannerDerivesCocoaPodsReposFromCustomHome() throws {
+        let home = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: home) }
+
+        let repos = home.appendingPathComponent("relocated/cocoapods-home/repos")
+        try createAllocatedCache(at: repos)
+
+        let report = CacheScanner.scan(
+            projectRoots: [],
+            deepScan: false,
+            home: home,
+            includeSystemCaches: false,
+            progress: { _ in },
+            environment: ["CP_HOME_DIR": "relocated/cocoapods-home"]
+        )
+
+        let item = report.items.first { $0.path == repos.standardizedFileURL }
+        XCTAssertEqual(item?.risk, .review)
     }
 
     func testFixedScannerFindsScriptInspiredApplicationCaches() throws {
