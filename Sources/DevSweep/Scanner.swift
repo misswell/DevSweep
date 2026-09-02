@@ -1281,6 +1281,9 @@ struct CacheScanner {
     static func generatedRule(for url: URL) -> GeneratedRule? {
         let name = url.lastPathComponent
         let parent = url.deletingLastPathComponent()
+        if let rule = xcodeDerivedDataRule(for: url) {
+            return rule
+        }
         if name == "logs" || name == "log" {
             let projectDirectories = [parent, parent.deletingLastPathComponent()]
             guard projectDirectories.contains(where: hasProjectMarker) else { return nil }
@@ -1314,6 +1317,103 @@ struct CacheScanner {
             return GeneratedRule(category: "项目生成物", risk: .review, note: "CMake 构建产物，可按需重新生成")
         }
         return generatedRules[url.lastPathComponent]
+    }
+
+    private static func xcodeDerivedDataRule(for url: URL) -> GeneratedRule? {
+        let name = url.lastPathComponent
+        guard name.hasPrefix("build-"), name.count > "build-".count else { return nil }
+
+        let projectRoot = url.deletingLastPathComponent()
+        guard directoryContainsProjectFile(projectRoot, extensions: ["xcodeproj", "xcworkspace"]) else {
+            return nil
+        }
+        guard isXcodeDerivedDataDirectory(url) else { return nil }
+
+        let releaseOutput = containsXcodeReleaseProduct(at: url)
+        let note = releaseOutput
+            ? "Xcode 自定义 DerivedData，包含 Release 产物；请确认不再需要后清理"
+            : "Xcode 自定义 DerivedData，删除后会重新构建；请确认后清理"
+        return GeneratedRule(category: "Apple 项目", risk: .review, note: note)
+    }
+
+    private static func isXcodeDerivedDataDirectory(_ directory: URL) -> Bool {
+        guard let children = try? fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: []
+        ) else {
+            return false
+        }
+
+        let names = Set(children.map(\.lastPathComponent))
+        let markers: Set<String> = [
+            "Build", "Index.noindex", "ModuleCache.noindex", "CompilationCache.noindex",
+            "SDKStatCaches.noindex", "SourcePackages", "Logs", "TestResults", "info.plist"
+        ]
+        return names.intersection(markers).count >= 2
+    }
+
+    private static func containsXcodeReleaseProduct(at derivedData: URL) -> Bool {
+        let releaseExtensions: Set<String> = ["app", "xcarchive", "zip", "pkg", "dmg"]
+        // Release archives are sometimes copied beside the DerivedData markers
+        // (for example, a manually packaged ZIP at the custom path's root).
+        if containsXcodeReleaseArtifact(at: derivedData, extensions: releaseExtensions, maxDepth: 0) {
+            return true
+        }
+
+        let productsRoot = derivedData.appendingPathComponent("Build/Products")
+        if let configurations = try? fileManager.contentsOfDirectory(
+            at: productsRoot,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: []
+        ) {
+            // xcodebuild uses names such as Release, Release-iphoneos and
+            // Release-macosx for platform-specific configurations.
+            let releaseConfigurations = configurations.filter {
+                $0.lastPathComponent.lowercased().hasPrefix("release")
+            }
+            if releaseConfigurations.contains(where: {
+                containsXcodeReleaseArtifact(at: $0, extensions: releaseExtensions, maxDepth: 1)
+            }) {
+                return true
+            }
+        }
+
+        // Archives produced by `xcodebuild archive` commonly live below
+        // Build/Archives/<timestamp>/*.xcarchive rather than Products/Release.
+        let archivesRoot = derivedData.appendingPathComponent("Build/Archives")
+        return containsXcodeReleaseArtifact(at: archivesRoot, extensions: ["xcarchive"], maxDepth: 2)
+    }
+
+    private static func containsXcodeReleaseArtifact(
+        at directory: URL,
+        extensions: Set<String>,
+        maxDepth: Int
+    ) -> Bool {
+        guard let children = try? fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: []
+        ) else {
+            return false
+        }
+
+        for child in children {
+            if extensions.contains(child.pathExtension.lowercased()) {
+                return true
+            }
+            guard maxDepth > 0,
+                  let values = try? child.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+                  values.isDirectory == true,
+                  values.isSymbolicLink != true
+            else {
+                continue
+            }
+            if containsXcodeReleaseArtifact(at: child, extensions: extensions, maxDepth: maxDepth - 1) {
+                return true
+            }
+        }
+        return false
     }
 
     private static func hasProjectMarker(_ directory: URL) -> Bool {

@@ -336,6 +336,90 @@ final class ScannerCoverageTests: XCTestCase {
         XCTAssertNil(CacheScanner.generatedRule(for: root.appendingPathComponent(".cxx")))
     }
 
+    func testScannerMatchesCustomXcodeDerivedDataDirectoriesBySignature() throws {
+        let root = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: root) }
+
+        try fileManager.createDirectory(
+            at: root.appendingPathComponent("CCRBar.xcodeproj"),
+            withIntermediateDirectories: true
+        )
+        let workspaceRoot = root.appendingPathComponent("WorkspaceProject")
+        try fileManager.createDirectory(
+            at: workspaceRoot.appendingPathComponent("Workspace.xcworkspace"),
+            withIntermediateDirectories: true
+        )
+
+        let releaseBuild = root.appendingPathComponent("build-release-0.1.5")
+        try createAllocatedCache(at: releaseBuild.appendingPathComponent("ModuleCache.noindex"))
+        try createAllocatedCache(at: releaseBuild.appendingPathComponent("Index.noindex"))
+        try fileManager.createDirectory(
+            at: releaseBuild.appendingPathComponent("Build/Products/Release/CCRBar.app"),
+            withIntermediateDirectories: true
+        )
+
+        let platformReleaseBuild = root.appendingPathComponent("build-release-device")
+        try createAllocatedCache(at: platformReleaseBuild.appendingPathComponent("Build"))
+        try createAllocatedCache(at: platformReleaseBuild.appendingPathComponent("Index.noindex"))
+        try fileManager.createDirectory(
+            at: platformReleaseBuild.appendingPathComponent("Build/Products/Release-iphoneos/CCRBar.app"),
+            withIntermediateDirectories: true
+        )
+
+        let archivedBuild = root.appendingPathComponent("build-release-archive")
+        try createAllocatedCache(at: archivedBuild.appendingPathComponent("Build"))
+        try createAllocatedCache(at: archivedBuild.appendingPathComponent("Logs"))
+        try fileManager.createDirectory(
+            at: archivedBuild.appendingPathComponent("Build/Archives/2026-09-02/CCRBar.xcarchive"),
+            withIntermediateDirectories: true
+        )
+
+        let packagedBuild = root.appendingPathComponent("build-release-package")
+        try createAllocatedCache(at: packagedBuild.appendingPathComponent("Build"))
+        try createAllocatedCache(at: packagedBuild.appendingPathComponent("Logs"))
+        try createAllocatedFile(at: packagedBuild.appendingPathComponent("CCRBar-0.1.7-macos.zip"))
+
+        let workspaceBuild = workspaceRoot.appendingPathComponent("build-workspace")
+        try createAllocatedCache(at: workspaceBuild.appendingPathComponent("Build"))
+        try createAllocatedCache(at: workspaceBuild.appendingPathComponent("ModuleCache.noindex"))
+
+        let testBuild = root.appendingPathComponent("build-tests-stop8")
+        try createAllocatedCache(at: testBuild.appendingPathComponent("Build"))
+        try createAllocatedCache(at: testBuild.appendingPathComponent("Logs"))
+
+        let misleadingBuild = root.appendingPathComponent("build-output")
+        try createAllocatedCache(at: misleadingBuild)
+
+        let weakBuild = root.appendingPathComponent("build-weak")
+        try createAllocatedCache(at: weakBuild.appendingPathComponent("Build"))
+
+        let outsideProject = root.appendingPathComponent("ordinary")
+        let outsideBuild = outsideProject.appendingPathComponent("build-release-0.1.5")
+        try createAllocatedCache(at: outsideBuild.appendingPathComponent("ModuleCache.noindex"))
+        try createAllocatedCache(at: outsideBuild.appendingPathComponent("Index.noindex"))
+
+        let report = CacheScanner.scan(
+            projectRoots: [root],
+            deepScan: false,
+            home: root.appendingPathComponent("empty-home"),
+            includeSystemCaches: false,
+            progress: { _ in }
+        )
+
+        let items = Dictionary(uniqueKeysWithValues: report.items.map { ($0.path, $0) })
+        XCTAssertEqual(items[releaseBuild.standardizedFileURL]?.category, "Apple 项目")
+        XCTAssertEqual(items[releaseBuild.standardizedFileURL]?.risk, .review)
+        XCTAssertFalse(items[releaseBuild.standardizedFileURL]?.isSelected ?? true)
+        XCTAssertEqual(items[testBuild.standardizedFileURL]?.category, "Apple 项目")
+        XCTAssertTrue(items[platformReleaseBuild.standardizedFileURL]?.note.contains("Release 产物") ?? false)
+        XCTAssertTrue(items[archivedBuild.standardizedFileURL]?.note.contains("Release 产物") ?? false)
+        XCTAssertTrue(items[packagedBuild.standardizedFileURL]?.note.contains("Release 产物") ?? false)
+        XCTAssertEqual(items[workspaceBuild.standardizedFileURL]?.category, "Apple 项目")
+        XCTAssertNil(items[misleadingBuild.standardizedFileURL])
+        XCTAssertNil(items[weakBuild.standardizedFileURL])
+        XCTAssertNil(items[outsideBuild.standardizedFileURL])
+    }
+
     func testProjectLogsRequireAProjectMarker() throws {
         let root = try temporaryDirectory()
         defer { try? fileManager.removeItem(at: root) }
