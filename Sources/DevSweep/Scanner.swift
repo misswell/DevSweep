@@ -1207,15 +1207,33 @@ struct CacheScanner {
                 continue
             }
 
-            guard let generatedRule = generatedRule(for: url) else { continue }
+            let values: URLResourceValues
             do {
-                let values = try url.resourceValues(forKeys: keys)
-                guard values.isDirectory == true, values.isSymbolicLink != true else { continue }
+                values = try url.resourceValues(forKeys: keys)
             } catch {
                 collector.skipped(url, reason: "无法读取目录属性", kind: .inaccessible)
                 enumerator.skipDescendants()
                 continue
             }
+
+            guard values.isSymbolicLink != true else { continue }
+            if values.isDirectory != true {
+                guard let releaseRule = projectReleaseFileRule(for: url) else { continue }
+                if let item = makeItem(
+                    category: releaseRule.category,
+                    name: "\(name) · \(url.deletingLastPathComponent().lastPathComponent)",
+                    path: url,
+                    risk: releaseRule.risk,
+                    note: releaseRule.note,
+                    collector: &collector,
+                    progress: progress
+                ) {
+                    items.append(item)
+                }
+                continue
+            }
+
+            guard let generatedRule = generatedRule(for: url) else { continue }
 
             if let item = makeItem(
                 category: generatedRule.category,
@@ -1278,6 +1296,11 @@ struct CacheScanner {
         ".gradle": GeneratedRule(category: "JVM", risk: .safe, note: "项目级 Gradle 缓存，会自动重建")
     ]
 
+    private static let projectReleaseArchiveSuffixes = [
+        ".pkg", ".dmg", ".zip", ".app.zip", ".tar.gz", ".tar.bz2", ".tar.xz",
+        ".appimage", ".deb", ".msi", ".exe"
+    ]
+
     static func generatedRule(for url: URL) -> GeneratedRule? {
         let name = url.lastPathComponent
         let parent = url.deletingLastPathComponent()
@@ -1292,6 +1315,13 @@ struct CacheScanner {
         if name == "vendor" {
             guard fileManager.fileExists(atPath: parent.appendingPathComponent("composer.json").path) else { return nil }
             return GeneratedRule(category: "PHP 项目", risk: .review, note: "Composer 依赖，删除后 composer install 会重新安装")
+        }
+        if name == "output" {
+            guard hasProjectMarker(parent) else { return nil }
+            return GeneratedRule(category: "项目生成物", risk: .review, note: "项目输出目录，可按需重新生成；请确认没有需要保留的截图或发布结果")
+        }
+        if let rule = projectReleaseDirectoryRule(for: url) {
+            return rule
         }
         if name == "bin" || name == "obj" {
             guard directoryContainsProjectFile(parent, extensions: ["csproj", "fsproj", "vbproj"]) else { return nil }
@@ -1317,6 +1347,55 @@ struct CacheScanner {
             return GeneratedRule(category: "项目生成物", risk: .review, note: "CMake 构建产物，可按需重新生成")
         }
         return generatedRules[url.lastPathComponent]
+    }
+
+    private static func projectReleaseDirectoryRule(for url: URL) -> GeneratedRule? {
+        let name = url.lastPathComponent
+        guard name.range(
+            of: #"^release[-_]v?\d+(?:\.\d+){1,3}$"#,
+            options: .regularExpression
+        ) != nil else { return nil }
+
+        let projectRoot = url.deletingLastPathComponent()
+        guard hasProjectMarker(projectRoot), hasProjectReleaseSignature(at: url) else { return nil }
+        return GeneratedRule(
+            category: "项目生成物",
+            risk: .review,
+            note: "项目 Release/CI 发布暂存目录，包含安装包或签名产物；确认版本已发布且不再需要后清理"
+        )
+    }
+
+    private static func projectReleaseFileRule(for url: URL) -> GeneratedRule? {
+        let name = url.lastPathComponent.lowercased()
+        guard projectReleaseArchiveSuffixes.contains(where: name.hasSuffix),
+              name.range(of: #"\d+\.\d+(?:\.\d+){0,3}"#, options: .regularExpression) != nil
+        else { return nil }
+        let parent = url.deletingLastPathComponent()
+        guard hasProjectMarker(parent) else { return nil }
+
+        return GeneratedRule(
+            category: "项目生成物",
+            risk: .review,
+            note: "项目版本发布安装包或归档；确认已上传或备份后清理"
+        )
+    }
+
+    private static func hasProjectReleaseSignature(at directory: URL) -> Bool {
+        let directoryMarkers: Set<String> = ["ci-artifacts", "final", "final-assets", "staging", "work"]
+        guard let children = try? fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: []
+        ) else {
+            return false
+        }
+
+        return children.contains { child in
+            let childName = child.lastPathComponent.lowercased()
+            return directoryMarkers.contains(childName)
+                || childName == "latest.json"
+                || projectReleaseArchiveSuffixes.contains(where: childName.hasSuffix)
+        }
     }
 
     private static func xcodeDerivedDataRule(for url: URL) -> GeneratedRule? {

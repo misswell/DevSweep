@@ -420,6 +420,49 @@ final class ScannerCoverageTests: XCTestCase {
         XCTAssertNil(items[outsideBuild.standardizedFileURL])
     }
 
+    func testScannerMatchesVersionedProjectReleasesAndInstallers() throws {
+        let root = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: root) }
+
+        try Data("{}".utf8).write(to: root.appendingPathComponent("package.json"))
+
+        let releaseDirectory = root.appendingPathComponent("release-v2.5.6/final-assets")
+        try createAllocatedCache(at: releaseDirectory)
+        let releaseRoot = releaseDirectory.deletingLastPathComponent()
+
+        let outputDirectory = root.appendingPathComponent("output")
+        try createAllocatedCache(at: outputDirectory)
+
+        let installer = root.appendingPathComponent("OctoShrink-2.5.24.pkg")
+        try createAllocatedFile(at: installer)
+
+        let unversionedInstaller = root.appendingPathComponent("OctoShrink-latest.pkg")
+        try createAllocatedFile(at: unversionedInstaller)
+
+        let misleadingRelease = root.appendingPathComponent("release-v2.5.7")
+        try createAllocatedCache(at: misleadingRelease.appendingPathComponent("notes"))
+
+        let report = CacheScanner.scan(
+            projectRoots: [root],
+            deepScan: false,
+            home: root.appendingPathComponent("empty-home"),
+            includeSystemCaches: false,
+            progress: { _ in },
+            environment: [:]
+        )
+
+        let items = Dictionary(uniqueKeysWithValues: report.items.map { ($0.path, $0) })
+        XCTAssertEqual(items[releaseRoot.standardizedFileURL]?.category, "项目生成物")
+        XCTAssertEqual(items[releaseRoot.standardizedFileURL]?.risk, .review)
+        XCTAssertFalse(items[releaseRoot.standardizedFileURL]?.isSelected ?? true)
+        XCTAssertEqual(items[outputDirectory.standardizedFileURL]?.category, "项目生成物")
+        XCTAssertEqual(items[installer.standardizedFileURL]?.category, "项目生成物")
+        XCTAssertEqual(items[installer.standardizedFileURL]?.risk, .review)
+        XCTAssertFalse(items[installer.standardizedFileURL]?.isSelected ?? true)
+        XCTAssertNil(items[unversionedInstaller.standardizedFileURL])
+        XCTAssertNil(items[misleadingRelease.standardizedFileURL])
+    }
+
     func testProjectLogsRequireAProjectMarker() throws {
         let root = try temporaryDirectory()
         defer { try? fileManager.removeItem(at: root) }

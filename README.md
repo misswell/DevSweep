@@ -9,7 +9,7 @@ DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcod
 - 按 Xcode、CoreSimulator、XCTest、Docker、项目生成物、包管理器、语言工具链、AI/ML、JVM、IDE 分类展示占用，并按空间从大到小排列。
 - 扫描常见开发者缓存白名单，不扫描照片、文档、邮件或整个磁盘；目录占用使用 macOS `du` 校准，避免只读到目录元数据而漏报大缓存。
 - 默认发现 `~/Code`、`~/Projects`、`~/Developer`、`~/Work`、`~/src` 和 `~/workspace`，也支持添加多个项目根目录并持久化保存。
-- 深度扫描项目目录，查找 `target`、`node_modules`、`.build`、`Pods`、`build`、`build-*`、`dist`、`.next`、`.turbo`、`.dart_tool`、Python 缓存、测试产物等生成物；Xcode 自定义 `build-*` 目录必须同时位于 Xcode 项目根目录并具备多个 DerivedData 特征，避免按名称误报。
+- 深度扫描项目目录，查找 `target`、`node_modules`、`.build`、`Pods`、`build`、`build-*`、`dist`、`output`、`release-v<版本>`、带版本号的项目发布包、`.next`、`.turbo`、`.dart_tool`、Python 缓存、测试产物等生成物；Xcode 自定义 `build-*` 目录必须同时位于 Xcode 项目根目录并具备多个 DerivedData 特征，避免按名称误报。
 - 识别 Xcode `ModuleCache`、`SourcePackages`、Preview、源码控制缓存，以及按 UUID 拆分的 XCTest 克隆设备和 CoreSimulator 设备。
 - 读取 npm、Cargo、Go、pip、uv、Poetry、Gradle 等自定义环境变量和 npm 配置，尽量覆盖不在默认路径的缓存。
 - 覆盖 Docker 官方 CLI 可回收的未使用镜像、已停止容器、未使用卷和 Build Cache，并显示 Docker Desktop 虚拟磁盘占用；虚拟磁盘只读，Docker CLI 清理需单独确认且不能从废纸篓恢复。
@@ -20,7 +20,7 @@ DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcod
 - 覆盖 Edge、Firefox、Google 应用、媒体分析、剪映和自定义 Chromium 资料目录缓存；跨 Caches、Application Support、Containers、Group Containers、HTTPStorages 和临时目录识别 Sparkle/Squirrel 等软件升级残留，系统级位置仅展示为手动项；存在项目标志时识别项目运行日志与 Nacos 日志。
 - 项目扫描覆盖 `.terragrunt-cache`、`.astro`、`zig-out`、`.cxx` 和项目内 DerivedData；对 Composer `vendor` 与 .NET `bin`/`obj` 必须先验证项目标志，避免按同名目录误报源码或运行时文件。
 - 识别 CoreSimulator 设备，通过 `xcrun simctl delete` 删除，避免直接破坏设备注册。
-- 对 Xcode Archives、iOS DeviceSupport、SourcePackages、XCTest 克隆设备、项目生成物和自定义 `build-*` DerivedData 标记为“建议确认”或“手动处理”；包含 Release App/归档的目录不会默认勾选。
+- 对 Xcode Archives、iOS DeviceSupport、SourcePackages、XCTest 克隆设备、项目生成物、自定义 `build-*` DerivedData 和版本化 Release 暂存目录标记为“建议确认”或“手动处理”；包含 Release App/归档或安装包的目录不会默认勾选。
 - 扫描过程中显示当前路径、已检查数量、跳过数量和权限异常；扫描完成后可查看实际扫描范围和诊断详情。
 - 默认只勾选低风险缓存；清理前二次确认。
 - 每个项目都提供操作下拉菜单，可加入忽略名单、在 Finder 中打开目录、复制完整路径或单独清理；加入忽略名单只保存路径，不触发重新扫描，下次扫描时生效；长路径可悬浮查看。
