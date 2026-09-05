@@ -84,3 +84,9 @@ GitHub Actions 的 tag 发布还需要配置仓库 Secrets：`APPLE_CERTIFICATE_
 ## 安全边界
 
 DevSweep 不会直接删除 Docker 虚拟磁盘、用户源码、Git 仓库、照片或文档。Docker 镜像、容器、卷和 Build Cache 通过官方 CLI 清理，不能移入废纸篓，必须由用户逐项确认；只允许当前 Docker CLI 指向本机 Unix socket 或 localhost，拒绝远程 context；Docker.raw 只展示占用。AI Agent 只纳入可重建缓存、调试日志和更新下载，所有会话、项目、凭据、记忆、队列、配置、状态和仓库数据都排除在扫描规则之外。开发工具的 Electron 数据也只按明确应用和缓存叶子白名单识别，不扫描整个 Application Support，不触碰 IDE 用户数据、会话历史或工作区状态。删除项目生成物和模拟器设备会让下次构建/运行重新生成数据，可能需要重新下载依赖。运行测试、模拟器、Docker 构建或 agent 更新时，请先停止相关进程再处理对应资源。
+
+---
+
+## 👨‍💻 作者的其他开源项目
+
+**[MacPilot](https://github.com/misswell/MacPilot)** —— 开源 macOS 菜单栏效率工具箱（Swift 原生 · 零第三方依赖）：应用自动退出规则、BLE 靠近解锁、窗口切换器、剪贴板历史、平滑滚动、画中画、录屏、截图贴图等 11 合 1，Apple 公证签名，[免费下载](https://github.com/misswell/MacPilot/releases/latest)。觉得有用欢迎点个 Star ⭐
