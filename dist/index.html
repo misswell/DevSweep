@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0a0d0d" />
+    <meta
+      name="description"
+      content="DevSweep is a native macOS developer cache cleaner for reclaiming build space without touching your source code."
+    />
+    <title>DevSweep — Make room for the next build</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script defer src="script.js"></script>
+  </head>
+  <body>
+    <div class="grain" aria-hidden="true"></div>
+    <div class="site-shell">
+      <header class="site-header">
+        <a class="brand" href="#top" aria-label="DevSweep home">
+          <span class="brand-mark" aria-hidden="true">
+            <img src="devsweep-icon.png" alt="" />
+          </span>
+          <span class="brand-name">DevSweep</span>
+        </a>
+
+        <nav class="desktop-nav" aria-label="Primary navigation">
+          <a href="#coverage">Coverage</a>
+          <a href="#method">How it works</a>
+          <a href="#safety">Safety</a>
+        </nav>
+
+        <div class="header-actions">
+          <a class="header-link" href="https://github.com/misswell/DevSweep" target="_blank" rel="noreferrer">
+            GitHub <span aria-hidden="true">↗</span>
+          </a>
+          <a class="button button-small button-lime" href="https://github.com/misswell/DevSweep/releases/latest" target="_blank" rel="noreferrer">
+            Download <span aria-hidden="true">↗</span>
+          </a>
+          <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="mobile-nav" aria-label="Open navigation">
+            <span></span><span></span>
+          </button>
+        </div>
+      </header>
+
+      <nav class="mobile-nav" id="mobile-nav" aria-label="Mobile navigation">
+        <a href="#coverage">Coverage</a>
+        <a href="#method">How it works</a>
+        <a href="#safety">Safety</a>
+        <a href="https://github.com/misswell/DevSweep" target="_blank" rel="noreferrer">GitHub ↗</a>
+      </nav>
+
+      <main id="top">
+        <section class="hero section-pad">
+          <div class="hero-copy" data-reveal>
+            <div class="eyebrow">
+              <span class="eyebrow-dot" aria-hidden="true"></span>
+              Developer cache hygiene for macOS
+              <span class="eyebrow-version">v0.1.28</span>
+            </div>
+            <h1>Less waiting.<br /><em>More making.</em></h1>
+            <p class="hero-lede">
+              DevSweep finds the build debris your tools leave behind, shows you exactly what it is, and gives you the final say.
+            </p>
+            <div class="hero-actions">
+              <a class="button button-primary" href="https://github.com/misswell/DevSweep/releases/latest" target="_blank" rel="noreferrer">
+                Get DevSweep <span aria-hidden="true">↗</span>
+              </a>
+              <a class="text-link" href="#method">See the method <span aria-hidden="true">↓</span></a>
+            </div>
+            <div class="hero-proof">
+              <div class="proof-dots" aria-hidden="true">
+                <span class="proof-dot proof-blue"></span>
+                <span class="proof-dot proof-mint"></span>
+                <span class="proof-dot proof-orange"></span>
+              </div>
+              <p>For the Mac that runs your whole stack.</p>
+            </div>
+          </div>
+
+          <div class="hero-visual" data-reveal data-delay="120">
+            <div class="visual-kicker"><span></span> SAMPLE SCAN / READY FOR REVIEW</div>
+            <div class="scan-window">
+              <div class="scan-window-topbar">
+                <div class="window-controls" aria-hidden="true"><span></span><span></span><span></span></div>
+                <div class="window-title">DevSweep <span>/ Overview</span></div>
+                <div class="window-menu" aria-hidden="true">•••</div>
+              </div>
+              <div class="scan-window-body">
+                <div class="scan-overview">
+                  <div class="scan-label">RECLAIMABLE SPACE</div>
+                  <div class="scan-total"><span data-total>142.8</span><small>GB</small></div>
+                  <div class="scan-status"><span class="status-pulse" aria-hidden="true"></span><span id="scan-status">Sample results · ready for review</span></div>
+                  <div class="radar" aria-hidden="true">
+                    <div class="radar-ring radar-ring-one"></div>
+                    <div class="radar-ring radar-ring-two"></div>
+                    <div class="radar-ring radar-ring-three"></div>
+                    <div class="radar-cross radar-cross-x"></div>
+                    <div class="radar-cross radar-cross-y"></div>
+                    <div class="radar-sweep"></div>
+                    <div class="radar-core"><span></span></div>
+                    <span class="radar-pin radar-pin-a"></span>
+                    <span class="radar-pin radar-pin-b"></span>
+                    <span class="radar-pin radar-pin-c"></span>
+                  </div>
+                  <button class="scan-button" id="run-scan" type="button">
+                    <span class="scan-button-icon" aria-hidden="true">↻</span>
+                    Run a sample scan
+                  </button>
+                </div>
+                <div class="scan-breakdown">
+                  <div class="breakdown-heading"><span>WHAT'S TAKING ROOM</span><span>SIZE</span></div>
+                  <div class="breakdown-row">
+                    <div class="breakdown-name"><span class="category-dot dot-xcode"></span><span>Xcode</span></div>
+                    <div class="breakdown-value"><span class="breakdown-bar"><i style="width: 89%"></i></span><strong data-space="xcode">68.4 GB</strong></div>
+                  </div>
+                  <div class="breakdown-row">
+                    <div class="breakdown-name"><span class="category-dot dot-docker"></span><span>Docker</span></div>
+                    <div class="breakdown-value"><span class="breakdown-bar"><i style="width: 63%"></i></span><strong data-space="docker">31.2 GB</strong></div>
+                  </div>
+                  <div class="breakdown-row">
+                    <div class="breakdown-name"><span class="category-dot dot-tooling"></span><span>Toolchains</span></div>
+                    <div class="breakdown-value"><span class="breakdown-bar"><i style="width: 48%"></i></span><strong data-space="tooling">24.7 GB</strong></div>
+                  </div>
+                  <div class="breakdown-row">
+                    <div class="breakdown-name"><span class="category-dot dot-projects"></span><span>Projects</span></div>
+                    <div class="breakdown-value"><span class="breakdown-bar"><i style="width: 29%"></i></span><strong data-space="projects">18.5 GB</strong></div>
+                  </div>
+                  <div class="breakdown-footer"><span>32 clean-up targets found</span><span class="footer-arrow" aria-hidden="true">↗</span></div>
+                </div>
+              </div>
+            </div>
+            <div class="float-note float-note-top"><span class="float-note-mark">✦</span> No source code touched</div>
+            <div class="float-note float-note-bottom"><span class="float-note-number">01</span> inspect <span aria-hidden="true">→</span> decide <span aria-hidden="true">→</span> reclaim</div>
+          </div>
+        </section>
+
+        <section class="toolbelt section-pad" aria-label="Supported developer tools">
+          <div class="toolbelt-label">YOUR TOOLCHAIN, IN ONE VIEW</div>
+          <div class="toolbelt-line" aria-hidden="true"></div>
+          <div class="toolbelt-items">
+            <span><b class="tool-mark tool-swift">●</b> Swift</span>
+            <span><b class="tool-mark tool-xcode">⌁</b> Xcode</span>
+            <span><b class="tool-mark tool-rust">◒</b> Rust</span>
+            <span><b class="tool-mark tool-node">◆</b> Node</span>
+            <span><b class="tool-mark tool-docker">▣</b> Docker</span>
+            <span><b class="tool-mark tool-python">⌘</b> Python</span>
+            <span><b class="tool-mark tool-ide">▦</b> IDEs</span>
+          </div>
+        </section>
+
+        <section class="story section-pad" id="method">
+          <div class="section-index" data-reveal>01 <span>THE PROBLEM</span></div>
+          <div class="story-grid">
+            <div class="story-heading" data-reveal>
+              <h2>Your drive remembers<br /><span>every build.</span></h2>
+            </div>
+            <div class="story-copy" data-reveal data-delay="80">
+              <p>
+                A preview run here. A failed Docker build there. A simulator you forgot three releases ago. The work moves on; the artifacts stay.
+              </p>
+              <p class="story-note">The answer isn't a bigger “Clean” button. It's a better map.</p>
+            </div>
+          </div>
+          <div class="stat-card" data-reveal data-delay="160">
+            <div class="stat-card-top"><span>THE BUILD DEBT</span><span>ANATOMY OF A WORKDAY</span></div>
+            <div class="stat-card-main">
+              <div class="stat-number">∞</div>
+              <div class="stat-description">small leftovers<br /><span>become big slowdowns</span></div>
+              <div class="stat-sparkline" aria-hidden="true">
+                <span style="height: 19%"></span><span style="height: 26%"></span><span style="height: 34%"></span><span style="height: 31%"></span><span style="height: 48%"></span><span style="height: 45%"></span><span style="height: 67%"></span><span style="height: 62%"></span><span style="height: 82%"></span><span style="height: 92%"></span>
+              </div>
+            </div>
+            <div class="stat-card-bottom"><span>DevSweep makes the invisible visible.</span><span class="card-chip">macOS 13+</span></div>
+          </div>
+        </section>
+
+        <section class="coverage section-pad" id="coverage">
+          <div class="section-index" data-reveal>02 <span>THE COVERAGE</span></div>
+          <div class="coverage-heading" data-reveal>
+            <h2>Every project has<br /><em>its own gravity.</em></h2>
+            <p>DevSweep follows the places your tools actually put things — default paths, custom environments, and the corners you stopped checking.</p>
+          </div>
+
+          <div class="coverage-cards">
+            <article class="coverage-card card-blue" data-reveal>
+              <div class="coverage-card-top"><span class="card-number">01</span><span class="card-icon" aria-hidden="true">⌘</span></div>
+              <h3>Find the heavy<br />layers.</h3>
+              <p>Xcode, CoreSimulator, previews, archives, package caches, and generated project output — sized and sorted.</p>
+              <div class="card-footer"><span>Apple stack</span><span>↗</span></div>
+            </article>
+            <article class="coverage-card card-mint" data-reveal data-delay="80">
+              <div class="coverage-card-top"><span class="card-number">02</span><span class="card-icon" aria-hidden="true">◌</span></div>
+              <h3>Trace the<br />whole stack.</h3>
+              <p>Rust, Node, Python, Go, Flutter, JVM, Docker, AI/ML tooling, IDEs, browsers, and the caches around them.</p>
+              <div class="card-footer"><span>Modern toolchains</span><span>↗</span></div>
+            </article>
+            <article class="coverage-card card-lime" data-reveal data-delay="160">
+              <div class="coverage-card-top"><span class="card-number">03</span><span class="card-icon" aria-hidden="true">✓</span></div>
+              <h3>Keep the<br />final say.</h3>
+              <p>Review risk, inspect paths, whitelist what matters, and send ordinary folders to the macOS Trash when possible.</p>
+              <div class="card-footer"><span>Review first</span><span>↗</span></div>
+            </article>
+          </div>
+
+          <div class="coverage-cloud" data-reveal>
+            <span>XCTest clones</span><span>ModuleCache</span><span>node_modules</span><span>Docker build cache</span><span>Playwright</span><span>Gradle</span><span>Ollama</span><span>DeviceSupport</span><span>CoreSimulator</span><span>VS Code</span><span>SwiftPM</span><span>Terraform</span>
+          </div>
+        </section>
+
+        <section class="safety section-pad" id="safety">
+          <div class="section-index section-index-dark" data-reveal>03 <span>THE DIFFERENCE</span></div>
+          <div class="safety-layout">
+            <div class="safety-heading" data-reveal>
+              <h2>Clean with<br /><span>context.</span></h2>
+              <p>No mystery meat. No blind wipe. Just a clear path from “what is that?” to “I’m good without it.”</p>
+            </div>
+            <div class="steps" data-reveal data-delay="100">
+              <div class="step is-active">
+                <div class="step-number">01</div>
+                <div><h3>Scan the known zones</h3><p>Default locations, custom project roots, and tool-specific environments — not your whole disk.</p></div>
+              </div>
+              <div class="step">
+                <div class="step-number">02</div>
+                <div><h3>Review the evidence</h3><p>See category, size, path, risk, and the reason an item can be reclaimed.</p></div>
+              </div>
+              <div class="step">
+                <div class="step-number">03</div>
+                <div><h3>Reclaim on your terms</h3><p>Selections persist. Whitelists stay local. Normal folders can go to Trash for recovery.</p></div>
+              </div>
+            </div>
+          </div>
+          <div class="safety-stamp" aria-hidden="true"><span>BUILT FOR<br />CAREFUL<br /><b>MAKERS</b></span></div>
+        </section>
+
+        <section class="download section-pad" id="download">
+          <div class="download-glow" aria-hidden="true"></div>
+          <div class="download-content" data-reveal>
+            <div class="eyebrow eyebrow-light"><span class="eyebrow-dot"></span> Free to inspect. Yours to decide.</div>
+            <h2>Make room for<br /><em>the next build.</em></h2>
+            <p>Native SwiftUI. macOS 13+. Built for the machines that make things.</p>
+            <div class="download-actions">
+              <a class="button button-lime button-large" href="https://github.com/misswell/DevSweep/releases/latest" target="_blank" rel="noreferrer">Download for macOS <span aria-hidden="true">↗</span></a>
+              <a class="button button-ghost" href="https://github.com/misswell/DevSweep" target="_blank" rel="noreferrer">Explore the source <span aria-hidden="true">↗</span></a>
+            </div>
+            <div class="download-meta"><span>Current release <b>0.1.28</b></span><span class="meta-separator">·</span><span>Developer cache cleaner</span></div>
+          </div>
+          <div class="download-orbit" aria-hidden="true"><div class="orbit-ring orbit-ring-a"></div><div class="orbit-ring orbit-ring-b"></div><div class="orbit-dot orbit-dot-a"></div><div class="orbit-dot orbit-dot-b"></div><div class="orbit-core">DS</div></div>
+        </section>
+      </main>
+
+      <footer class="site-footer">
+        <div class="footer-brand"><span class="brand-mark brand-mark-small"><img src="devsweep-icon.png" alt="" /></span><span>DevSweep</span></div>
+        <p>Make space for better work.</p>
+        <div class="footer-links"><a href="https://github.com/misswell/DevSweep" target="_blank" rel="noreferrer">GitHub ↗</a><a href="#top">Back to top ↑</a></div>
+      </footer>
+    </div>
+  </body>
+</html>
