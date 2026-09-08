@@ -1,6 +1,41 @@
 import AppKit
 import SwiftUI
 
+/// A single compatibility point for the macOS 26 glass redesign.
+///
+/// `glassEffect` is only available on macOS 26, while DevSweep still supports
+/// macOS 13. Keeping the availability check here prevents the new appearance
+/// from leaking into every view and gives older systems the existing material
+/// treatment.
+private struct DevSweepSurfaceModifier: ViewModifier {
+    let cornerRadius: CGFloat
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(macOS 26, *) {
+            content
+                .glassEffect(
+                    .regular,
+                    in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                )
+        } else {
+            content
+                .background(.regularMaterial)
+                .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .stroke(Color.primary.opacity(0.08))
+                }
+        }
+    }
+}
+
+private extension View {
+    func devSweepSurface(cornerRadius: CGFloat = 12) -> some View {
+        modifier(DevSweepSurfaceModifier(cornerRadius: cornerRadius))
+    }
+}
+
 struct MiniModeWindowPlacement {
     static func expandedFrame(
         from miniFrame: CGRect,
@@ -267,6 +302,11 @@ struct ContentView: View {
             bottomBar
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .background {
+            if #available(macOS 26, *) {
+                Color.clear.glassEffect(.regular)
+            }
+        }
     }
 
     private var header: some View {
@@ -633,12 +673,7 @@ struct ContentView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
-        .background(.background)
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(Color.primary.opacity(0.08))
-        }
+        .devSweepSurface(cornerRadius: 10)
     }
 
     private var bottomBar: some View {
@@ -665,6 +700,11 @@ struct ContentView: View {
         .padding(.horizontal, 24)
         .padding(.vertical, 12)
         .background(.regularMaterial)
+        .background {
+            if #available(macOS 26, *) {
+                Color.clear.glassEffect(.regular)
+            }
+        }
     }
 
     private func categorySubtitle(_ category: String) -> String {
