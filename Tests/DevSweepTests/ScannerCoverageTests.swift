@@ -274,8 +274,7 @@ final class ScannerCoverageTests: XCTestCase {
             "Library/Application Support/Google/GoogleUpdater/crx_cache",
             "Library/Containers/com.apple.mediaanalysisd/Data/Library/Caches",
             "Movies/JianyingPro/User Data/Cache",
-            "Library/Caches/Google",
-            "logs"
+            "Library/Caches/Google"
         ]
         for relativePath in expectedPaths {
             try createAllocatedCache(at: home.appendingPathComponent(relativePath))
@@ -314,11 +313,13 @@ final class ScannerCoverageTests: XCTestCase {
         XCTAssertEqual(CacheScanner.generatedRule(for: dotnet.appendingPathComponent("bin"))?.category, ".NET 项目")
         XCTAssertEqual(CacheScanner.generatedRule(for: dotnet.appendingPathComponent("obj"))?.category, ".NET 项目")
         XCTAssertEqual(CacheScanner.generatedRule(for: xcode.appendingPathComponent("DerivedData"))?.category, "Apple 项目")
+        XCTAssertEqual(CacheScanner.generatedRule(for: composer.appendingPathComponent("build"))?.category, "项目生成物")
 
         XCTAssertNil(CacheScanner.generatedRule(for: ordinary.appendingPathComponent("vendor")))
         XCTAssertNil(CacheScanner.generatedRule(for: ordinary.appendingPathComponent("bin")))
         XCTAssertNil(CacheScanner.generatedRule(for: ordinary.appendingPathComponent("obj")))
         XCTAssertNil(CacheScanner.generatedRule(for: ordinary.appendingPathComponent("DerivedData")))
+        XCTAssertNil(CacheScanner.generatedRule(for: ordinary.appendingPathComponent("build")))
     }
 
     func testNewProjectArtifactRulesCoverModernToolchains() throws {
@@ -606,6 +607,232 @@ final class ScannerCoverageTests: XCTestCase {
         for relativePath in expectedPaths {
             XCTAssertTrue(scannedPaths.contains(home.appendingPathComponent(relativePath).standardizedFileURL))
         }
+    }
+
+    func testDependencyStoreRisksAndCustomDenoRootAreConservative() throws {
+        let home = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: home) }
+
+        let expectedRisks: [String: RiskLevel] = [
+            ".cargo/registry/cache": .safe,
+            ".cargo/registry/index": .safe,
+            ".cargo/registry/src": .review,
+            ".cargo/git/checkouts": .review,
+            ".cargo/git/db": .review,
+            ".nuget/packages": .review,
+            ".pub-cache": .review,
+            "custom-deno": .review
+        ]
+        for relativePath in expectedRisks.keys {
+            try createAllocatedCache(at: home.appendingPathComponent(relativePath))
+        }
+
+        let report = CacheScanner.scan(
+            projectRoots: [],
+            deepScan: false,
+            home: home,
+            includeSystemCaches: false,
+            progress: { _ in },
+            environment: ["DENO_DIR": "custom-deno"]
+        )
+        let scannedItems = Dictionary(uniqueKeysWithValues: report.items.map { ($0.path, $0) })
+
+        for (relativePath, expectedRisk) in expectedRisks {
+            let item = scannedItems[home.appendingPathComponent(relativePath).standardizedFileURL]
+            XCTAssertEqual(item?.risk, expectedRisk, relativePath)
+            if expectedRisk == .review {
+                XCTAssertFalse(item?.isSelected ?? true, relativePath)
+            }
+        }
+    }
+
+    func testArtifactContainerCannotBecomeProjectRoot() throws {
+        let nodeModules = try temporaryDirectory().appendingPathComponent("node_modules")
+        defer { try? fileManager.removeItem(at: nodeModules.deletingLastPathComponent()) }
+
+        let dist = nodeModules.appendingPathComponent("fake-package/dist")
+        try fileManager.createDirectory(at: dist, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: nodeModules.appendingPathComponent("fake-package/package.json"))
+        try Data(repeating: 0xA5, count: 1_100_000).write(to: dist.appendingPathComponent("bundle.js"))
+
+        let report = CacheScanner.scan(
+            projectRoots: [nodeModules],
+            deepScan: true,
+            home: nodeModules.deletingLastPathComponent().appendingPathComponent("home"),
+            includeSystemCaches: false,
+            progress: { _ in },
+            environment: [:]
+        )
+
+        XCTAssertTrue(report.items.isEmpty)
+        XCTAssertTrue(report.diagnostics.contains { $0.reason.contains("生成物容器") })
+    }
+
+    func testNormalNodeProjectStillFindsNodeModules() throws {
+        let root = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: root) }
+
+        try Data("{}".utf8).write(to: root.appendingPathComponent("package.json"))
+        try createAllocatedCache(at: root.appendingPathComponent("node_modules"))
+
+        let report = CacheScanner.scan(
+            projectRoots: [root],
+            deepScan: true,
+            home: root.appendingPathComponent("home"),
+            includeSystemCaches: false,
+            progress: { _ in },
+            environment: [:]
+        )
+
+        let item = report.items.first { $0.path == root.appendingPathComponent("node_modules") }
+        XCTAssertEqual(item?.risk, .review)
+        XCTAssertFalse(item?.isSelected ?? true)
+    }
+
+    func testMonorepoMarkersAllowNestedProjectArtifacts() throws {
+        let root = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: root) }
+
+        try Data("packages:\n  - apps/*\n".utf8).write(to: root.appendingPathComponent("pnpm-workspace.yaml"))
+        let app = root.appendingPathComponent("apps/web")
+        try fileManager.createDirectory(at: app, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: app.appendingPathComponent("package.json"))
+        try createAllocatedCache(at: app.appendingPathComponent(".next"))
+
+        let report = CacheScanner.scan(
+            projectRoots: [root],
+            deepScan: true,
+            home: root.appendingPathComponent("home"),
+            includeSystemCaches: false,
+            progress: { _ in },
+            environment: [:]
+        )
+
+        let item = report.items.first { $0.path == app.appendingPathComponent(".next") }
+        XCTAssertEqual(item?.category, "Node.js 项目")
+        XCTAssertEqual(item?.risk, .safe)
+    }
+
+    func testCachedirTagRequiresExactSignatureAndRegularFile() throws {
+        let root = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: root) }
+        let valid = root.appendingPathComponent("valid")
+        let invalid = root.appendingPathComponent("invalid")
+        let symlink = root.appendingPathComponent("symlink")
+        let empty = root.appendingPathComponent("empty")
+        for directory in [valid, invalid, symlink, empty] {
+            try createAllocatedCache(at: directory)
+        }
+
+        let signature = "Signature: 8a477f597d28d172789f06886806bc55\n"
+        try Data(signature.utf8).write(to: valid.appendingPathComponent("CACHEDIR.TAG"))
+        try Data("Signature: invalid\n".utf8).write(to: invalid.appendingPathComponent("CACHEDIR.TAG"))
+        try fileManager.createSymbolicLink(
+            at: symlink.appendingPathComponent("CACHEDIR.TAG"),
+            withDestinationURL: valid.appendingPathComponent("CACHEDIR.TAG")
+        )
+        try Data().write(to: empty.appendingPathComponent("CACHEDIR.TAG"))
+
+        XCTAssertTrue(CacheScanner.hasValidCacheDirectoryTag(valid))
+        XCTAssertFalse(CacheScanner.hasValidCacheDirectoryTag(invalid))
+        XCTAssertFalse(CacheScanner.hasValidCacheDirectoryTag(symlink))
+        XCTAssertFalse(CacheScanner.hasValidCacheDirectoryTag(empty))
+    }
+
+    func testCachedirTagProvidesCacheEvidenceForProjectDirectory() throws {
+        let root = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: root) }
+        let cache = root.appendingPathComponent("generated-cache")
+        try createAllocatedCache(at: cache)
+        try Data("Signature: 8a477f597d28d172789f06886806bc55\n".utf8)
+            .write(to: cache.appendingPathComponent("CACHEDIR.TAG"))
+
+        let report = CacheScanner.scan(
+            projectRoots: [root],
+            deepScan: true,
+            home: root.appendingPathComponent("home"),
+            includeSystemCaches: false,
+            progress: { _ in },
+            environment: [:]
+        )
+        let item = report.items.first { $0.path == cache.standardizedFileURL }
+        XCTAssertEqual(item?.category, "其他开发缓存")
+        XCTAssertEqual(item?.risk, .safe)
+    }
+
+    func testAIWorktreeCanBeScannedWithoutTreatingAgentRootAsArtifact() throws {
+        let home = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: home) }
+        let worktrees = home.appendingPathComponent(".codex/worktrees")
+        let project = worktrees.appendingPathComponent("project")
+        try fileManager.createDirectory(at: project, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: project.appendingPathComponent("package.json"))
+        try createAllocatedCache(at: project.appendingPathComponent("node_modules"))
+
+        let report = CacheScanner.scan(
+            projectRoots: [worktrees],
+            deepScan: true,
+            home: home,
+            includeSystemCaches: false,
+            progress: { _ in },
+            environment: [:]
+        )
+
+        XCTAssertTrue(report.items.contains { $0.path == project.appendingPathComponent("node_modules") })
+        XCTAssertFalse(report.items.contains { $0.path == home.appendingPathComponent(".codex") })
+        XCTAssertFalse(report.items.contains { $0.path == worktrees })
+    }
+
+    func testDangerousProjectRootIsIgnoredInsteadOfScanningWholeDisk() throws {
+        let fakeHome = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: fakeHome) }
+
+        let report = CacheScanner.scan(
+            projectRoots: [URL(fileURLWithPath: "/")],
+            deepScan: true,
+            home: fakeHome,
+            includeSystemCaches: false,
+            progress: { _ in },
+            environment: [:]
+        )
+
+        XCTAssertTrue(report.scannedRoots.isEmpty)
+        XCTAssertFalse(report.items.contains { $0.path.path == "/" })
+    }
+
+    func testNewDatabaseAPICICachesAreScopedToExplicitLeaves() throws {
+        let home = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: home) }
+        let expected: [(String, String, RiskLevel)] = [
+            ("Library/Caches/com.sequel-ace.sequel-ace", "数据库工具", .safe),
+            ("Library/Caches/com.navicat.test", "数据库工具", .safe),
+            ("Library/Caches/com.dbeaver.test", "数据库工具", .safe),
+            ("Library/Caches/com.postmanlabs.mac", "API / 调试工具", .safe),
+            ("Library/Caches/com.github.GitHubDesktop", "开发工具", .safe),
+            ("Library/Caches/SentryCrash", "开发工具", .review),
+            (".cache/gitlab-runner", "CI/CD", .safe),
+            (".tnpm/_cacache", "包管理器", .safe)
+        ]
+        for (relativePath, _, _) in expected {
+            try createAllocatedCache(at: home.appendingPathComponent(relativePath))
+        }
+        try createAllocatedCache(at: home.appendingPathComponent("Library/Application Support/Postman"))
+
+        let report = CacheScanner.scan(
+            projectRoots: [],
+            deepScan: false,
+            home: home,
+            includeSystemCaches: false,
+            progress: { _ in },
+            environment: [:]
+        )
+        let items = Dictionary(uniqueKeysWithValues: report.items.map { ($0.path, $0) })
+        for (relativePath, category, risk) in expected {
+            let item = items[home.appendingPathComponent(relativePath).standardizedFileURL]
+            XCTAssertEqual(item?.category, category, relativePath)
+            XCTAssertEqual(item?.risk, risk, relativePath)
+        }
+        XCTAssertFalse(report.items.contains { $0.path == home.appendingPathComponent("Library/Application Support/Postman") })
     }
 
     private func temporaryDirectory() throws -> URL {

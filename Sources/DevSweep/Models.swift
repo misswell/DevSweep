@@ -1,10 +1,38 @@
 import Foundation
 import SwiftUI
 
-enum CleanupKind: String {
+enum CleanupKind: String, Hashable {
     case trash
     case simulatorDevice
     case dockerPrune
+    case toolCommand
+
+    var isNonRecoverable: Bool {
+        switch self {
+        case .trash:
+            return false
+        case .simulatorDevice, .dockerPrune, .toolCommand:
+            return true
+        }
+    }
+}
+
+enum ToolCleanupAction: String, Hashable {
+    case githubCLI
+    case pnpmStore
+    case uvCache
+    case condaCache
+    case nixGarbageCollection
+
+    var displayName: String {
+        switch self {
+        case .githubCLI: return "GitHub CLI"
+        case .pnpmStore: return "pnpm"
+        case .uvCache: return "uv"
+        case .condaCache: return "Conda"
+        case .nixGarbageCollection: return "Nix"
+        }
+    }
 }
 
 enum DockerCleanupTarget: String, CaseIterable, Equatable, Sendable {
@@ -130,6 +158,8 @@ struct CacheItem: Identifiable, Hashable {
     let risk: RiskLevel
     let kind: CleanupKind
     let identifier: String?
+    let toolAction: ToolCleanupAction?
+    let expectedFileIdentity: FileIdentity?
     let note: String
     var isSelected: Bool
 
@@ -142,6 +172,8 @@ struct CacheItem: Identifiable, Hashable {
         risk: RiskLevel = .safe,
         kind: CleanupKind = .trash,
         identifier: String? = nil,
+        toolAction: ToolCleanupAction? = nil,
+        expectedFileIdentity: FileIdentity? = nil,
         note: String = "",
         isSelected: Bool? = nil
     ) {
@@ -154,6 +186,8 @@ struct CacheItem: Identifiable, Hashable {
         self.risk = risk
         self.kind = kind
         self.identifier = identifier
+        self.toolAction = toolAction
+        self.expectedFileIdentity = expectedFileIdentity ?? FileIdentity.capture(path)
         self.note = note
         self.isSelected = isSelected ?? (risk == .safe && kind == .trash)
     }

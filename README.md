@@ -2,13 +2,13 @@
 
 DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcode、Rust/Tauri、Node、SwiftPM、Cargo、Gradle、Maven、Python、Go、Flutter、VS Code、Cursor 以及 OpenAI Codex、OpenCode、Claude Code、Goose 等 AI agent 开发环境。
 
-当前版本：0.1.30
+当前版本：0.1.32
 
 ## 当前功能
 
-- 按 Xcode、CoreSimulator、XCTest、Docker、项目生成物、包管理器、语言工具链、AI/ML、JVM、IDE 分类展示占用，并按空间从大到小排列。
+- 按 Xcode、CoreSimulator、XCTest、Docker、项目生成物、包管理器、语言工具链、CI/CD、AI/ML、JVM、IDE、数据库工具和 API/调试工具分类展示占用，并按空间从大到小排列。
 - 扫描常见开发者缓存白名单，不扫描照片、文档、邮件或整个磁盘；目录占用使用 macOS `du` 校准，避免只读到目录元数据而漏报大缓存。
-- 默认发现 `~/Code`、`~/Projects`、`~/Developer`、`~/Work`、`~/src` 和 `~/workspace`，也支持添加多个项目根目录并持久化保存。
+- 默认发现 `~/Code`、`~/Projects`、`~/Developer`、`~/Development`、`~/Work`、`~/src`、`~/workspace`、`~/www`、`~/GitHub` 以及存在时的 `~/.codex/worktrees`、`~/.claude/worktrees`，也支持添加多个项目根目录并持久化保存；不会把整个 `~/.codex` 或 `~/.claude` 当作项目根。
 - 深度扫描项目目录，查找 `target`、`node_modules`、`.build`、`Pods`、`build`、`build-*`、`dist`、`output`、`release-v<版本>`、带版本号的项目发布包、`.next`、`.turbo`、`.dart_tool`、Python 缓存、测试产物等生成物；Xcode 自定义 `build-*` 目录必须同时位于 Xcode 项目根目录并具备多个 DerivedData 特征，避免按名称误报。
 - 识别 Xcode `ModuleCache`、`SourcePackages`、Preview、源码控制缓存，以及按 UUID 拆分的 XCTest 克隆设备和 CoreSimulator 设备。
 - 读取 npm、Cargo、Go、pip、uv、Poetry、Gradle 等自定义环境变量和 npm 配置，尽量覆盖不在默认路径的缓存。
@@ -18,11 +18,13 @@ DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcod
 - 补充 npx、Ruby/Bundler、node-gyp、VS Code/Cursor 扩展安装包、前端工具链、云 CLI、Terraform/Helm、Cypress/Selenium 和多平台 Xcode DeviceSupport；系统级 CoreSimulator/Xcode 缓存只读展示为手动处理。
 - 补充 nvm、Volta、SonarQube、pnpm registry 元数据、SwiftPM XDG/旧缓存、Scala/sbt/Ivy/Coursier/Metals，以及 Instruments、SourceKitService 和 Xcode Previews 缓存；同时覆盖 Lingma、Trae CN、Windsurf、Zed、OpenCode Desktop、Nova 等开发工具的明确缓存叶子，并识别 NVM_DIR、VOLTA_HOME、SONAR_USER_HOME、COURSIER_CACHE 和 CocoaPods 自定义目录。
 - 覆盖 Edge、Firefox、Google 应用、媒体分析、剪映和自定义 Chromium 资料目录缓存；跨 Caches、Application Support、Containers、Group Containers、HTTPStorages 和临时目录识别 Sparkle/Squirrel 等软件升级残留，系统级位置仅展示为手动项；存在项目标志时识别项目运行日志与 Nacos 日志。
-- 项目扫描覆盖 `.terragrunt-cache`、`.astro`、`zig-out`、`.cxx` 和项目内 DerivedData；对 Composer `vendor` 与 .NET `bin`/`obj` 必须先验证项目标志，避免按同名目录误报源码或运行时文件。
+- 项目扫描覆盖 `.terragrunt-cache`、`.astro`、`zig-out`、`.cxx`、项目内 DerivedData、monorepo marker 和有效 `CACHEDIR.TAG`；如果扫描根自身是 `node_modules`、`target`、`build`、`dist`、`vendor` 等生成物容器，会跳过其内部项目发现。对 Composer `vendor`、.NET `bin`/`obj` 和通用 `build` 必须先验证项目标志，避免按同名目录误报源码或运行时文件。
 - 识别 CoreSimulator 设备，通过 `xcrun simctl delete` 删除，避免直接破坏设备注册。
 - 对 Xcode Archives、iOS DeviceSupport、SourcePackages、XCTest 克隆设备、项目生成物、自定义 `build-*` DerivedData 和版本化 Release 暂存目录标记为“建议确认”或“手动处理”；包含 Release App/归档或安装包的目录不会默认勾选。
 - 扫描过程中显示当前路径、已检查数量、跳过数量和权限异常；扫描完成后可查看实际扫描范围和诊断详情。
-- 默认只勾选低风险缓存；清理前二次确认。
+- Cargo 已解压源码、Cargo Git、NuGet、Dart/Flutter 依赖目录和自定义 `DENO_DIR` 按 `review` 展示，默认不勾选；近期刚修改的低风险缓存也不会自动勾选。
+- 普通目录清理前会重新检查目标是否仍存在、是否发生 symlink/路径替换、是否落在危险根目录或当前白名单中；检查失败只记录该项失败并继续处理其他项目。
+- GitHub CLI、pnpm 和 uv 优先使用官方清理命令，并在执行前检查工具进程、白名单、缓存根目录和超时；命令型清理不会进入废纸篓，默认不勾选。
 - 每个项目都提供操作下拉菜单，可加入忽略名单、在 Finder 中打开目录、复制完整路径或单独清理；加入忽略名单只保存路径，不触发重新扫描，下次扫描时生效；长路径可悬浮查看。
 - 支持迷你模式：以 360×640 的手机式竖屏窗口隐藏侧栏和说明卡，只保留扫描进度、缓存列表、选择、扫描和清理操作，并记住上次模式；从迷你模式切回普通模式时会根据窗口所在屏幕边缘向内展开，避免超出屏幕。
 - 勾选仅用于批量清理；设置页支持手动检查和执行在线更新。
@@ -35,26 +37,18 @@ DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcod
 要求 macOS 13+、Swift 5.9+：
 
 ```bash
-DEVSWEEP_ALLOW_ADHOC=1 ./scripts/build_app.sh
-open ./DevSweep.app
+swift build
+swift test
 ```
 
-上面是仅供本地调试的 ad-hoc 构建，默认按当前机器架构构建；需要 Universal 调试包时使用：
+本地验证只运行 SwiftPM 测试和编译，不生成或交付临时签名 App。正式发布需要 Developer ID 签名和 Apple 公证，由 GitHub Actions 完成：
 
 ```bash
-DEVSWEEP_ALLOW_ADHOC=1 DEVSWEEP_ARCHS="arm64 x86_64" ./scripts/build_app.sh
+git tag v<version>
+git push origin v<version>
 ```
 
-正式发布需要 Developer ID 签名和 Apple 公证。请在发布电脑上配置 Developer ID 证书及其私钥，并使用已验证的 `DEVSWEEP_NOTARY_PROFILE`：
-
-```bash
-export DEVSWEEP_DEVELOPER_ID='Developer ID Application: Your Name (TEAMID)'
-export DEVSWEEP_DEVELOPER_TEAM_ID='TEAMID'
-export DEVSWEEP_NOTARY_PROFILE='your-notary-profile'
-DEVSWEEP_ARCHS='arm64 x86_64' ./scripts/distribute_app.sh
-```
-
-`scripts/build_app.sh` 默认拒绝没有 Developer ID 的构建，避免误把 ad-hoc 包上传到 Release。只有本地开发时才显式使用 `DEVSWEEP_ALLOW_ADHOC=1`；这个包不能发布或用于在线更新。发布前必须确认 `codesign` 显示 `Developer ID Application`、`spctl` 通过且 `xcrun stapler validate` 成功。在线更新要求 Release 资产使用 `DevSweep-<version>-macos.zip` 文件名，并保留 GitHub 自动生成的 SHA-256 digest。包含在线更新功能的首个版本之前，旧安装需要手动安装一次。
+`scripts/build_app.sh` 默认拒绝没有 Developer ID 的构建，避免误把临时签名包上传到 Release。发布前必须确认 `codesign` 显示 `Developer ID Application`、`spctl` 通过且 `xcrun stapler validate` 成功。在线更新要求 Release 资产使用 `DevSweep-<version>-macos.zip` 文件名，并保留 GitHub 自动生成的 SHA-256 digest。包含在线更新功能的首个版本之前，旧安装需要手动安装一次。
 
 正式 Release 使用 `.github/workflows/release.yml` 在 GitHub Actions 上完成，不依赖发布电脑的钥匙串。该 workflow 复用现有项目的仓库 Secrets：`APPLE_CERTIFICATE_P12`、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_ID`、`APPLE_APP_SPECIFIC_PASSWORD`、`APPLE_DEVELOPER_ID` 和 `APPLE_TEAM_ID`。推送符合版本格式的 tag 后，Actions 会自动测试、签名、公证、装订票据、校验并创建 Release。
 
@@ -79,11 +73,11 @@ GitHub Actions 的 tag 发布还需要配置仓库 Secrets：`APPLE_CERTIFICATE_
 - [aaif-goose/goose](https://github.com/aaif-goose/goose/blob/4ad43df42d8e6f5c9dae962d4cf4cbad2aadf3de/ui/desktop/src/app-update.yml)：确认 Goose updater cache 目录名为 `goose-updater`。
 - [cline/cline](https://github.com/cline/cline/blob/main/apps/vscode/package.json)：确认扩展 ID；其 globalStorage 主要是任务和 agent 状态，因此不作为清理目标。
 
-代码仅借鉴公开项目描述和使用策略，没有复制其源代码。
+DevSweep 的清理目录和安全策略依据各开发工具公开文件结构、官方文档、实际运行行为及公开项目的功能思路独立实现。项目不复制、移植或翻译其他清理工具的源代码；上面的链接仅用于透明说明设计依据。
 
 ## 安全边界
 
-DevSweep 不会直接删除 Docker 虚拟磁盘、用户源码、Git 仓库、照片或文档。Docker 镜像、容器、卷和 Build Cache 通过官方 CLI 清理，不能移入废纸篓，必须由用户逐项确认；只允许当前 Docker CLI 指向本机 Unix socket 或 localhost，拒绝远程 context；Docker.raw 只展示占用。AI Agent 只纳入可重建缓存、调试日志和更新下载，所有会话、项目、凭据、记忆、队列、配置、状态和仓库数据都排除在扫描规则之外。开发工具的 Electron 数据也只按明确应用和缓存叶子白名单识别，不扫描整个 Application Support，不触碰 IDE 用户数据、会话历史或工作区状态。删除项目生成物和模拟器设备会让下次构建/运行重新生成数据，可能需要重新下载依赖。运行测试、模拟器、Docker 构建或 agent 更新时，请先停止相关进程再处理对应资源。
+DevSweep 不会直接删除 Docker 虚拟磁盘、用户源码、Git 仓库、照片或文档，也不会把 `/`、`$HOME`、`$HOME/Library`、Desktop、Documents、Downloads 等危险根目录作为自动删除目标。Docker 镜像、容器、卷和 Build Cache 通过官方 CLI 清理，不能移入废纸篓，必须由用户逐项确认；只允许当前 Docker CLI 指向本机 Unix socket 或 localhost，拒绝远程 context；Docker.raw 只展示占用。AI Agent 只纳入可重建缓存、调试日志和更新下载，所有会话、项目、凭据、记忆、队列、配置、状态和仓库数据都排除在扫描规则之外。开发工具的 Electron 数据也只按明确应用和缓存叶子白名单识别，不扫描整个 Application Support，不触碰 IDE 用户数据、会话历史或工作区状态。删除项目生成物和模拟器设备会让下次构建/运行重新生成数据，可能需要重新下载依赖。运行测试、模拟器、Docker 构建或 agent 更新时，请先停止相关进程再处理对应资源。
 
 ---
 

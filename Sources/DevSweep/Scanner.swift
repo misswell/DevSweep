@@ -16,11 +16,7 @@ struct GeneratedRule {
     let note: String
 }
 
-fileprivate struct ProcessOutput {
-    let status: Int32
-    let stdout: Data
-    let stderr: Data
-}
+fileprivate typealias ProcessOutput = ProcessResult
 
 fileprivate enum DockerSupport {
     static func executableURL() -> URL? {
@@ -179,9 +175,15 @@ struct CacheScanner {
             )
         }
 
-        let uniqueItems = nonOverlappingItems(
-            items.filter { !PathWhitelist.contains($0.path, in: whitelistedPaths) }
-        )
+        let candidates = items
+            .filter { !PathWhitelist.contains($0.path, in: whitelistedPaths) }
+            .sorted { left, right in
+                guard left.path.standardizedFileURL.path == right.path.standardizedFileURL.path else {
+                    return false
+                }
+                return (left.kind == .toolCommand ? 0 : 1) < (right.kind == .toolCommand ? 0 : 1)
+            }
+        let uniqueItems = nonOverlappingItems(candidates)
         .filter { $0.size >= minimumItemSize }
         .sorted {
             if $0.size == $1.size { return $0.name.localizedStandardCompare($1.name) == .orderedAscending }
@@ -310,12 +312,12 @@ struct CacheScanner {
             CacheRule(category: "包管理器", name: "npx 临时包", relativePath: ".npm/_npx", risk: .safe, note: "npx 会在下次执行时重新下载临时包"),
             CacheRule(category: "包管理器", name: "npm 预编译缓存", relativePath: ".npm/_prebuilds", risk: .safe, note: "原生模块会在需要时重新下载或编译"),
             CacheRule(category: "包管理器", name: "npm（旧路径）", relativePath: ".npm-cache-user/_cacache", risk: .safe, note: "npm 会重新下载依赖"),
+            CacheRule(category: "包管理器", name: "tnpm 下载缓存", relativePath: ".tnpm/_cacache", risk: .safe, note: "tnpm 会重新下载依赖"),
+            CacheRule(category: "包管理器", name: "tnpm 日志", relativePath: ".tnpm/_logs", risk: .safe, note: "仅为 tnpm 日志"),
             CacheRule(category: "包管理器", name: "Yarn", relativePath: "Library/Caches/Yarn", risk: .safe, note: "Yarn 会重新下载依赖"),
             CacheRule(category: "包管理器", name: "Yarn（旧缓存）", relativePath: ".cache/yarn", risk: .safe, note: "Yarn 会重新下载依赖"),
             CacheRule(category: "包管理器", name: "Yarn 离线缓存", relativePath: ".yarn/cache", risk: .review, note: "Yarn 会重新下载依赖；离线环境下请保留"),
-            CacheRule(category: "包管理器", name: "pnpm store", relativePath: "Library/pnpm/store", risk: .safe, note: "pnpm 会重新下载依赖"),
             CacheRule(category: "包管理器", name: "pnpm 元数据缓存", relativePath: "Library/Caches/pnpm", risk: .safe, note: "pnpm 会重新获取 registry 元数据"),
-            CacheRule(category: "包管理器", name: "pnpm store（Linux 兼容路径）", relativePath: ".local/share/pnpm/store", risk: .safe, note: "pnpm 会重新下载依赖"),
             CacheRule(category: "包管理器", name: "Bun", relativePath: ".bun/install/cache", risk: .safe, note: "Bun 会重新下载依赖"),
             CacheRule(category: "包管理器", name: "Deno", relativePath: "Library/Caches/deno", risk: .safe, note: "Deno 会重新下载依赖和工具"),
             CacheRule(category: "包管理器", name: "Deno（旧缓存）", relativePath: ".cache/deno", risk: .safe, note: "Deno 会重新下载依赖和工具"),
@@ -330,14 +332,14 @@ struct CacheScanner {
             CacheRule(category: "包管理器", name: "SwiftPM（旧缓存）", relativePath: ".swiftpm/cache", risk: .safe, note: "SwiftPM 会重新解析依赖"),
             CacheRule(category: "包管理器", name: "SwiftPM 仓库缓存", relativePath: ".swiftpm/repositories", risk: .review, note: "可能包含依赖仓库 checkout；删除后会重新下载，请确认后清理"),
             CacheRule(category: "包管理器", name: "Composer", relativePath: "Library/Caches/composer", risk: .safe, note: "Composer 会重新下载依赖"),
-            CacheRule(category: "包管理器", name: "NuGet 全局包缓存", relativePath: ".nuget/packages", risk: .safe, note: "NuGet 会重新下载包"),
+            CacheRule(category: "包管理器", name: "NuGet 全局包缓存", relativePath: ".nuget/packages", risk: .review, note: "NuGet 全局依赖包目录。清理后项目可以重新 restore，但可能需要大量网络下载，离线环境建议保留"),
             CacheRule(category: "包管理器", name: "CocoaPods Specs 仓库", relativePath: ".cocoapods/repos", risk: .review, note: "Specs 索引会重新下载；离线环境下请保留"),
 
             CacheRule(category: "语言工具链", name: "Cargo registry cache", relativePath: ".cargo/registry/cache", risk: .safe, note: "Cargo 会重新下载 crate"),
             CacheRule(category: "语言工具链", name: "Cargo registry index", relativePath: ".cargo/registry/index", risk: .safe, note: "Cargo 会重新获取 registry 索引"),
-            CacheRule(category: "语言工具链", name: "Cargo registry source", relativePath: ".cargo/registry/src", risk: .safe, note: "Cargo 会重新下载 crate 源码"),
-            CacheRule(category: "语言工具链", name: "Cargo git checkout", relativePath: ".cargo/git/checkouts", risk: .safe, note: "Cargo 会重新检出依赖"),
-            CacheRule(category: "语言工具链", name: "Cargo git database", relativePath: ".cargo/git/db", risk: .safe, note: "Cargo 会重新获取依赖"),
+            CacheRule(category: "语言工具链", name: "Cargo registry source", relativePath: ".cargo/registry/src", risk: .review, note: "Cargo 已解压的依赖源码；删除后会重新下载，可能影响离线构建和 IDE 索引"),
+            CacheRule(category: "语言工具链", name: "Cargo git checkout", relativePath: ".cargo/git/checkouts", risk: .review, note: "Cargo Git 依赖 checkout；删除后会重新获取，请确认离线构建不受影响"),
+            CacheRule(category: "语言工具链", name: "Cargo git database", relativePath: ".cargo/git/db", risk: .review, note: "Cargo Git 依赖数据库；删除后会重新获取，请确认离线构建不受影响"),
             CacheRule(category: "语言工具链", name: "rustup 下载缓存", relativePath: ".rustup/downloads", risk: .safe, note: "rustup 会重新下载工具链安装包"),
             CacheRule(category: "语言工具链", name: "rustup 临时缓存", relativePath: ".rustup/tmp", risk: .safe, note: "rustup 会重新创建临时文件"),
             CacheRule(category: "语言工具链", name: "pip", relativePath: "Library/Caches/pip", risk: .safe, note: "pip 会重新下载 wheel"),
@@ -360,7 +362,7 @@ struct CacheScanner {
             CacheRule(category: "语言工具链", name: "Anaconda 包缓存", relativePath: "anaconda3/pkgs", risk: .safe, note: "Conda 会重新下载包"),
             CacheRule(category: "语言工具链", name: "Go build cache", relativePath: "Library/Caches/go-build", risk: .safe, note: "Go 会重新编译"),
             CacheRule(category: "语言工具链", name: "Go modules", relativePath: "go/pkg/mod", risk: .review, note: "删除后 Go 项目需要重新下载模块"),
-            CacheRule(category: "语言工具链", name: "Flutter / Dart", relativePath: ".pub-cache", risk: .safe, note: "Pub 会重新下载依赖"),
+            CacheRule(category: "语言工具链", name: "Flutter / Dart", relativePath: ".pub-cache", risk: .review, note: "Dart/Flutter 依赖缓存。清理后可以重新获取依赖，但会增加下一次构建的网络和时间成本"),
 
             CacheRule(category: "JVM", name: "Gradle caches", relativePath: ".gradle/caches", risk: .safe, note: "Gradle 会重新下载依赖"),
             CacheRule(category: "JVM", name: "Gradle wrapper distributions", relativePath: ".gradle/wrapper/dists", risk: .safe, note: "Gradle wrapper 会重新下载发行版"),
@@ -459,8 +461,6 @@ struct CacheScanner {
             CacheRule(category: "应用缓存", name: "Google 更新下载缓存", relativePath: "Library/Application Support/Google/GoogleUpdater/crx_cache", risk: .safe, note: "Google Updater 会在需要时重新下载安装包"),
             CacheRule(category: "应用缓存", name: "媒体分析缓存", relativePath: "Library/Containers/com.apple.mediaanalysisd/Data/Library/Caches", risk: .safe, note: "macOS 媒体分析服务会重新生成缓存"),
             CacheRule(category: "应用缓存", name: "剪映缓存", relativePath: "Movies/JianyingPro/User Data/Cache", risk: .review, note: "退出剪映后清理；请先确认没有仍需使用的草稿缓存"),
-            CacheRule(category: "项目日志", name: "用户日志目录", relativePath: "logs", risk: .review, note: "用户主目录下的日志；确认不再需要排查问题后清理"),
-
             CacheRule(category: "前端工具链", name: "TypeScript 缓存", relativePath: ".cache/typescript", risk: .safe, note: "TypeScript 工具会重新生成缓存"),
             CacheRule(category: "前端工具链", name: "Electron 缓存", relativePath: ".cache/electron", risk: .safe, note: "Electron 会重新下载或生成缓存"),
             CacheRule(category: "前端工具链", name: "node-gyp 缓存", relativePath: ".cache/node-gyp", risk: .safe, note: "node-gyp 会重新下载头文件并编译"),
@@ -481,6 +481,23 @@ struct CacheScanner {
             CacheRule(category: "云与基础设施", name: "Azure CLI 日志", relativePath: ".azure/logs", risk: .safe, note: "仅为 Azure CLI 日志"),
             CacheRule(category: "Docker", name: "Docker BuildX 缓存", relativePath: ".docker/buildx/cache", risk: .safe, note: "BuildX 会重新生成构建缓存"),
             CacheRule(category: "包管理器", name: "Homebrew 日志", relativePath: "Library/Logs/Homebrew", risk: .safe, note: "仅为 Homebrew 构建和安装日志"),
+
+            CacheRule(category: "数据库工具", name: "Sequel Ace 缓存", relativePath: "Library/Caches/com.sequel-ace.sequel-ace", risk: .safe, note: "仅删除 Sequel Ace 的 macOS Cache 数据"),
+            CacheRule(category: "数据库工具", name: "Sequel Pro 缓存", relativePath: "Library/Caches/com.eggerapps.Sequel-Pro", risk: .safe, note: "仅删除 Sequel Pro 的 macOS Cache 数据"),
+            CacheRule(category: "数据库工具", name: "Redis Desktop Manager 缓存", relativePath: "Library/Caches/redis-desktop-manager", risk: .safe, note: "仅删除 Redis Desktop Manager 的 macOS Cache 数据"),
+            CacheRule(category: "数据库工具", name: "RedisInsight 缓存", relativePath: "Library/Caches/com.redis.RedisInsight", risk: .safe, note: "仅删除 RedisInsight 的 macOS Cache 数据"),
+            CacheRule(category: "数据库工具", name: "MongoDB Compass 缓存", relativePath: "Library/Caches/com.mongodb.compass", risk: .safe, note: "仅删除 MongoDB Compass 的 macOS Cache 数据"),
+            CacheRule(category: "API / 调试工具", name: "Postman 缓存", relativePath: "Library/Caches/com.postmanlabs.mac", risk: .safe, note: "退出 Postman 后仅清理 macOS Cache 数据，不触碰工作区、请求历史或凭据"),
+            CacheRule(category: "API / 调试工具", name: "Insomnia 缓存", relativePath: "Library/Caches/com.konghq.insomnia", risk: .safe, note: "退出 Insomnia 后仅清理 macOS Cache 数据，不触碰工作区或凭据"),
+            CacheRule(category: "API / 调试工具", name: "TablePlus 缓存", relativePath: "Library/Caches/com.tinyapp.TablePlus", risk: .safe, note: "仅删除 TablePlus 的 macOS Cache 数据"),
+            CacheRule(category: "API / 调试工具", name: "Paw 缓存", relativePath: "Library/Caches/com.getpaw.Paw", risk: .safe, note: "仅删除 Paw 的 macOS Cache 数据"),
+            CacheRule(category: "API / 调试工具", name: "Charles 缓存", relativePath: "Library/Caches/com.charlesproxy.charles", risk: .safe, note: "仅删除 Charles 的 macOS Cache 数据，不触碰配置、证书或请求历史"),
+            CacheRule(category: "开发工具", name: "GitHub Desktop 缓存", relativePath: "Library/Caches/com.github.GitHubDesktop", risk: .safe, note: "仅删除 GitHub Desktop 的 macOS Cache 数据，不触碰仓库或凭据"),
+            CacheRule(category: "开发工具", name: "SentryCrash 诊断数据", relativePath: "Library/Caches/SentryCrash", risk: .review, note: "崩溃诊断数据；确认不再需要排查相关问题后清理"),
+            CacheRule(category: "CI/CD", name: "GitLab Runner 缓存", relativePath: ".cache/gitlab-runner", risk: .safe, note: "GitLab Runner 会重新生成缓存"),
+            CacheRule(category: "CI/CD", name: "GitHub Actions 缓存", relativePath: ".github/cache", risk: .safe, note: "GitHub 工具会重新生成缓存"),
+            CacheRule(category: "CI/CD", name: "CircleCI 缓存", relativePath: ".circleci/cache", risk: .safe, note: "CircleCI 工具会重新生成缓存"),
+            CacheRule(category: "云与基础设施", name: "Grafana 缓存", relativePath: ".grafana/cache", risk: .safe, note: "Grafana 会重新生成缓存"),
 
         ]
 
@@ -601,10 +618,10 @@ struct CacheScanner {
             add("包管理器", "Yarn 自定义缓存", path, .safe, "来自 YARN_CACHE_FOLDER，Yarn 会重新下载依赖")
         }
         if let value = environment["PNPM_STORE_PATH"], let path = expandedPath(value, home: home) {
-            add("包管理器", "pnpm 自定义 store", path, .safe, "来自 PNPM_STORE_PATH，pnpm 会重新下载依赖")
+            add("包管理器", "pnpm 自定义 store", path, .review, "来自 PNPM_STORE_PATH；优先通过 pnpm store prune 清理，直接删除会影响离线开发")
         }
         if let value = environment["DENO_DIR"], let path = expandedPath(value, home: home) {
-            add("包管理器", "Deno 自定义缓存", path, .safe, "来自 DENO_DIR，Deno 会重新下载依赖和工具")
+            add("包管理器", "Deno 自定义目录", path, .review, "来自 DENO_DIR；可能混合远程依赖、运行时载荷和缓存，确认后再清理")
         }
         if let value = environment["PLAYWRIGHT_BROWSERS_PATH"], value != "0", let path = expandedPath(value, home: home) {
             add("包管理器", "Playwright 自定义浏览器缓存", path, .review, "来自 PLAYWRIGHT_BROWSERS_PATH，浏览器会重新下载")
@@ -650,7 +667,7 @@ struct CacheScanner {
             add("JVM", "Maven 自定义 wrapper", mavenHome.appendingPathComponent("wrapper/dists"), .safe, "来自 MAVEN_USER_HOME，Maven Wrapper 会重新下载")
         }
         if let value = environment["NUGET_PACKAGES"], let path = expandedPath(value, home: home) {
-            add("包管理器", "NuGet 自定义包缓存", path, .safe, "来自 NUGET_PACKAGES，NuGet 会重新下载包")
+            add("包管理器", "NuGet 自定义包目录", path, .review, "来自 NUGET_PACKAGES；清理后可能需要大量网络下载，离线环境建议保留")
         }
         if let value = environment["BUN_INSTALL_CACHE_DIR"], let path = expandedPath(value, home: home) {
             add("包管理器", "Bun 自定义缓存", path, .safe, "来自 BUN_INSTALL_CACHE_DIR，Bun 会重新下载依赖")
@@ -730,8 +747,111 @@ struct CacheScanner {
             ("com.adobe.", "Adobe", "应用会自动重建缓存")
         ]
         for child in childDirectories(at: appCache, collector: &collector, progress: progress) {
-            guard let match = vendorPrefixes.first(where: { child.lastPathComponent.hasPrefix($0.0) }) else { continue }
-            add("设计工具", "\(match.1) · \(child.lastPathComponent)", child, .safe, match.2)
+            if let match = vendorPrefixes.first(where: { child.lastPathComponent.hasPrefix($0.0) }) {
+                add("设计工具", "\(match.1) · \(child.lastPathComponent)", child, .safe, match.2)
+            } else if child.lastPathComponent.hasPrefix("com.navicat.") {
+                add("数据库工具", "Navicat · \(child.lastPathComponent)", child, .safe, "仅删除 Navicat 的 macOS Cache 数据，不触碰连接、密码或配置")
+            } else if child.lastPathComponent.hasPrefix("com.dbeaver.") {
+                add("数据库工具", "DBeaver · \(child.lastPathComponent)", child, .safe, "仅删除 DBeaver 的 macOS Cache 数据，不触碰 workspace、连接或密码")
+            }
+        }
+
+        if environment["PATH"] != nil {
+            items += ownerToolItems(
+                home: home,
+                environment: environment,
+                collector: &collector,
+                progress: progress
+            )
+        }
+
+        if !items.contains(where: { $0.toolAction == .pnpmStore }) {
+            for fallback in [
+                home.appendingPathComponent("Library/pnpm/store"),
+                home.appendingPathComponent(".local/share/pnpm/store")
+            ] {
+                add(
+                    "包管理器",
+                    "pnpm store（无 CLI fallback）",
+                    fallback,
+                    .review,
+                    "未能使用 pnpm store prune；整个依赖 store 不会默认勾选，离线环境建议保留"
+                )
+            }
+        }
+
+        return items
+    }
+
+    private static func ownerToolItems(
+        home: URL,
+        environment: [String: String],
+        collector: inout ScanCollector,
+        progress: @escaping (ScanProgress) -> Void
+    ) -> [CacheItem] {
+        var items: [CacheItem] = []
+
+        func add(
+            category: String,
+            name: String,
+            path: URL,
+            action: ToolCleanupAction,
+            note: String
+        ) {
+            guard let item = makeItem(
+                category: category,
+                name: name,
+                path: path,
+                risk: .review,
+                note: note,
+                collector: &collector,
+                progress: progress,
+                isSelected: false,
+                kind: .toolCommand,
+                toolAction: action
+            ) else { return }
+            items.append(item)
+        }
+
+        if GitHubCLISupport.executableURL(environment: environment) != nil,
+           let cache = GitHubCLISupport.cacheURL(home: home, environment: environment) {
+            add(
+                category: "CI/CD",
+                name: "GitHub CLI 缓存",
+                path: cache,
+                action: .githubCLI,
+                note: "通过 gh config clear-cache 官方命令清理，不会进入废纸篓；清理前会跳过正在运行或状态不明的 gh"
+            )
+        }
+
+        if let executable = PnpmSupport.executableURL(environment: environment),
+           let store = PnpmSupport.storeURL(
+               executable: executable,
+               home: home,
+               environment: environment
+           ) {
+            add(
+                category: "包管理器",
+                name: "pnpm store（官方 prune）",
+                path: store,
+                action: .pnpmStore,
+                note: "通过 pnpm store prune 官方命令清理，不会进入废纸篓；清理前会跳过正在运行或状态不明的 pnpm"
+            )
+        }
+
+        if let executable = UVSupport.executableURL(environment: environment),
+           let cache = UVSupport.cacheURL(
+               executable: executable,
+               home: home,
+               environment: environment
+           ) {
+            add(
+                category: "语言工具链",
+                name: "uv 缓存（官方 prune）",
+                path: cache,
+                action: .uvCache,
+                note: "通过 uv cache prune 官方命令清理，不会进入废纸篓；清理前会跳过正在运行或状态不明的 uv"
+            )
         }
 
         return items
@@ -1012,8 +1132,9 @@ struct CacheScanner {
     ) {
         add("语言工具链", "Cargo 自定义 registry index", cargoHome.appendingPathComponent("registry/index"), .safe, "来自 CARGO_HOME，Cargo 会重新获取 registry 索引")
         add("语言工具链", "Cargo 自定义 registry cache", cargoHome.appendingPathComponent("registry/cache"), .safe, "来自 CARGO_HOME，Cargo 会重新下载 crate")
-        add("语言工具链", "Cargo 自定义 registry source", cargoHome.appendingPathComponent("registry/src"), .safe, "来自 CARGO_HOME，Cargo 会重新下载 crate 源码")
-        add("语言工具链", "Cargo 自定义 git", cargoHome.appendingPathComponent("git"), .safe, "来自 CARGO_HOME，Cargo 会重新获取依赖")
+        add("语言工具链", "Cargo 自定义 registry source", cargoHome.appendingPathComponent("registry/src"), .review, "来自 CARGO_HOME；已解压依赖源码删除后会重新下载，可能影响离线构建和 IDE 索引")
+        add("语言工具链", "Cargo 自定义 git checkout", cargoHome.appendingPathComponent("git/checkouts"), .review, "来自 CARGO_HOME；Git 依赖 checkout 删除后会重新获取")
+        add("语言工具链", "Cargo 自定义 git database", cargoHome.appendingPathComponent("git/db"), .review, "来自 CARGO_HOME；Git 依赖数据库删除后会重新获取")
     }
 
     private static func xctestDeviceItems(
@@ -1166,6 +1287,24 @@ struct CacheScanner {
         collector: inout ScanCollector,
         progress: @escaping (ScanProgress) -> Void
     ) -> [CacheItem] {
+        let artifactContainerBlocklist: Set<String> = [
+            "node_modules", "target", "build", "dist", "vendor", "Pods", "bin", "obj",
+            "venv", ".venv", ".gradle", ".next", ".nuxt", ".output", ".turbo",
+            ".parcel-cache", ".dart_tool", ".svelte-kit", "DerivedData", ".build"
+        ]
+        let protectedAgentRoots: Set<String> = [".codex", ".claude"]
+        if artifactContainerBlocklist.contains(root.lastPathComponent)
+            || protectedAgentRoots.contains(root.lastPathComponent) {
+            collector.skipped(
+                root,
+                reason: protectedAgentRoots.contains(root.lastPathComponent)
+                    ? "AI Agent 状态根目录不会作为项目根扫描"
+                    : "项目根自身是已知生成物容器，已跳过其内部项目发现",
+                kind: .skipped
+            )
+            return []
+        }
+
         let skipNames: Set<String> = [
             ".git", ".hg", ".svn", ".Trash", "Library", "Applications", "Pictures", "Movies"
         ]
@@ -1253,6 +1392,10 @@ struct CacheScanner {
         return items
     }
 
+    private static let monorepoMarkers: Set<String> = [
+        "lerna.json", "pnpm-workspace.yaml", "nx.json", "rush.json", ".git"
+    ]
+
     private static let generatedRules: [String: GeneratedRule] = [
         "target": GeneratedRule(category: "Rust / Tauri 项目", risk: .review, note: "Rust/Tauri 编译产物，删除后 cargo build 会重新生成"),
         "node_modules": GeneratedRule(category: "Node.js 项目", risk: .review, note: "删除后 npm/pnpm/yarn install 会重新安装依赖"),
@@ -1316,6 +1459,11 @@ struct CacheScanner {
             guard fileManager.fileExists(atPath: parent.appendingPathComponent("composer.json").path) else { return nil }
             return GeneratedRule(category: "PHP 项目", risk: .review, note: "Composer 依赖，删除后 composer install 会重新安装")
         }
+        if name == "build" {
+            let projectDirectories = [parent, parent.deletingLastPathComponent()]
+            guard projectDirectories.contains(where: hasProjectMarker) else { return nil }
+            return GeneratedRule(category: "项目生成物", risk: .review, note: "项目构建产物，可按需重新生成；只有在项目标志明确时才会识别")
+        }
         if name == "output" {
             guard hasProjectMarker(parent) else { return nil }
             return GeneratedRule(category: "项目生成物", risk: .review, note: "项目输出目录，可按需重新生成；请确认没有需要保留的截图或发布结果")
@@ -1343,10 +1491,29 @@ struct CacheScanner {
         if url.lastPathComponent == "cache" && url.deletingLastPathComponent().lastPathComponent == ".yarn" {
             return GeneratedRule(category: "Node.js 项目", risk: .review, note: "Yarn 离线缓存，会重新下载依赖")
         }
+        if hasValidCacheDirectoryTag(url) {
+            return GeneratedRule(category: "其他开发缓存", risk: .safe, note: "目录包含有效 CACHEDIR.TAG，软件声明其内容可作为缓存重建；仍受删除安全校验和白名单控制")
+        }
         if url.lastPathComponent.hasPrefix("cmake-build-") {
             return GeneratedRule(category: "项目生成物", risk: .review, note: "CMake 构建产物，可按需重新生成")
         }
         return generatedRules[url.lastPathComponent]
+    }
+
+    static func hasValidCacheDirectoryTag(_ directory: URL) -> Bool {
+        let tag = directory.appendingPathComponent("CACHEDIR.TAG")
+        guard let values = try? tag.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+              values.isDirectory != true,
+              values.isSymbolicLink != true
+        else { return false }
+
+        let signature = Data("Signature: 8a477f597d28d172789f06886806bc55".utf8)
+        guard let handle = try? FileHandle(forReadingFrom: tag) else { return false }
+        defer { try? handle.close() }
+        guard let header = try? handle.read(upToCount: signature.count),
+              header.count >= signature.count
+        else { return false }
+        return header.prefix(signature.count) == signature
     }
 
     private static func projectReleaseDirectoryRule(for url: URL) -> GeneratedRule? {
@@ -1499,9 +1666,12 @@ struct CacheScanner {
         let markerNames: Set<String> = [
             "pom.xml", "package.json", "Cargo.toml", "Package.swift", "composer.json",
             "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
-            "go.mod", "pyproject.toml", "requirements.txt", "conf/application.properties"
+            "go.mod", "pyproject.toml", "requirements.txt", "conf/application.properties",
+            "terragrunt.hcl", "Gemfile", "pubspec.yaml", "Makefile", "build.zig", "build.zig.zon",
+            "composer.lock", "Package.resolved"
         ]
         return directoryContainsNamedFile(directory, names: markerNames)
+            || monorepoMarkers.contains { directoryContainsNamedFile(directory, names: [$0]) }
             || directoryContainsProjectFile(directory, extensions: [
                 "xcodeproj", "xcworkspace", "csproj", "fsproj", "vbproj"
             ])
@@ -1531,7 +1701,8 @@ struct CacheScanner {
         details: String? = nil,
         isSelected: Bool? = nil,
         kind: CleanupKind = .trash,
-        identifier: String? = nil
+        identifier: String? = nil,
+        toolAction: ToolCleanupAction? = nil
     ) -> CacheItem? {
         let standardized = path.standardizedFileURL
         guard fileManager.fileExists(atPath: standardized.path) else { return nil }
@@ -1566,9 +1737,24 @@ struct CacheScanner {
             risk: risk,
             kind: kind,
             identifier: identifier,
+            toolAction: toolAction,
             note: note,
-            isSelected: isSelected
+            isSelected: isSelected ?? defaultSelection(for: standardized, risk: risk, kind: kind)
         )
+    }
+
+    private static func defaultSelection(
+        for url: URL,
+        risk: RiskLevel,
+        kind: CleanupKind
+    ) -> Bool {
+        guard risk == .safe, kind == .trash else { return false }
+        guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey]),
+              let modified = values.contentModificationDate
+        else {
+            return true
+        }
+        return Date().timeIntervalSince(modified) > 7 * 24 * 60 * 60
     }
 
     private static func childDirectories(
@@ -1605,9 +1791,15 @@ struct CacheScanner {
     }
 
     private static func normalizedRoots(_ roots: [URL]) -> [URL] {
+        let protectedPaths = DeletionValidator.defaultProtectedPaths()
         let existing = roots
             .map { $0.standardizedFileURL.resolvingSymlinksInPath() }
-            .filter { fileManager.fileExists(atPath: $0.path) }
+            .filter { root in
+                fileManager.fileExists(atPath: root.path)
+                    && !protectedPaths.contains { protected in
+                        protected.standardizedFileURL.path == root.path
+                    }
+            }
             .sorted { $0.path.count < $1.path.count }
 
         var result: [URL] = []
@@ -1668,30 +1860,20 @@ struct CacheScanner {
     }
 
     fileprivate static func run(executable: String, arguments: [String]) -> ProcessOutput? {
-        let task = Process()
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-        task.executableURL = URL(fileURLWithPath: executable)
-        task.arguments = arguments
-        task.standardInput = FileHandle.nullDevice
-        task.standardOutput = outputPipe
-        task.standardError = errorPipe
-        do {
-            try task.run()
-            task.waitUntilExit()
-            return ProcessOutput(
-                status: task.terminationStatus,
-                stdout: outputPipe.fileHandleForReading.readDataToEndOfFile(),
-                stderr: errorPipe.fileHandleForReading.readDataToEndOfFile()
-            )
-        } catch {
-            return nil
-        }
+        ProcessRunner.run(
+            executable: URL(fileURLWithPath: executable),
+            arguments: arguments,
+            timeout: 30
+        )
     }
 }
 
 struct CacheCleaner {
-    static func clean(_ items: [CacheItem]) -> CleanupReport {
+    static func clean(
+        _ items: [CacheItem],
+        context: DeletionContext,
+        toolExecutor: ToolCommandExecuting = ToolCleanupExecutor()
+    ) -> CleanupReport {
         var removed: [CacheItem] = []
         var failures: [(CacheItem, String)] = []
 
@@ -1699,6 +1881,7 @@ struct CacheCleaner {
             do {
                 switch item.kind {
                 case .trash:
+                    try DeletionValidator.validate(item: item, context: context)
                     try FileManager.default.trashItem(at: item.path, resultingItemURL: nil)
                 case .simulatorDevice:
                     guard let udid = item.identifier else {
@@ -1711,6 +1894,12 @@ struct CacheCleaner {
                         throw NSError(domain: "DevSweep", code: 2, userInfo: [NSLocalizedDescriptionKey: "缺少 Docker 清理目标"])
                     }
                     try runDockerPrune(target)
+                case .toolCommand:
+                    guard let action = item.toolAction else {
+                        throw ToolCleanupError.commandFailed("缺少官方工具清理动作")
+                    }
+                    try DeletionValidator.validate(item: item, context: context)
+                    try toolExecutor.execute(action: action, cacheRoot: item.path)
                 }
                 removed.append(item)
             } catch {
@@ -1720,19 +1909,29 @@ struct CacheCleaner {
         return CleanupReport(removed: removed, failures: failures)
     }
 
+    static func clean(_ items: [CacheItem]) -> CleanupReport {
+        let context = DeletionContext(
+            whitelistedPaths: [],
+            projectRoots: [],
+            allowedPaths: items.map(\.path)
+        )
+        return clean(items, context: context)
+    }
+
     private static func runSimctlDelete(udid: String) throws {
-        let task = Process()
-        let errorPipe = Pipe()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
-        task.arguments = ["simctl", "delete", udid]
-        task.standardInput = FileHandle.nullDevice
-        task.standardError = errorPipe
-        try task.run()
-        task.waitUntilExit()
-        guard task.terminationStatus == 0 else {
-            let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
-            let message = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-            throw NSError(domain: "DevSweep", code: Int(task.terminationStatus), userInfo: [
+        guard let result = ProcessRunner.run(
+            executable: URL(fileURLWithPath: "/usr/bin/xcrun"),
+            arguments: ["simctl", "delete", udid],
+            timeout: 30
+        ) else {
+            throw NSError(domain: "DevSweep", code: 3, userInfo: [NSLocalizedDescriptionKey: "xcrun 不可用"])
+        }
+        if result.timedOut {
+            throw NSError(domain: "DevSweep", code: 4, userInfo: [NSLocalizedDescriptionKey: "simctl 删除命令超时"])
+        }
+        guard result.status == 0 else {
+            let message = String(data: result.stderr, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            throw NSError(domain: "DevSweep", code: Int(result.status), userInfo: [
                 NSLocalizedDescriptionKey: message?.isEmpty == false ? message! : "simctl 删除失败"
             ])
         }
@@ -1741,6 +1940,9 @@ struct CacheCleaner {
     private static func runDockerPrune(_ target: DockerCleanupTarget) throws {
         guard let output = DockerSupport.run(arguments: target.arguments) else {
             throw NSError(domain: "DevSweep", code: 3, userInfo: [NSLocalizedDescriptionKey: "Docker CLI 不可用"])
+        }
+        if output.timedOut {
+            throw NSError(domain: "DevSweep", code: 4, userInfo: [NSLocalizedDescriptionKey: "Docker 清理命令超时"])
         }
         guard output.status == 0 else {
             let message = String(data: output.stderr, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1794,8 +1996,9 @@ final class DevSweepStore: ObservableObject {
             "Xcode", "CoreSimulator", "XCTest", "Rust / Tauri 项目", "项目生成物", "Node.js 项目",
             "Apple 项目", "Swift 项目", "Flutter 项目", "Python 项目", "PHP 项目", ".NET 项目",
             "Android 项目", "测试产物", "测试工具", "包管理器", "语言工具链", "Ruby", "前端工具链",
-            "云与基础设施", "AI/ML", "AI Agent", "Docker", "JVM", "IDE", "Android Studio", "设计工具",
-            "浏览器缓存", "应用缓存", "项目日志", "其他开发缓存"
+            "CI/CD", "云与基础设施", "Docker", "AI/ML", "AI Agent", "JVM", "IDE", "数据库工具",
+            "API / 调试工具", "开发工具", "Android Studio", "设计工具", "浏览器缓存", "应用缓存",
+            "项目日志", "其他开发缓存"
         ]
         let present = Set(items.map(\.category))
         return order.filter(present.contains) + present.subtracting(order).sorted()
@@ -1859,7 +2062,8 @@ final class DevSweepStore: ObservableObject {
     func setAllSelected(_ selected: Bool, category: String? = nil) {
         var didChange = false
         for index in items.indices where category == nil || items[index].category == category {
-            if items[index].risk != .manual && (selected == false || items[index].kind != .dockerPrune) {
+            if items[index].risk != .manual
+                && (selected == false || (items[index].kind != .dockerPrune && items[index].kind != .toolCommand)) {
                 if items[index].isSelected != selected {
                     items[index].isSelected = selected
                     selectionStates[SelectionMemory.key(for: items[index].path)] = selected
@@ -1925,9 +2129,20 @@ final class DevSweepStore: ObservableObject {
         isCleaning = true
         lastError = nil
         let includesDocker = selected.contains { $0.kind == .dockerPrune }
-        statusMessage = includesDocker ? "正在执行选中项目的清理…" : "正在把选中项目移入废纸篓…"
+        let includesNonRecoverable = selected.contains { $0.kind.isNonRecoverable }
+        let deletionContext = DeletionContext(
+            whitelistedPaths: whitelistedPaths,
+            projectRoots: projectRoots,
+            allowedPaths: items.map(\.path)
+        )
+        statusMessage = includesNonRecoverable ? "正在执行选中项目的清理…" : "正在把选中项目移入废纸篓…"
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let report = CacheCleaner.clean(selected)
+            let toolExecutor = ToolCleanupExecutor()
+            let report = CacheCleaner.clean(
+                selected,
+                context: deletionContext,
+                toolExecutor: toolExecutor
+            )
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isCleaning = false
@@ -1938,14 +2153,14 @@ final class DevSweepStore: ObservableObject {
                 }
                 if !report.removed.isEmpty { self.persistSelectionStates() }
                 if report.failures.isEmpty {
-                    self.statusMessage = includesDocker
-                        ? "已处理 \(report.removed.count) 项，普通目录可从废纸篓恢复，Docker 资源不可恢复"
+                    self.statusMessage = includesNonRecoverable
+                        ? "已处理 \(report.removed.count) 项，部分工具资源不可从废纸篓恢复"
                         : "已处理 \(report.removed.count) 项，文件可从废纸篓恢复"
                 } else {
                     let details = report.failures.map { "\($0.0.name)：\($0.1)" }.joined(separator: "\n")
                     self.lastError = "部分项目未能清理：\n\(details)"
                     self.statusMessage = includesDocker
-                        ? "已处理 \(report.removed.count) 项，\(report.failures.count) 项失败；Docker 资源请查看错误详情"
+                        ? "已处理 \(report.removed.count) 项，\(report.failures.count) 项失败；Docker 或工具资源请查看错误详情"
                         : "已处理 \(report.removed.count) 项，\(report.failures.count) 项失败"
                 }
             }
@@ -1971,16 +2186,27 @@ final class DevSweepStore: ObservableObject {
 
     private static func defaultProjectRoots(home: URL) -> [URL] {
         let candidates = [
-            "Code", "Projects", "Developer", "Work", "src", "workspace", "Repos", "Repositories", "dev", "software"
+            "Code", "Projects", "Developer", "Development", "Work", "src", "workspace", "Repos",
+            "Repositories", "dev", "software", "www", "GitHub"
         ]
             .map { home.appendingPathComponent($0) }
+            + [
+                home.appendingPathComponent(".codex/worktrees"),
+                home.appendingPathComponent(".claude/worktrees")
+            ]
         return normalizeProjectRoots(candidates)
     }
 
     private static func normalizeProjectRoots(_ roots: [URL]) -> [URL] {
+        let protectedPaths = DeletionValidator.defaultProtectedPaths()
         let existing = roots
             .map { $0.standardizedFileURL.resolvingSymlinksInPath() }
-            .filter { FileManager.default.fileExists(atPath: $0.path) }
+            .filter { root in
+                FileManager.default.fileExists(atPath: root.path)
+                    && !protectedPaths.contains { protected in
+                        protected.standardizedFileURL.path == root.path
+                    }
+            }
             .sorted { $0.path.count < $1.path.count }
         var result: [URL] = []
         for root in existing {

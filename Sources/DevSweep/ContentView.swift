@@ -64,12 +64,12 @@ struct ContentView: View {
         cleanupItems.reduce(0) { $0 + $1.size }
     }
 
-    private var cleanupIncludesDocker: Bool {
-        cleanupItems.contains { $0.kind == .dockerPrune }
+    private var cleanupIncludesNonRecoverable: Bool {
+        cleanupItems.contains { $0.kind.isNonRecoverable }
     }
 
-    private var pendingCleanupIncludesDocker: Bool {
-        pendingCleanupItems.contains { $0.kind == .dockerPrune }
+    private var pendingCleanupIncludesNonRecoverable: Bool {
+        pendingCleanupItems.contains { $0.kind.isNonRecoverable }
     }
 
     private var hasScanReport: Bool {
@@ -102,7 +102,7 @@ struct ContentView: View {
             isPresented: $showingConfirmation,
             titleVisibility: .visible
         ) {
-            Button(pendingCleanupIncludesDocker ? "执行清理" : "移入废纸篓", role: .destructive) {
+            Button(pendingCleanupIncludesNonRecoverable ? "执行清理" : "移入废纸篓", role: .destructive) {
                 let ids = Set(pendingCleanupItems.map(\.id))
                 pendingCleanupItems = []
                 store.cleanSelected(ids: ids)
@@ -112,8 +112,8 @@ struct ContentView: View {
             }
         } message: {
             Text(
-                pendingCleanupIncludesDocker
-                    ? "将处理 \(pendingCleanupItems.count) 项，共 \(pendingCleanupItems.reduce(0) { $0 + $1.size }.devSweepFileSize)。Docker 资源会通过官方 CLI 直接清理，不能从废纸篓恢复；普通目录会移入废纸篓。"
+                pendingCleanupIncludesNonRecoverable
+                    ? "将处理 \(pendingCleanupItems.count) 项，共 \(pendingCleanupItems.reduce(0) { $0 + $1.size }.devSweepFileSize)。部分项目会通过开发工具自己的清理命令执行，不会进入废纸篓；普通目录会移入废纸篓。"
                     : "将处理 \(pendingCleanupItems.count) 项，共 \(pendingCleanupItems.reduce(0) { $0 + $1.size }.devSweepFileSize)。运行中的模拟器、未登记目录和手动项目不会自动删除。"
             )
         }
@@ -648,7 +648,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(cleanupItems.isEmpty ? "选择项目后开始清理" : "准备清理 \(cleanupItems.count) 项")
                     .font(.subheadline.weight(.medium))
-                Text(cleanupIncludesDocker ? "包含 Docker 资源，执行后不可从废纸篓恢复" : "清理会优先移入废纸篓，不直接永久删除")
+                Text(cleanupIncludesNonRecoverable ? "包含官方工具或设备清理，执行后不可从废纸篓恢复" : "清理会优先移入废纸篓，不直接永久删除")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -710,8 +710,8 @@ private struct MiniModeView: View {
         cleanupItems.reduce(0) { $0 + $1.size }
     }
 
-    private var cleanupIncludesDocker: Bool {
-        cleanupItems.contains { $0.kind == .dockerPrune }
+    private var cleanupIncludesNonRecoverable: Bool {
+        cleanupItems.contains { $0.kind.isNonRecoverable }
     }
 
     var body: some View {
@@ -988,8 +988,8 @@ private struct MiniModeView: View {
             Text(
                 cleanupItems.isEmpty
                     ? "扫描后选择项目即可清理"
-                    : cleanupIncludesDocker
-                        ? "Docker 资源清理后不可恢复"
+                    : cleanupIncludesNonRecoverable
+                        ? "官方工具或设备资源清理后不可恢复"
                         : "普通目录会优先移入废纸篓"
             )
             .font(.caption2)
@@ -1121,7 +1121,7 @@ private struct CacheItemRow: View {
             VStack(alignment: .trailing, spacing: 4) {
                 Text(item.size.devSweepFileSize)
                     .font(.subheadline.monospacedDigit().weight(.medium))
-                Text(item.kind == .simulatorDevice ? "模拟器设备" : item.kind == .dockerPrune ? "Docker 资源" : "缓存目录")
+                Text(itemKindTitle)
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
@@ -1178,11 +1178,21 @@ private struct CacheItemRow: View {
         switch item.kind {
         case .simulatorDevice: return "iphone.gen3"
         case .dockerPrune: return "shippingbox"
+        case .toolCommand: return "wrench.and.screwdriver"
         case .trash:
             if item.category.contains("Xcode") || item.category == "XCTest" { return "hammer" }
             if item.category.contains("项目") { return "folder.badge.gearshape" }
             if item.category == "AI Agent" { return "sparkles" }
             return "archivebox"
+        }
+    }
+
+    private var itemKindTitle: String {
+        switch item.kind {
+        case .simulatorDevice: return "模拟器设备"
+        case .dockerPrune: return "Docker 资源"
+        case .toolCommand: return "官方清理命令"
+        case .trash: return "缓存目录"
         }
     }
 }
