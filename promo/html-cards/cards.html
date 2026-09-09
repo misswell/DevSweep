@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=1080, initial-scale=1" />
+    <meta name="theme-color" content="#0a0d0d" />
+    <title>DevSweep 功能说明卡</title>
+    <link rel="stylesheet" href="cards.css" />
+    <script defer src="cards.js"></script>
+  </head>
+  <body>
+    <main class="card-stage" id="card-stage">
+      <article class="poster poster-scan" data-card="scan" aria-label="DevSweep 扫描功能说明卡">
+        <div class="poster-grid" aria-hidden="true"></div>
+        <div class="poster-orbit poster-orbit-one" aria-hidden="true"></div>
+        <div class="poster-orbit poster-orbit-two" aria-hidden="true"></div>
+        <div class="poster-orbit poster-orbit-three" aria-hidden="true"></div>
+        <div class="poster-sweep" aria-hidden="true"></div>
+        <div class="poster-topline">
+          <span class="brand-lockup"><span class="brand-mark">DS</span><strong>DevSweep</strong></span>
+          <span class="card-label">PRODUCT NOTE / 01</span>
+          <span class="card-version">macOS · v0.1.32</span>
+        </div>
+        <div class="scan-heading">
+          <p class="micro-label"><i></i> DEVELOPER CACHE HYGIENE</p>
+          <h1>先扫描，<br /><em>再决定。</em></h1>
+          <p class="lead">把开发缓存从黑盒，<br />变成一张看得懂的地图。</p>
+        </div>
+        <div class="scan-callout scan-callout-top"><span>01</span><b>先看范围</b><small>只扫描明确的开发工具目录</small></div>
+        <section class="scan-console" aria-label="示例扫描结果">
+          <div class="console-topbar">
+            <div class="traffic-lights" aria-hidden="true"><i></i><i></i><i></i></div>
+            <span>DevSweep <b>/ Overview</b></span>
+            <span class="console-menu">···</span>
+          </div>
+          <div class="console-content">
+            <div class="console-summary">
+              <p class="console-label">示例扫描 / RECLAIMABLE SPACE</p>
+              <div class="console-total">142.8 <small>GB</small></div>
+              <p class="console-status"><i></i> 已完成扫描 · 等待审阅</p>
+              <div class="radar-visual" aria-hidden="true">
+                <div class="radar-line radar-line-x"></div><div class="radar-line radar-line-y"></div>
+                <div class="radar-circle radar-circle-1"></div><div class="radar-circle radar-circle-2"></div><div class="radar-circle radar-circle-3"></div>
+                <span class="radar-point point-a"></span><span class="radar-point point-b"></span><span class="radar-point point-c"></span>
+                <span class="radar-center"></span>
+              </div>
+              <div class="review-pill"><span>✓</span> Review first / 先审阅</div>
+            </div>
+            <div class="console-breakdown">
+              <div class="breakdown-title"><span>占用分布</span><span>SIZE</span></div>
+              <div class="breakdown-item"><div><i class="dot dot-blue"></i><span>Xcode</span></div><strong>68.4 GB</strong><b><i style="width: 92%"></i></b></div>
+              <div class="breakdown-item"><div><i class="dot dot-orange"></i><span>Docker</span></div><strong>31.2 GB</strong><b><i style="width: 64%"></i></b></div>
+              <div class="breakdown-item"><div><i class="dot dot-lime"></i><span>Toolchains</span></div><strong>24.7 GB</strong><b><i style="width: 48%"></i></b></div>
+              <div class="breakdown-item"><div><i class="dot dot-mint"></i><span>Projects</span></div><strong>18.5 GB</strong><b><i style="width: 34%"></i></b></div>
+              <div class="breakdown-foot"><span>32 个清理目标</span><span>↗</span></div>
+            </div>
+          </div>
+        </section>
+        <div class="scan-callout scan-callout-bottom"><span class="check-box">✓</span><b>不会触碰源码</b><small>源代码、照片和文档不在扫描范围</small></div>
+        <div class="poster-footer"><span>SCAN / MAP / UNDERSTAND</span><span>MAKE ROOM FOR THE NEXT BUILD.</span></div>
+      </article>
+
+      <article class="poster poster-coverage" data-card="coverage" aria-label="DevSweep 工具链覆盖功能说明卡">
+        <div class="coverage-blue-field" aria-hidden="true"></div>
+        <div class="registration registration-a" aria-hidden="true"></div><div class="registration registration-b" aria-hidden="true"></div>
+        <div class="poster-topline">
+          <span class="brand-lockup"><span class="brand-mark brand-mark-dark">DS</span><strong>DevSweep</strong></span>
+          <span class="card-label">PRODUCT NOTE / 02</span>
+          <span class="card-version card-version-dark">TOOLCHAIN COVERAGE</span>
+        </div>
+        <div class="coverage-heading">
+          <p class="micro-label"><i></i> ONE SWEEP / EVERY BUILD TOOL</p>
+          <h1>全栈工具链，<br /><em>一次看清。</em></h1>
+          <p class="lead">从 Xcode 到 Docker，<br />从 Node 到 AI/ML，缓存都应该有名字。</p>
+        </div>
+        <div class="coverage-rail" aria-hidden="true">
+          <span>01</span><span>02</span><span>03</span><span>04</span><span>05</span><span>06</span><span>07</span>
+        </div>
+        <section class="tool-map" aria-label="工具链覆盖范围">
+          <div class="tool-map-header"><span>覆盖范围 / COVERAGE MAP</span><span>07 SYSTEMS</span></div>
+          <div class="tool-map-grid">
+            <div class="tool-tile tool-tile-blue"><span class="tile-index">01</span><strong>Xcode</strong><small>DerivedData / Simulators</small><i>⌘</i></div>
+            <div class="tool-tile tool-tile-lime"><span class="tile-index">02</span><strong>Docker</strong><small>Images / Volumes / Build Cache</small><i>▣</i></div>
+            <div class="tool-tile tool-tile-paper"><span class="tile-index">03</span><strong>Node</strong><small>npm / npx / node_modules</small><i>◆</i></div>
+            <div class="tool-tile tool-tile-mint"><span class="tile-index">04</span><strong>Rust</strong><small>Cargo / rustup / target</small><i>◒</i></div>
+            <div class="tool-tile tool-tile-orange"><span class="tile-index">05</span><strong>Python</strong><small>pip / uv / Poetry / .venv</small><i>⌘</i></div>
+            <div class="tool-tile tool-tile-dark"><span class="tile-index">06</span><strong>AI / ML</strong><small>Ollama / Hugging Face / Models</small><i>✦</i></div>
+            <div class="tool-tile tool-tile-wide"><span class="tile-index">07</span><strong>IDE + 浏览器</strong><small>VS Code · Cursor · JetBrains · Playwright · Firefox · Edge</small><i>▦</i></div>
+          </div>
+        </section>
+        <div class="coverage-note"><span class="note-arrow">↘</span><div><b>默认路径 + 自定义环境</b><small>不只找“常见目录”，也跟着你的工作方式走。</small></div></div>
+        <div class="poster-footer poster-footer-dark"><span>DISCOVER / SORT / RECLAIM</span><span>BUILD MORE. STORE LESS.</span></div>
+      </article>
+
+      <article class="poster poster-safety" data-card="safety" aria-label="DevSweep 安全清理功能说明卡">
+        <div class="safety-grid" aria-hidden="true"></div>
+        <div class="safety-blue-field" aria-hidden="true"></div>
+        <div class="safety-cross safety-cross-a" aria-hidden="true"></div><div class="safety-cross safety-cross-b" aria-hidden="true"></div>
+        <div class="poster-topline">
+          <span class="brand-lockup"><span class="brand-mark">DS</span><strong>DevSweep</strong></span>
+          <span class="card-label">PRODUCT NOTE / 03</span>
+          <span class="card-version">SAFETY FIRST</span>
+        </div>
+        <div class="safety-heading">
+          <p class="micro-label"><i></i> REVIEW-FIRST CLEANUP</p>
+          <h1>清理，也要<br /><em>有边界。</em></h1>
+          <p class="lead">没有神秘的“一键清空”。<br />每一次回收，都先给你看证据。</p>
+        </div>
+        <section class="workflow" aria-label="安全清理流程">
+          <div class="workflow-line" aria-hidden="true"></div>
+          <div class="workflow-node workflow-node-blue"><span>01</span><i>⌁</i><strong>扫描</strong><small>SCAN</small></div>
+          <div class="workflow-node workflow-node-lime"><span>02</span><i>✓</i><strong>审阅</strong><small>REVIEW</small></div>
+          <div class="workflow-node workflow-node-mint"><span>03</span><i>↗</i><strong>回收</strong><small>RECLAIM</small></div>
+        </section>
+        <section class="evidence-card" aria-label="清理证据示例">
+          <div class="evidence-top"><span>清理前二次确认 / REVIEW</span><span>3 ITEMS</span></div>
+          <div class="evidence-row"><i class="file-icon file-icon-check">✓</i><div><b>DerivedData</b><small>可重建缓存 · 可移入废纸篓</small></div><strong>12.8 GB</strong></div>
+          <div class="evidence-row"><i class="file-icon file-icon-warn">!</i><div><b>Docker Build Cache</b><small>官方 CLI 清理 · 不可移入废纸篓</small></div><strong>8.4 GB</strong></div>
+          <div class="evidence-row"><i class="file-icon file-icon-lock">×</i><div><b>你的源码</b><small>不在扫描范围 · 永远不处理</small></div><strong>SAFE</strong></div>
+        </section>
+        <div class="boundary-chips"><span>源代码 / EXCLUDED</span><span>照片文档 / EXCLUDED</span><span>Trash / RECOVERABLE</span></div>
+        <div class="poster-footer"><span>INSPECT / DECIDE / CLEAN</span><span>NO SOURCE CODE TOUCHED.</span></div>
+      </article>
+    </main>
+  </body>
+</html>
