@@ -4,14 +4,16 @@ import SwiftUI
 /// A single compatibility point for the macOS 26 glass redesign.
 ///
 /// `glassEffect` is only available on macOS 26, while DevSweep still supports
-/// macOS 13. Keeping the availability check here prevents the new appearance
-/// from leaking into every view and gives older systems the existing material
-/// treatment.
+/// macOS 13 and older toolchains. The API also only exists in the macOS 26 SDK,
+/// so building with an older Xcode fails even inside `#available`; the
+/// compile-time check keeps the project buildable there and both paths share
+/// the same material fallback.
 private struct DevSweepSurfaceModifier: ViewModifier {
     let cornerRadius: CGFloat
 
     @ViewBuilder
     func body(content: Content) -> some View {
+        #if compiler(>=6.2)
         if #available(macOS 26, *) {
             content
                 .glassEffect(
@@ -19,20 +21,51 @@ private struct DevSweepSurfaceModifier: ViewModifier {
                     in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                 )
         } else {
-            content
-                .background(.regularMaterial)
-                .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .stroke(Color.primary.opacity(0.08))
-                }
+            materialSurface(content)
         }
+        #else
+        materialSurface(content)
+        #endif
+    }
+
+    @ViewBuilder
+    private func materialSurface(_ content: Content) -> some View {
+        content
+            .background(.regularMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .stroke(Color.primary.opacity(0.08))
+            }
     }
 }
 
 private extension View {
     func devSweepSurface(cornerRadius: CGFloat = 12) -> some View {
         modifier(DevSweepSurfaceModifier(cornerRadius: cornerRadius))
+    }
+}
+
+/// The translucent layer applied above a material background on macOS 26.
+/// Older SDKs and older systems simply get the material background unchanged.
+private struct DevSweepGlassLayerModifier: ViewModifier {
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        #if compiler(>=6.2)
+        if #available(macOS 26, *) {
+            content.glassEffect(.regular)
+        } else {
+            content
+        }
+        #else
+        content
+        #endif
+    }
+}
+
+private extension View {
+    func devSweepGlassLayer() -> some View {
+        modifier(DevSweepGlassLayerModifier())
     }
 }
 
@@ -303,9 +336,7 @@ struct ContentView: View {
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .background {
-            if #available(macOS 26, *) {
-                Color.clear.glassEffect(.regular)
-            }
+            Color.clear.devSweepGlassLayer()
         }
     }
 
@@ -701,9 +732,7 @@ struct ContentView: View {
         .padding(.vertical, 12)
         .background(.regularMaterial)
         .background {
-            if #available(macOS 26, *) {
-                Color.clear.glassEffect(.regular)
-            }
+            Color.clear.devSweepGlassLayer()
         }
     }
 

@@ -19,7 +19,10 @@ env:
 jobs:
   release:
     name: Build, notarize, and publish
-    runs-on: macos-15
+    # 必须使用带 macOS 26 SDK 的 Xcode：ContentView 的 macOS 26 glass 表面在
+    # 旧 SDK 上无法编译。macos-26 镜像默认 Xcode 26，并且脚本会自行交叉编译
+    # arm64 + x86_64，不需要 Intel 主机。
+    runs-on: macos-26
 
     steps:
       - name: Check out release source
