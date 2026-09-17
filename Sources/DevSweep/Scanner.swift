@@ -149,6 +149,15 @@ struct CacheScanner {
         items += dockerItems(home: home, collector: &collector, progress: progress)
 
         progress(ScanProgress(
+            phase: "检查 AI Agent 请求日志",
+            checkedPaths: collector.checkedPaths,
+            matchedPaths: items.count,
+            skippedPaths: collector.skippedPaths,
+            permissionFailures: collector.permissionFailures
+        ))
+        items += requestLogItems(home: home, collector: &collector, progress: progress)
+
+        progress(ScanProgress(
             phase: "检查模拟器和 XCTest 设备",
             checkedPaths: collector.checkedPaths,
             matchedPaths: items.count,
@@ -1046,6 +1055,80 @@ struct CacheScanner {
         }
     }
 
+    /// Claude Code Router 的请求日志不是「整目录丢进废纸篓」，而是按保留窗口原地裁剪：
+    /// 数据库项显示可回收的空闲页 / WAL / 随过期行删除的正文，正文项显示已无日志引用的过期文件。
+    private static func requestLogItems(
+        home: URL,
+        collector: inout ScanCollector,
+        progress: @escaping (ScanProgress) -> Void
+    ) -> [CacheItem] {
+        let store = RequestLogStore.standard(home: home)
+        guard fileManager.fileExists(atPath: store.databaseURL.path) else { return [] }
+        collector.checked(store.dataDirectory)
+
+        let inventory = RequestLogScanner().inventory(store: store)
+        guard inventory.isReadable else {
+            collector.skipped(
+                store.databaseURL,
+                reason: "无法读取请求日志数据库，已跳过 AI Agent 请求日志统计",
+                kind: .unavailable
+            )
+            return []
+        }
+
+        progress(ScanProgress(
+            phase: "统计请求日志可回收空间",
+            currentPath: store.dataDirectory.devSweepDisplayPath,
+            checkedPaths: collector.checkedPaths,
+            matchedPaths: 0,
+            skippedPaths: collector.skippedPaths,
+            permissionFailures: collector.permissionFailures
+        ))
+
+        let retention = RequestLogPolicy.defaultRetentionHours
+        var items: [CacheItem] = []
+
+        if inventory.databaseReclaimableBytes >= minimumItemSize {
+            let details = [
+                "\(inventory.expiredRowCount) 行 \(retention) 小时前的日志",
+                "空闲页 \(inventory.freePageBytes.devSweepFileSize)",
+                "WAL \(inventory.writeAheadLogBytes.devSweepFileSize)",
+                "随行删除的正文 \(inventory.expiredBodyBytes.devSweepFileSize)"
+            ].joined(separator: " · ")
+            items.append(CacheItem(
+                category: "AI Agent",
+                name: RequestLogTarget.database.displayName,
+                path: store.databaseURL,
+                size: inventory.databaseReclaimableBytes,
+                details: details,
+                risk: .review,
+                kind: .requestLogTrim,
+                identifier: RequestLogTarget.database.rawValue,
+                note: "删除 \(retention) 小时前的请求日志行、其正文文件，并执行 VACUUM 回收 SQLite 空闲页；"
+                    + "清理后这些记录不再出现在请求日志和用量分析里，也不能从废纸篓恢复，最近的日志会保留"
+            ))
+        }
+
+        if inventory.bodiesReclaimableBytes >= minimumItemSize {
+            let details = "\(inventory.orphanBodyNames.count) 个已无日志引用的 \(retention) 小时前文件 · "
+                + store.bodyDirectoryURL.devSweepDisplayPath
+            items.append(CacheItem(
+                category: "AI Agent",
+                name: RequestLogTarget.bodies.displayName,
+                path: store.bodyDirectoryURL,
+                size: inventory.bodiesReclaimableBytes,
+                details: details,
+                risk: .review,
+                kind: .requestLogTrim,
+                identifier: RequestLogTarget.bodies.rawValue,
+                note: "只删除 \(retention) 小时前、且已没有任何日志行引用的请求/响应正文文件；"
+                    + "最近的正文和仍被引用的正文都会保留，删除后不能从废纸篓恢复"
+            ))
+        }
+
+        return items
+    }
+
     private static func dockerItems(
         home: URL,
         collector: inout ScanCollector,
@@ -1872,7 +1955,8 @@ struct CacheCleaner {
     static func clean(
         _ items: [CacheItem],
         context: DeletionContext,
-        toolExecutor: ToolCommandExecuting = ToolCleanupExecutor()
+        toolExecutor: ToolCommandExecuting = ToolCleanupExecutor(),
+        requestLogCleaner: RequestLogCleaner = RequestLogCleaner()
     ) -> CleanupReport {
         var removed: [CacheItem] = []
         var failures: [(CacheItem, String)] = []
@@ -1900,6 +1984,19 @@ struct CacheCleaner {
                     }
                     try DeletionValidator.validate(item: item, context: context)
                     try toolExecutor.execute(action: action, cacheRoot: item.path)
+                case .requestLogTrim:
+                    guard let rawTarget = item.identifier,
+                          let target = RequestLogTarget(rawValue: rawTarget) else {
+                        throw RequestLogCleanError.missingTarget
+                    }
+                    guard !PathWhitelist.contains(item.path, in: context.whitelistedPaths) else {
+                        throw DeletionValidationError.whitelisted
+                    }
+                    // 清理范围只由 context.home 推导，item.path 不参与定位，避免把删除重定向到别处。
+                    _ = try requestLogCleaner.trim(
+                        target: target,
+                        store: RequestLogStore.standard(home: context.home)
+                    )
                 }
                 removed.append(item)
             } catch {
@@ -2062,14 +2159,13 @@ final class DevSweepStore: ObservableObject {
     func setAllSelected(_ selected: Bool, category: String? = nil) {
         var didChange = false
         for index in items.indices where category == nil || items[index].category == category {
-            if items[index].risk != .manual
-                && (selected == false || (items[index].kind != .dockerPrune && items[index].kind != .toolCommand)) {
-                if items[index].isSelected != selected {
-                    items[index].isSelected = selected
-                    selectionStates[SelectionMemory.key(for: items[index].path)] = selected
-                    didChange = true
-                }
-            }
+            let item = items[index]
+            // 取消勾选对所有非手动项都生效；勾选只覆盖可批量处理的项目。
+            let isAllowed = selected ? CleanupSelection.isBatchSelectable(item) : item.risk != .manual
+            guard isAllowed, item.isSelected != selected else { continue }
+            items[index].isSelected = selected
+            selectionStates[SelectionMemory.key(for: item.path)] = selected
+            didChange = true
         }
         if didChange { persistSelectionStates() }
     }

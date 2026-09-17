@@ -1219,6 +1219,7 @@ private struct CacheItemRow: View {
         case .simulatorDevice: return "iphone.gen3"
         case .dockerPrune: return "shippingbox"
         case .toolCommand: return "wrench.and.screwdriver"
+        case .requestLogTrim: return "cylinder.split.1x2"
         case .trash:
             if item.category.contains("Xcode") || item.category == "XCTest" { return "hammer" }
             if item.category.contains("项目") { return "folder.badge.gearshape" }
@@ -1232,6 +1233,7 @@ private struct CacheItemRow: View {
         case .simulatorDevice: return "模拟器设备"
         case .dockerPrune: return "Docker 资源"
         case .toolCommand: return "官方清理命令"
+        case .requestLogTrim: return "就地裁剪日志"
         case .trash: return "缓存目录"
         }
     }

@@ -6,12 +6,13 @@ enum CleanupKind: String, Hashable {
     case simulatorDevice
     case dockerPrune
     case toolCommand
+    case requestLogTrim
 
     var isNonRecoverable: Bool {
         switch self {
         case .trash:
             return false
-        case .simulatorDevice, .dockerPrune, .toolCommand:
+        case .simulatorDevice, .dockerPrune, .toolCommand, .requestLogTrim:
             return true
         }
     }
@@ -202,6 +203,18 @@ struct CleanupSelection {
     static func remainingItems(from items: [CacheItem], removing removedItems: [CacheItem]) -> [CacheItem] {
         let removedIDs = Set(removedItems.map(\.id))
         return items.filter { !removedIDs.contains($0.id) }
+    }
+
+    /// 「全选」只覆盖可以批量处理的缓存；Docker 资源、官方清理命令和就地裁剪日志
+    /// 都会直接改变开发环境状态，必须由用户逐项确认。
+    static func isBatchSelectable(_ item: CacheItem) -> Bool {
+        guard item.risk != .manual else { return false }
+        switch item.kind {
+        case .trash, .simulatorDevice:
+            return true
+        case .dockerPrune, .toolCommand, .requestLogTrim:
+            return false
+        }
     }
 }
 
