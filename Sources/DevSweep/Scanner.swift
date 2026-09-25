@@ -97,6 +97,7 @@ struct CacheScanner {
         deepScan: Bool,
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         includeSystemCaches: Bool = true,
+        xctestActivityInspector: XCTestActivityInspecting = XCTestActivityInspector(),
         progress: @escaping (ScanProgress) -> Void,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> ScanReport {
@@ -163,7 +164,12 @@ struct CacheScanner {
             skippedPaths: collector.skippedPaths,
             permissionFailures: collector.permissionFailures
         ))
-        items += xctestDeviceItems(home: home, collector: &collector, progress: progress)
+        items += xctestDeviceItems(
+            home: home,
+            xctestActivityInspector: xctestActivityInspector,
+            collector: &collector,
+            progress: progress
+        )
         items += simulatorItems(home: home, collector: &collector, progress: progress)
 
         for root in roots {
@@ -1222,6 +1228,7 @@ struct CacheScanner {
 
     private static func xctestDeviceItems(
         home: URL,
+        xctestActivityInspector: XCTestActivityInspecting,
         collector: inout ScanCollector,
         progress: @escaping (ScanProgress) -> Void
     ) -> [CacheItem] {
@@ -1229,33 +1236,68 @@ struct CacheScanner {
         guard fileManager.fileExists(atPath: root.path) else { return [] }
 
         let children = childDirectories(at: root, collector: &collector, progress: progress)
-            .filter { UUID(uuidString: $0.lastPathComponent) != nil }
+        let clones = children.filter { UUID(uuidString: $0.lastPathComponent) != nil }
 
-        if children.isEmpty {
-            if let item = makeItem(
+        // 只自动清理明确以 UUID 命名的 clone 子目录。XCTestDevices 根目录本身
+        // 可能包含未来 Xcode 版本的新数据结构或未识别内容，永远不能因为没有
+        // 测试进程就当作普通缓存自动清理。
+        if clones.isEmpty {
+            let note = children.isEmpty
+                ? "测试克隆设备根目录；请先停止 XCTest/UI 测试后确认清理"
+                : "XCTestDevices 目录包含无法识别为克隆设备的内容，不能整目录自动清理；请确认后手动处理"
+            guard let item = makeItem(
                 category: "XCTest",
                 name: "XCTestDevices（全部）",
                 path: root,
                 risk: .review,
-                note: "测试克隆设备；请先停止 XCTest/UI 测试后清理",
+                note: note,
                 collector: &collector,
-                progress: progress
-            ) {
-                return [item]
-            }
-            return []
+                progress: progress,
+                isSelected: false
+            ) else { return [] }
+            return [item]
         }
 
+        // 进程状态只检测一次，所有 clone 共用同一个结果，保证状态一致
+        // 且不会为每个目录重复运行 ps。
+        let activityState = xctestActivityInspector.currentState()
+
         var items: [CacheItem] = []
-        for child in children {
+        for child in clones {
+            // 完整 UUID 放进 details，标题只显示短 ID，避免 36 位字符挤占列表。
+            let cloneID = child.lastPathComponent
+            let displayID = String(cloneID.prefix(8))
+            let risk: RiskLevel
+            let note: String
+            let statusTitle: String
+            let isSelected: Bool
+            switch activityState {
+            case .idle:
+                risk = .safe
+                note = "Xcode 测试产生的临时克隆设备。当前未检测到测试运行，删除后需要时会自动重新创建。"
+                statusTitle = "可安全清理"
+                isSelected = true
+            case .running:
+                risk = .manual
+                note = "检测到 XCTest/UI 测试正在运行。请停止测试后重新扫描，运行中的测试设备不会被清理。"
+                statusTitle = "正在测试"
+                isSelected = false
+            case .unknown:
+                risk = .manual
+                note = "无法确认 XCTest 是否正在运行，为避免破坏当前测试，本次禁止自动清理。"
+                statusTitle = "无法确认状态"
+                isSelected = false
+            }
             if let item = makeItem(
                 category: "XCTest",
-                name: "XCTest 克隆设备 · (child.lastPathComponent)",
+                name: "XCTest 克隆设备 · \(displayID)",
                 path: child,
-                risk: .review,
-                note: "请先停止 XCTest/UI 测试；删除后测试会重新创建",
+                risk: risk,
+                note: note,
                 collector: &collector,
-                progress: progress
+                progress: progress,
+                isSelected: isSelected,
+                statusTitle: statusTitle
             ) {
                 items.append(item)
             }
@@ -1785,7 +1827,8 @@ struct CacheScanner {
         isSelected: Bool? = nil,
         kind: CleanupKind = .trash,
         identifier: String? = nil,
-        toolAction: ToolCleanupAction? = nil
+        toolAction: ToolCleanupAction? = nil,
+        statusTitle: String? = nil
     ) -> CacheItem? {
         let standardized = path.standardizedFileURL
         guard fileManager.fileExists(atPath: standardized.path) else { return nil }
@@ -1822,6 +1865,7 @@ struct CacheScanner {
             identifier: identifier,
             toolAction: toolAction,
             note: note,
+            statusTitle: statusTitle,
             isSelected: isSelected ?? defaultSelection(for: standardized, risk: risk, kind: kind)
         )
     }
@@ -1951,22 +1995,55 @@ struct CacheScanner {
     }
 }
 
+protocol TrashExecuting {
+    func trash(_ url: URL) throws
+}
+
+struct FileManagerTrashExecutor: TrashExecuting {
+    func trash(_ url: URL) throws {
+        try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+    }
+}
+
 struct CacheCleaner {
     static func clean(
         _ items: [CacheItem],
         context: DeletionContext,
         toolExecutor: ToolCommandExecuting = ToolCleanupExecutor(),
-        requestLogCleaner: RequestLogCleaner = RequestLogCleaner()
+        requestLogCleaner: RequestLogCleaner = RequestLogCleaner(),
+        xctestActivityInspector: XCTestActivityInspecting = XCTestActivityInspector(),
+        trashExecutor: TrashExecuting = FileManagerTrashExecutor()
     ) -> CleanupReport {
         var removed: [CacheItem] = []
         var failures: [(CacheItem, String)] = []
 
+        // TOCTOU 防护：扫描结果可能早已过期（扫描时空闲、点击清理时测试已启动），
+        // 实际删除前必须重新确认 XCTest 状态。同一次批量清理只检查一次：
+        // running / unknown 时所有 XCTestDevices 项目都被拒绝，非 XCTest 缓存
+        // 照常继续处理，不让整批任务因此取消。
+        let hasXCTestTargets = items.contains {
+            XCTestDeviceLocator.isXCTestDevicesPath($0.path, home: context.home)
+        }
+        let xctestVerdict: XCTestActivityState? = hasXCTestTargets
+            ? xctestActivityInspector.currentState()
+            : nil
+
         for item in items {
             do {
+                if XCTestDeviceLocator.isXCTestDevicesPath(item.path, home: context.home) {
+                    switch xctestVerdict ?? .unknown {
+                    case .idle:
+                        break
+                    case .running:
+                        throw XCTestCleanupError.testsRunning
+                    case .unknown:
+                        throw XCTestCleanupError.activityStateUnavailable
+                    }
+                }
                 switch item.kind {
                 case .trash:
                     try DeletionValidator.validate(item: item, context: context)
-                    try FileManager.default.trashItem(at: item.path, resultingItemURL: nil)
+                    try trashExecutor.trash(item.path)
                 case .simulatorDevice:
                     guard let udid = item.identifier else {
                         throw NSError(domain: "DevSweep", code: 1, userInfo: [NSLocalizedDescriptionKey: "缺少模拟器 UDID"])

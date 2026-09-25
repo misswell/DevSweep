@@ -2,7 +2,7 @@
 
 DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcode、Rust/Tauri、Node、SwiftPM、Cargo、Gradle、Maven、Python、Go、Flutter、VS Code、Cursor 以及 OpenAI Codex、OpenCode、Claude Code、Goose 等 AI agent 开发环境。
 
-当前版本：0.1.35
+当前版本：0.1.36
 
 ## 当前功能
 
@@ -21,6 +21,9 @@ DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcod
 - 覆盖 Edge、Firefox、Google 应用、媒体分析、剪映和自定义 Chromium 资料目录缓存；跨 Caches、Application Support、Containers、Group Containers、HTTPStorages 和临时目录识别 Sparkle/Squirrel 等软件升级残留，系统级位置仅展示为手动项；存在项目标志时识别项目运行日志与 Nacos 日志。
 - 项目扫描覆盖 `.terragrunt-cache`、`.astro`、`zig-out`、`.cxx`、项目内 DerivedData、monorepo marker 和有效 `CACHEDIR.TAG`；如果扫描根自身是 `node_modules`、`target`、`build`、`dist`、`vendor` 等生成物容器，会跳过其内部项目发现。对 Composer `vendor`、.NET `bin`/`obj` 和通用 `build` 必须先验证项目标志，避免按同名目录误报源码或运行时文件。
 - 识别 CoreSimulator 设备，通过 `xcrun simctl delete` 删除，避免直接破坏设备注册。
+- XCTest 克隆设备按动态状态展示：明确 UUID 命名的 clone 在未检测到 XCTest/UI 测试运行时显示「可安全清理」并默认勾选；检测到 `xcodebuild test`、`test-without-building`、`xctest`、`XCTRunner` 或 `XCTestAgent` 进程时显示「正在测试」并禁止勾选清理；无法确认进程状态时保守显示「无法确认状态」，同样禁止自动清理。标题只显示 8 位短 UUID，完整路径放在详情中；XCTestDevices 根目录或未识别内容永远保持「建议确认」不默认勾选。
+- 清理 XCTestDevices 项目前会重新检测一次测试进程（TOCTOU 二次确认，一次批量清理只检测一次）：扫描后启动的测试同样会阻止删除，被阻止的 clone 不影响同批次普通缓存继续清理；CoreSimulator 设备仍走 simctl，不受影响。
+- 提供 `deploy/ios-project-template/`（`scripts/test-ios.sh`、`scripts/ensure-scheme-serial.sh` 与 Agent 规则文本），用于在 iOS 项目内固定单 Simulator 测试：自动探测 workspace/project/scheme，固定 `-parallel-testing-enabled NO`、`-maximum-parallel-testing-workers 1`，只复用已有 Simulator、绝不 `simctl create`，从源头避免并行测试持续制造 XCTest clone。
 - 对 Xcode Archives、iOS DeviceSupport、SourcePackages、XCTest 克隆设备、项目生成物、自定义 `build-*` DerivedData 和版本化 Release 暂存目录标记为“建议确认”或“手动处理”；包含 Release App/归档或安装包的目录不会默认勾选。
 - 扫描过程中显示当前路径、已检查数量、跳过数量和权限异常；扫描完成后可查看实际扫描范围和诊断详情。
 - Cargo 已解压源码、Cargo Git、NuGet、Dart/Flutter 依赖目录和自定义 `DENO_DIR` 按 `review` 展示，默认不勾选；近期刚修改的低风险缓存也不会自动勾选。
@@ -82,7 +85,7 @@ DevSweep 的清理目录和安全策略依据各开发工具公开文件结构�
 
 ## 安全边界
 
-DevSweep 不会直接删除 Docker 虚拟磁盘、用户源码、Git 仓库、照片或文档，也不会把 `/`、`$HOME`、`$HOME/Library`、Desktop、Documents、Downloads 等危险根目录作为自动删除目标。Docker 镜像、容器、卷和 Build Cache 通过官方 CLI 清理，不能移入废纸篓，必须由用户逐项确认；只允许当前 Docker CLI 指向本机 Unix socket 或 localhost，拒绝远程 context；Docker.raw 只展示占用。AI Agent 只纳入可重建缓存、调试日志和更新下载，所有会话、项目、凭据、记忆、队列、配置、状态和仓库数据都排除在扫描规则之外。Claude Code Router 的请求日志只在原地按 24 小时窗口裁剪，清理范围始终由 `$HOME` 推导、不采用扫描结果里的路径，只接受 UUID 命名的正文文件，读不到日志库时直接跳过而不是按空结果删除。开发工具的 Electron 数据也只按明确应用和缓存叶子白名单识别，不扫描整个 Application Support，不触碰 IDE 用户数据、会话历史或工作区状态。删除项目生成物和模拟器设备会让下次构建/运行重新生成数据，可能需要重新下载依赖。运行测试、模拟器、Docker 构建或 agent 更新时，请先停止相关进程再处理对应资源。
+DevSweep 不会直接删除 Docker 虚拟磁盘、用户源码、Git 仓库、照片或文档，也不会把 `/`、`$HOME`、`$HOME/Library`、Desktop、Documents、Downloads 等危险根目录作为自动删除目标。Docker 镜像、容器、卷和 Build Cache 通过官方 CLI 清理，不能移入废纸篓，必须由用户逐项确认；只允许当前 Docker CLI 指向本机 Unix socket 或 localhost，拒绝远程 context；Docker.raw 只展示占用。AI Agent 只纳入可重建缓存、调试日志和更新下载，所有会话、项目、凭据、记忆、队列、配置、状态和仓库数据都排除在扫描规则之外。Claude Code Router 的请求日志只在原地按 24 小时窗口裁剪，清理范围始终由 `$HOME` 推导、不采用扫描结果里的路径，只接受 UUID 命名的正文文件，读不到日志库时直接跳过而不是按空结果删除。开发工具的 Electron 数据也只按明确应用和缓存叶子白名单识别，不扫描整个 Application Support，不触碰 IDE 用户数据、会话历史或工作区状态。删除项目生成物和模拟器设备会让下次构建/运行重新生成数据，可能需要重新下载依赖。运行测试、模拟器、Docker 构建或 agent 更新时，请先停止相关进程再处理对应资源。XCTestDevices 只自动清理明确以 UUID 命名的克隆设备：实际删除前会重新检测一次测试进程，空闲才放行，正在测试或状态不可知时一律拒绝；CoreSimulator 真实设备永远只通过 `xcrun simctl delete` 管理。
 
 ---
 

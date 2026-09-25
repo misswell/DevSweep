@@ -1695,8 +1695,9 @@ private struct CacheItemRow: View {
                     Text(item.name)
                         .font(.subheadline.weight(.semibold))
                         .lineLimit(1)
-                    // Badge 顺序：风险 → 常用清理。
-                    RiskBadge(risk: item.risk)
+                    // Badge 顺序：风险 → 常用清理。XCTest clone 等动态状态项
+                    // 用自己的状态文字（可安全清理 / 正在测试 / 无法确认状态）。
+                    RiskBadge(title: item.statusTitle ?? item.risk.title, color: item.risk.color)
                     if isQuickClean {
                         QuickCleanBadge()
                     }
@@ -1829,15 +1830,16 @@ private struct QuickCleanBadge: View {
 }
 
 private struct RiskBadge: View {
-    let risk: RiskLevel
+    let title: String
+    let color: Color
 
     var body: some View {
-        Text(risk.title)
+        Text(title)
             .font(.caption2.weight(.medium))
-            .foregroundStyle(risk.color)
+            .foregroundStyle(color)
             .padding(.horizontal, 6)
             .padding(.vertical, 3)
-            .background(risk.color.opacity(0.11))
+            .background(color.opacity(0.11))
             .clipShape(Capsule())
     }
 }

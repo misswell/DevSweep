@@ -162,6 +162,9 @@ struct CacheItem: Identifiable, Hashable {
     let toolAction: ToolCleanupAction?
     let expectedFileIdentity: FileIdentity?
     let note: String
+    /// 风险徽章文字覆盖：XCTest clone 等动态状态项需要显示
+    /// 「可安全清理 / 正在测试 / 无法确认状态」，而不是通用风险标题。
+    let statusTitle: String?
     var isSelected: Bool
 
     init(
@@ -176,6 +179,7 @@ struct CacheItem: Identifiable, Hashable {
         toolAction: ToolCleanupAction? = nil,
         expectedFileIdentity: FileIdentity? = nil,
         note: String = "",
+        statusTitle: String? = nil,
         isSelected: Bool? = nil
     ) {
         self.id = UUID()
@@ -190,6 +194,7 @@ struct CacheItem: Identifiable, Hashable {
         self.toolAction = toolAction
         self.expectedFileIdentity = expectedFileIdentity ?? FileIdentity.capture(path)
         self.note = note
+        self.statusTitle = statusTitle
         self.isSelected = isSelected ?? (risk == .safe && kind == .trash)
     }
 }
@@ -227,6 +232,13 @@ struct SelectionMemory {
     static func restore(_ items: [CacheItem], from states: [String: Bool]) -> [CacheItem] {
         items.map { item in
             guard let savedSelection = states[key(for: item.path)] else { return item }
+            // 手动风险项（如正在测试的 XCTest clone）永远不恢复历史勾选：
+            // 状态从 safe 变为 manual 后，上一次的勾选记忆不能让它看起来仍被选中。
+            guard item.risk != .manual else {
+                var deselected = item
+                deselected.isSelected = false
+                return deselected
+            }
             var restoredItem = item
             restoredItem.isSelected = savedSelection
             return restoredItem
