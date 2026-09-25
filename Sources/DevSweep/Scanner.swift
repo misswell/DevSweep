@@ -95,7 +95,6 @@ struct CacheScanner {
     static func scan(
         projectRoots: [URL],
         deepScan: Bool,
-        whitelistedPaths: [URL] = [],
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         includeSystemCaches: Bool = true,
         progress: @escaping (ScanProgress) -> Void,
@@ -184,8 +183,9 @@ struct CacheScanner {
             )
         }
 
+        // Scanner 只负责「机器上发现了什么」；白名单等用户规则由 DevSweepStore
+        // 在 rebuildItems() 中统一套用，这样加入/移出白名单都不需要重新扫描。
         let candidates = items
-            .filter { !PathWhitelist.contains($0.path, in: whitelistedPaths) }
             .sorted { left, right in
                 guard left.path.standardizedFileURL.path == right.path.standardizedFileURL.path else {
                     return false
@@ -2055,6 +2055,7 @@ final class DevSweepStore: ObservableObject {
     private static let projectRootsKey = "DevSweep.projectRoots"
     private static let selectionStatesKey = "DevSweep.selectionStates"
     private static let whitelistedPathsKey = "DevSweep.whitelistedPaths"
+    private static let quickCleanEntriesKey = "DevSweep.quickCleanEntries"
 
     @Published private(set) var items: [CacheItem] = []
     @Published private(set) var isScanning = false
@@ -2063,14 +2064,24 @@ final class DevSweepStore: ObservableObject {
     @Published private(set) var lastError: String?
     @Published private(set) var lastReport: ScanReport?
     @Published private(set) var scanProgress = ScanProgress()
+    @Published private(set) var quickCleanEntries: [QuickCleanEntry] = []
+    @Published private(set) var quickCleanSnapshots: [QuickCleanSnapshot] = []
+    @Published private(set) var isRefreshingQuickClean = false
+    @Published private(set) var transientNotice: TransientNotice?
     @Published var projectRoots: [URL]
     @Published private(set) var whitelistedPaths: [URL]
     @Published var deepScan = true
     private var selectionStates: [String: Bool]
+    /// Scanner 本次发现的完整候选条目；白名单等用户规则在 rebuildItems() 中套用。
+    private var rawScanItems: [CacheItem] = []
+    private let defaults: UserDefaults
+    private var transientNoticeTask: Task<Void, Never>?
+    private var quickCleanRefreshGeneration = 0
 
-    init() {
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
         let home = FileManager.default.homeDirectoryForCurrentUser
-        if let saved = UserDefaults.standard.array(forKey: Self.projectRootsKey) as? [String] {
+        if let saved = defaults.array(forKey: Self.projectRootsKey) as? [String] {
             let configuredRoots = Self.normalizeProjectRoots(saved.map { URL(fileURLWithPath: $0) })
             projectRoots = saved.isEmpty
                 ? []
@@ -2078,13 +2089,17 @@ final class DevSweepStore: ObservableObject {
         } else {
             projectRoots = Self.defaultProjectRoots(home: home)
         }
-        let savedWhitelist = UserDefaults.standard.array(forKey: Self.whitelistedPathsKey) as? [String] ?? []
+        let savedWhitelist = defaults.array(forKey: Self.whitelistedPathsKey) as? [String] ?? []
         whitelistedPaths = PathWhitelist.normalized(savedWhitelist.map { URL(fileURLWithPath: $0) })
-        if let data = UserDefaults.standard.data(forKey: Self.selectionStatesKey),
+        if let data = defaults.data(forKey: Self.selectionStatesKey),
            let savedStates = try? JSONDecoder().decode([String: Bool].self, from: data) {
             selectionStates = savedStates
         } else {
             selectionStates = [:]
+        }
+        if let data = defaults.data(forKey: Self.quickCleanEntriesKey),
+           let savedEntries = try? JSONDecoder().decode([QuickCleanEntry].self, from: data) {
+            quickCleanEntries = QuickCleanRegistry.normalized(savedEntries)
         }
     }
 
@@ -2108,22 +2123,34 @@ final class DevSweepStore: ObservableObject {
         return items.filter { $0.category == category }.reduce(0) { $0 + $1.size }
     }
 
+    /// 全 App 唯一的清理候选计算入口；过滤器和 Mini 模式都不再各自计算清理范围。
+    var selectedCleanupItems: [CacheItem] {
+        CleanupSelection.selectedItems(from: items)
+    }
+
+    /// 常用清理中当前真实存在、可一键清理的条目。
+    var cleanableQuickCleanSnapshots: [QuickCleanSnapshot] {
+        quickCleanSnapshots.filter { $0.exists && $0.fileIdentity != nil }
+    }
+
+    var quickCleanSize: Int64 {
+        cleanableQuickCleanSnapshots.reduce(0) { $0 + $1.size }
+    }
+
     func scan() {
         guard !isScanning, !isCleaning else { return }
         isScanning = true
         lastError = nil
-        lastReport = nil
+        // 重新扫描期间保留上一次的结果，避免界面闪空；新报告完成后一次性替换。
         scanProgress = ScanProgress(phase: "准备扫描")
-        statusMessage = "正在扫描开发者缓存…"
+        statusMessage = rawScanItems.isEmpty ? "正在扫描开发者缓存…" : "重新扫描中…"
         let roots = projectRoots
         let deepScan = self.deepScan
-        let whitelist = whitelistedPaths
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let report = CacheScanner.scan(
                 projectRoots: roots,
-                deepScan: deepScan,
-                whitelistedPaths: whitelist
+                deepScan: deepScan
             ) { progress in
                 DispatchQueue.main.async {
                     guard let self else { return }
@@ -2133,41 +2160,67 @@ final class DevSweepStore: ObservableObject {
             }
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.items = SelectionMemory.restore(report.items, from: self.selectionStates)
-                self.lastReport = report
-                self.scanProgress = ScanProgress(
-                    phase: "扫描完成",
-                    checkedPaths: report.checkedPaths,
-                    matchedPaths: report.items.count,
-                    skippedPaths: report.skippedPaths,
-                    permissionFailures: report.permissionFailures
-                )
+                self.applyScanResult(report)
                 self.isScanning = false
-                self.statusMessage = "已扫描 \(report.items.count) 项，耗时 \(String(format: "%.1f", report.duration)) 秒"
+                self.statusMessage = "已扫描 \(report.items.count) 项，已自动选择安全项目，耗时 \(String(format: "%.1f", report.duration)) 秒"
             }
         }
     }
 
-    func setSelected(_ id: UUID, selected: Bool) {
-        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
-        guard items[index].risk != .manual else { return }
-        items[index].isSelected = selected
-        selectionStates[SelectionMemory.key(for: items[index].path)] = selected
-        persistSelectionStates()
+    /// 安装一次新的扫描结果并按用户规则重建列表；也是测试注入原始结果的入口。
+    func applyScanResult(_ report: ScanReport) {
+        rawScanItems = report.items
+        lastReport = report
+        rebuildItems()
+        scanProgress = ScanProgress(
+            phase: "扫描完成",
+            checkedPaths: report.checkedPaths,
+            matchedPaths: report.items.count,
+            skippedPaths: report.skippedPaths,
+            permissionFailures: report.permissionFailures
+        )
+        if !quickCleanEntries.isEmpty {
+            refreshQuickCleanSnapshots()
+        }
     }
 
-    func setAllSelected(_ selected: Bool, category: String? = nil) {
+    /// rawScanItems → 去掉白名单 → 恢复 selection memory → items。
+    /// 加入/移出白名单都只调用这里，立即生效，不需要重新扫描。
+    private func rebuildItems() {
+        let whitelist = whitelistedPaths
+        let visibleItems = rawScanItems.filter { !PathWhitelist.contains($0.path, in: whitelist) }
+        items = SelectionMemory.restore(visibleItems, from: selectionStates)
+    }
+
+    func isQuickClean(_ item: CacheItem) -> Bool {
+        QuickCleanRegistry.contains(item.path, in: quickCleanEntries)
+    }
+
+    func setSelected(_ id: UUID, selected: Bool) {
+        setSelected(ids: [id], selected: selected)
+    }
+
+    /// 批量设置勾选状态。勾选只覆盖可批量处理的项目；取消勾选对所有非手动项生效。
+    /// 传入的 ids 由调用方决定（通常是「当前显示」的条目），过滤不影响这里的语义。
+    func setSelected(ids: Set<UUID>, selected: Bool) {
         var didChange = false
-        for index in items.indices where category == nil || items[index].category == category {
+        for index in items.indices where ids.contains(items[index].id) {
             let item = items[index]
-            // 取消勾选对所有非手动项都生效；勾选只覆盖可批量处理的项目。
             let isAllowed = selected ? CleanupSelection.isBatchSelectable(item) : item.risk != .manual
             guard isAllowed, item.isSelected != selected else { continue }
             items[index].isSelected = selected
-            selectionStates[SelectionMemory.key(for: item.path)] = selected
+            selectionStates[SelectionMemory.key(for: items[index].path)] = selected
             didChange = true
         }
         if didChange { persistSelectionStates() }
+    }
+
+    /// 「全选/取消当前显示」：只作用于传入的可见条目，其余条目保持不变。
+    func setVisibleSelected(_ visibleItems: [CacheItem], selected: Bool) {
+        let ids = Set(visibleItems
+            .filter { selected ? CleanupSelection.isBatchSelectable($0) : $0.risk != .manual }
+            .map(\.id))
+        setSelected(ids: ids, selected: selected)
     }
 
     func chooseProjectRoots() {
@@ -2200,23 +2253,199 @@ final class DevSweepStore: ObservableObject {
         persistProjectRoots()
     }
 
+    /// 加入白名单后条目立即从当前扫描结果消失，同时清除它的勾选状态，
+    /// 不需要等下一次扫描。白名单保护优先于清理授权：同一路径不能既在
+    /// 常用清理又被白名单，冲突的常用清理条目会被自动移除。
     func addToWhitelist(_ items: [CacheItem]) {
         guard !items.isEmpty, !isScanning, !isCleaning else { return }
         let updated = PathWhitelist.normalized(whitelistedPaths + items.map(\.path))
         guard updated != whitelistedPaths else { return }
         whitelistedPaths = updated
         persistWhitelist()
-        statusMessage = items.count == 1
-            ? "已加入白名单"
-            : "已加入白名单 \(items.count) 项"
+
+        // 白名单意味着之前对这些路径的选择意图作废，包括子路径。
+        for item in items {
+            let key = SelectionMemory.key(for: item.path)
+            selectionStates = selectionStates.filter { stateKey, _ in
+                stateKey != key && !stateKey.hasPrefix(key + "/")
+            }
+        }
+        persistSelectionStates()
+
+        // 冲突的常用清理授权一并移除（含父子路径）。
+        let conflictKeys = Set(items.map { QuickCleanRegistry.key(for: $0.path) })
+        let hadConflicts = quickCleanEntries.contains { entry in
+            conflictKeys.contains { conflict in
+                entry.id == conflict || conflict.hasPrefix(entry.id + "/") || entry.id.hasPrefix(conflict + "/")
+            }
+        }
+        if hadConflicts {
+            quickCleanEntries = QuickCleanRegistry.normalized(quickCleanEntries.filter { entry in
+                !conflictKeys.contains { conflict in
+                    entry.id == conflict || conflict.hasPrefix(entry.id + "/") || entry.id.hasPrefix(conflict + "/")
+                }
+            })
+            persistQuickCleanEntries()
+            refreshQuickCleanSnapshots()
+        }
+
+        rebuildItems()
+        showTransientNotice(items.count == 1 ? "已加入白名单" : "已加入白名单 \(items.count) 项")
     }
 
+    /// 移出白名单是瞬时操作：如果目录在最近一次 rawScanItems 里存在就立即恢复；
+    /// 磁盘已经变化的部分由用户下次重新扫描发现。
     func removeFromWhitelist(_ path: URL) {
         guard !isScanning, !isCleaning else { return }
         let standardizedPath = path.standardizedFileURL.path
-        whitelistedPaths.removeAll { $0.standardizedFileURL.path == standardizedPath }
+        let updated = whitelistedPaths.filter { $0.standardizedFileURL.path != standardizedPath }
+        guard updated.count != whitelistedPaths.count else { return }
+        whitelistedPaths = updated
         persistWhitelist()
-        scan()
+        rebuildItems()
+        showTransientNotice("已移出白名单")
+    }
+
+    /// 加入常用清理：只接受 Scanner 已识别、kind == .trash、非 manual 的真实目录。
+    /// Docker prune、simctl、官方工具命令、就地裁剪日志、普通文件和手动项目
+    /// 都不能进入。加入后扫描列表中的项目不消失，而是立即出现「常用清理」标识。
+    @discardableResult
+    func addToQuickClean(_ items: [CacheItem]) -> (added: Int, rejected: Int) {
+        guard !items.isEmpty, !isScanning, !isCleaning else { return (0, items.count) }
+        let whitelist = whitelistedPaths
+        var newEntries: [QuickCleanEntry] = []
+        var rejected = 0
+        for item in items {
+            guard item.kind == .trash,
+                  item.risk != .manual,
+                  !PathWhitelist.contains(item.path, in: whitelist),
+                  !QuickCleanRegistry.contains(item.path, in: quickCleanEntries),
+                  (try? DeletionValidator.validateQuickCleanRegistration(path: item.path)) != nil
+            else {
+                rejected += 1
+                continue
+            }
+            newEntries.append(QuickCleanEntry(
+                path: QuickCleanRegistry.key(for: item.path),
+                displayName: item.name,
+                category: item.category,
+                dateAdded: Date()
+            ))
+        }
+        guard !newEntries.isEmpty else {
+            showTransientNotice("没有可加入常用清理的项目", icon: "exclamationmark.circle.fill")
+            return (0, rejected)
+        }
+        quickCleanEntries = QuickCleanRegistry.normalized(quickCleanEntries + newEntries)
+        persistQuickCleanEntries()
+        refreshQuickCleanSnapshots()
+
+        let added = newEntries.count
+        if rejected > 0 {
+            showTransientNotice("已加入常用清理 \(added) 项，\(rejected) 项不支持")
+        } else {
+            showTransientNotice(added == 1 ? "已加入常用清理" : "已加入常用清理 \(added) 项")
+        }
+        return (added, rejected)
+    }
+
+    func removeFromQuickClean(_ entry: QuickCleanEntry) {
+        removeFromQuickClean(paths: [URL(fileURLWithPath: entry.path)])
+    }
+
+    func removeFromQuickClean(paths: [URL]) {
+        guard !paths.isEmpty, !isScanning, !isCleaning else { return }
+        let keys = Set(paths.map { QuickCleanRegistry.key(for: $0) })
+        quickCleanEntries.removeAll { keys.contains($0.id) }
+        persistQuickCleanEntries()
+        refreshQuickCleanSnapshots()
+        showTransientNotice("已移出常用清理")
+    }
+
+    /// 刷新快照：存在性、FileIdentity、大小都重新读取磁盘，绝不调用完整 CacheScanner。
+    func refreshQuickCleanSnapshots() {
+        let entries = quickCleanEntries
+        quickCleanRefreshGeneration += 1
+        let generation = quickCleanRefreshGeneration
+        isRefreshingQuickClean = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let snapshots = QuickCleanInspector.snapshots(for: entries)
+            DispatchQueue.main.async {
+                guard let self, generation == self.quickCleanRefreshGeneration else { return }
+                self.quickCleanSnapshots = snapshots
+                self.isRefreshingQuickClean = false
+            }
+        }
+    }
+
+    /// 一键清理：用户加入常用清理即代表长期授权，不再弹二次确认。
+    /// 目录被清理后 Entry 保留，目录重新生成后仍可继续一键清理。
+    func cleanAllQuickClean() {
+        cleanQuickCleanEntries(cleanableQuickCleanSnapshots.map(\.entry))
+    }
+
+    func cleanQuickClean(_ entries: [QuickCleanEntry]) {
+        cleanQuickCleanEntries(entries)
+    }
+
+    private func cleanQuickCleanEntries(_ entries: [QuickCleanEntry]) {
+        let targets = QuickCleanRegistry.normalized(entries)
+        guard !targets.isEmpty, !isScanning, !isCleaning else { return }
+        isCleaning = true
+        lastError = nil
+        statusMessage = "正在把常用项目移入废纸篓…"
+        let whitelist = whitelistedPaths
+        let roots = projectRoots
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // 执行前重新读取磁盘状态，生成刚刚捕获 FileIdentity 的执行条目；
+            // 仍然走 CacheCleaner + DeletionValidator，白名单永远拥有最高优先级。
+            let freshItems = QuickCleanInspector.executableItems(for: targets)
+            let context = DeletionContext(
+                whitelistedPaths: whitelist,
+                projectRoots: roots,
+                allowedPaths: freshItems.map(\.path)
+            )
+            let report = CacheCleaner.clean(freshItems, context: context)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isCleaning = false
+                self.applyQuickCleanCleanupResult(report)
+                if report.failures.isEmpty {
+                    let removedSize = report.removed.reduce(0) { $0 + $1.size }
+                    self.statusMessage = report.removed.isEmpty
+                        ? "没有需要清理的常用项目"
+                        : "已清理 \(report.removed.count) 个常用目录，共 \(removedSize.devSweepFileSize)，文件可从废纸篓恢复"
+                    if !report.removed.isEmpty {
+                        self.showTransientNotice("已清理 \(report.removed.count) 项，共 \(removedSize.devSweepFileSize)")
+                    }
+                } else {
+                    let details = report.failures.map { "\($0.0.name)：\($0.1)" }.joined(separator: "\n")
+                    self.lastError = "部分常用项目未能清理：\n\(details)"
+                    self.statusMessage = "已处理 \(report.removed.count) 项，\(report.failures.count) 项失败"
+                }
+            }
+        }
+    }
+
+    /// Quick Clean 清理成功后的状态更新：Entry 永远不删除；快照重新读取磁盘后
+    /// 变成「当前无内容」；rawScanItems 中同路径项目同步消失。
+    func applyQuickCleanCleanupResult(_ report: CleanupReport) {
+        guard !report.removed.isEmpty else { return }
+        let removedPaths = Set(report.removed.map { QuickCleanRegistry.key(for: $0.path) })
+        rawScanItems.removeAll { removedPaths.contains(QuickCleanRegistry.key(for: $0.path)) }
+        rebuildItems()
+        refreshQuickCleanSnapshots()
+    }
+
+    private func showTransientNotice(_ text: String, icon: String = "checkmark.circle.fill") {
+        transientNoticeTask?.cancel()
+        transientNotice = TransientNotice(text, icon: icon)
+        transientNoticeTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.transientNotice = nil
+        }
     }
 
     func cleanSelected(ids: Set<UUID>) {
@@ -2242,12 +2471,21 @@ final class DevSweepStore: ObservableObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isCleaning = false
-                let remainingItems = CleanupSelection.remainingItems(from: self.items, removing: report.removed)
-                self.items = remainingItems
+                // 普通清理：被删除的条目从原始扫描结果中消失；常用清理配置则保留。
+                let removedIDs = Set(report.removed.map(\.id))
+                self.rawScanItems.removeAll { removedIDs.contains($0.id) }
+                self.rebuildItems()
                 for item in report.removed {
                     self.selectionStates.removeValue(forKey: SelectionMemory.key(for: item.path))
                 }
-                if !report.removed.isEmpty { self.persistSelectionStates() }
+                if !report.removed.isEmpty {
+                    self.persistSelectionStates()
+                    if !self.quickCleanEntries.isEmpty {
+                        self.refreshQuickCleanSnapshots()
+                    }
+                    let removedSize = report.removed.reduce(0) { $0 + $1.size }
+                    self.showTransientNotice("已清理 \(report.removed.count) 项，共 \(removedSize.devSweepFileSize)")
+                }
                 if report.failures.isEmpty {
                     self.statusMessage = includesNonRecoverable
                         ? "已处理 \(report.removed.count) 项，部分工具资源不可从废纸篓恢复"
@@ -2268,16 +2506,21 @@ final class DevSweepStore: ObservableObject {
     }
 
     private func persistProjectRoots() {
-        UserDefaults.standard.set(projectRoots.map(\.path), forKey: Self.projectRootsKey)
+        defaults.set(projectRoots.map(\.path), forKey: Self.projectRootsKey)
     }
 
     private func persistWhitelist() {
-        UserDefaults.standard.set(whitelistedPaths.map(\.path), forKey: Self.whitelistedPathsKey)
+        defaults.set(whitelistedPaths.map(\.path), forKey: Self.whitelistedPathsKey)
     }
 
     private func persistSelectionStates() {
         guard let data = try? JSONEncoder().encode(selectionStates) else { return }
-        UserDefaults.standard.set(data, forKey: Self.selectionStatesKey)
+        defaults.set(data, forKey: Self.selectionStatesKey)
+    }
+
+    private func persistQuickCleanEntries() {
+        guard let data = try? JSONEncoder().encode(quickCleanEntries) else { return }
+        defaults.set(data, forKey: Self.quickCleanEntriesKey)
     }
 
     private static func defaultProjectRoots(home: URL) -> [URL] {

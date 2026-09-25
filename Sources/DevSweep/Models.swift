@@ -195,9 +195,10 @@ struct CacheItem: Identifiable, Hashable {
 }
 
 struct CleanupSelection {
-    static func selectedItems(from items: [CacheItem], visibleItems: [CacheItem]) -> [CacheItem] {
-        let visibleIDs = Set(visibleItems.map(\.id))
-        return items.filter { visibleIDs.contains($0.id) && $0.isSelected && $0.risk != .manual }
+    /// 全 App 唯一的清理候选计算入口：只由用户勾选状态决定，与当前分类、
+    /// 过滤器和显示窗口无关。过滤只改变 `visibleItems`，永远不改变清理范围。
+    static func selectedItems(from items: [CacheItem]) -> [CacheItem] {
+        items.filter { $0.isSelected && $0.risk != .manual }
     }
 
     static func remainingItems(from items: [CacheItem], removing removedItems: [CacheItem]) -> [CacheItem] {
@@ -257,6 +258,64 @@ struct PathWhitelist {
             let allowed = allowedPath.standardizedFileURL.path
             return candidatePath == allowed || candidatePath.hasPrefix(allowed + "/")
         }
+    }
+}
+
+/// 长期保存的用户清理授权。不保存 `CacheItem.id`（UUID 每次扫描都会变化），
+/// 稳定身份是 normalized path；目录被清理后重新生成，Entry 仍然保留。
+struct QuickCleanEntry: Codable, Hashable, Identifiable {
+    let path: String
+    let displayName: String
+    let category: String
+    let dateAdded: Date
+
+    var id: String {
+        URL(fileURLWithPath: path).standardizedFileURL.path
+    }
+}
+
+/// 某一时刻磁盘上的实际状态，与长期保存的 `QuickCleanEntry` 分开维护。
+struct QuickCleanSnapshot: Identifiable {
+    let entry: QuickCleanEntry
+    let exists: Bool
+    let size: Int64
+    let fileIdentity: FileIdentity?
+
+    var id: String { entry.id }
+}
+
+enum QuickCleanRegistry {
+    static func key(for path: URL) -> String {
+        path.standardizedFileURL.path
+    }
+
+    static func contains(_ path: URL, in entries: [QuickCleanEntry]) -> Bool {
+        entries.contains { $0.id == key(for: path) }
+    }
+
+    /// 去掉父子路径重复：父目录已登记时不再保留子目录，避免一键清理时
+    /// 先删父目录、再删子目录时报告 pathMissing。
+    static func normalized(_ entries: [QuickCleanEntry]) -> [QuickCleanEntry] {
+        var result: [QuickCleanEntry] = []
+        for entry in entries.sorted(by: { $0.id.count < $1.id.count }) {
+            guard !result.contains(where: { parent in
+                entry.id == parent.id || entry.id.hasPrefix(parent.id + "/")
+            }) else { continue }
+            result.append(entry)
+        }
+        return result
+    }
+}
+
+/// 短暂的即时操作反馈（toast），与常驻的 `statusMessage` 分开维护。
+struct TransientNotice: Equatable, Identifiable {
+    let id = UUID()
+    let text: String
+    let icon: String
+
+    init(_ text: String, icon: String = "checkmark.circle.fill") {
+        self.text = text
+        self.icon = icon
     }
 }
 

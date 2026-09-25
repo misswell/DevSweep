@@ -182,6 +182,42 @@ struct DeletionValidator {
         }
     }
 
+    /// 「加入常用清理」前的资格检查：只允许真实的、非符号链接的普通目录，
+    /// 且不能是受保护路径。真正的删除仍然走 `validate(item:context:)`，
+    /// 这里不放宽任何现有保护。
+    static func validateQuickCleanRegistration(path: URL) throws {
+        let standardized = path.standardizedFileURL
+        guard fileManager.fileExists(atPath: standardized.path) else {
+            throw DeletionValidationError.pathMissing
+        }
+
+        guard let values = try? standardized.resourceValues(forKeys: [.isSymbolicLinkKey]),
+              values.isSymbolicLink != true
+        else {
+            throw DeletionValidationError.symbolicLink
+        }
+
+        let physical = standardized.resolvingSymlinksInPath().standardizedFileURL
+        guard physical.path == standardized.path else {
+            throw DeletionValidationError.symbolicLink
+        }
+
+        guard let attributes = try? fileManager.attributesOfItem(atPath: standardized.path),
+              (attributes[.type] as? FileAttributeType) == .typeDirectory
+        else {
+            throw DeletionValidationError.unsupportedTarget
+        }
+
+        // 用未归并的原始保护列表做精确匹配：PathWhitelist.normalized 会把
+        // home 的子目录当作冗余剔除，那样 ~/Documents 等路径会漏检。
+        let protectedPaths = defaultProtectedPaths()
+        guard !containsExact(standardized, in: protectedPaths),
+              !containsExact(physical, in: protectedPaths)
+        else {
+            throw DeletionValidationError.protectedPath
+        }
+    }
+
     private static func isWithinAuthorizedScope(
         standardized: URL,
         physical: URL,

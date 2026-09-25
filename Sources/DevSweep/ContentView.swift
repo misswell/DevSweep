@@ -99,41 +99,68 @@ struct MiniModeWindowPlacement {
     }
 }
 
+/// Sidebar 不再用一个 `selectedCategory: String` 承担全部导航。
+enum SidebarDestination: Hashable {
+    case all
+    case quickClean
+    case whitelist
+    case category(String)
+}
+
 struct ContentView: View {
     @EnvironmentObject private var store: DevSweepStore
     @EnvironmentObject private var updater: DevSweepSoftwareUpdater
-    @State private var selectedCategory = "全部"
+    @State private var destination: SidebarDestination = .all
     @State private var onlySelected = false
+    @State private var onlyQuickClean = false
     @State private var onlyLarge = false
     @State private var showingConfirmation = false
+    @State private var showingQuickCleanHint = false
     @State private var showingError = false
     @State private var showingHelp = false
     @State private var showingSettings = false
     @State private var showingScanDetails = false
     @State private var pendingCleanupItems: [CacheItem] = []
+    @State private var pendingQuickCleanItems: [CacheItem] = []
     @State private var savedNormalWindowFrame: NSRect?
     @AppStorage("DevSweep.miniMode") private var miniMode = false
+    @AppStorage("DevSweep.quickCleanHintAcknowledged") private var quickCleanHintAcknowledged = false
 
     private let largeThreshold: Int64 = 1 * 1024 * 1024 * 1024
 
-    private var visibleItems: [CacheItem] {
-        store.items.filter { item in
-            (selectedCategory == "全部" || item.category == selectedCategory) &&
-            (!onlySelected || item.isSelected) &&
-            (!onlyLarge || item.size >= largeThreshold)
+    private var showsCacheList: Bool {
+        switch destination {
+        case .all, .category: return true
+        case .quickClean, .whitelist: return false
         }
     }
 
-    private var cleanupItems: [CacheItem] {
-        CleanupSelection.selectedItems(from: store.items, visibleItems: visibleItems)
+    /// 过滤器只决定「当前看到什么」，永远不影响清理范围。
+    private var visibleItems: [CacheItem] {
+        store.items.filter { item in
+            let matchesCategory: Bool
+            switch destination {
+            case .all:
+                matchesCategory = true
+            case .category(let category):
+                matchesCategory = item.category == category
+            case .quickClean, .whitelist:
+                matchesCategory = false
+            }
+            return matchesCategory
+                && (!onlySelected || item.isSelected)
+                && (!onlyQuickClean || store.isQuickClean(item))
+                && (!onlyLarge || item.size >= largeThreshold)
+        }
     }
 
-    private var cleanupSize: Int64 {
-        cleanupItems.reduce(0) { $0 + $1.size }
+    /// 清理范围永远等于 store.selectedCleanupItems，与当前页面和过滤器无关。
+    private var selectedCleanupSize: Int64 {
+        store.selectedCleanupItems.reduce(0) { $0 + $1.size }
     }
 
-    private var cleanupIncludesNonRecoverable: Bool {
-        cleanupItems.contains { $0.kind.isNonRecoverable }
+    private var selectedCleanupIncludesNonRecoverable: Bool {
+        store.selectedCleanupItems.contains { $0.kind.isNonRecoverable }
     }
 
     private var pendingCleanupIncludesNonRecoverable: Bool {
@@ -142,6 +169,15 @@ struct ContentView: View {
 
     private var hasScanReport: Bool {
         store.lastReport != nil
+    }
+
+    private var headerTitle: String {
+        switch destination {
+        case .all: return "开发者垃圾清理"
+        case .quickClean: return "常用清理"
+        case .whitelist: return "白名单"
+        case .category(let category): return category
+        }
     }
 
     var body: some View {
@@ -153,7 +189,8 @@ struct ContentView: View {
                     onCleanup: { items in
                         pendingCleanupItems = items
                         showingConfirmation = true
-                    }
+                    },
+                    onAddToQuickClean: { requestAddToQuickClean([$0]) }
                 )
             } else {
                 NavigationSplitView {
@@ -165,6 +202,15 @@ struct ContentView: View {
                 .frame(minWidth: 1_040, minHeight: 700)
             }
         }
+        .overlay(alignment: .top) {
+            if let notice = store.transientNotice {
+                TransientNoticeView(notice: notice)
+                    .padding(.top, 12)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .id(notice.id)
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: store.transientNotice)
         .confirmationDialog(
             pendingCleanupItems.count == 1 ? "确认清理这一项？" : "确认清理选中的项目？",
             isPresented: $showingConfirmation,
@@ -184,6 +230,22 @@ struct ContentView: View {
                     ? "将处理 \(pendingCleanupItems.count) 项，共 \(pendingCleanupItems.reduce(0) { $0 + $1.size }.devSweepFileSize)。部分项目会通过开发工具自己的清理命令执行，不会进入废纸篓；普通目录会移入废纸篓。"
                     : "将处理 \(pendingCleanupItems.count) 项，共 \(pendingCleanupItems.reduce(0) { $0 + $1.size }.devSweepFileSize)。运行中的模拟器、未登记目录和手动项目不会自动删除。"
             )
+        }
+        .alert("加入常用清理？", isPresented: $showingQuickCleanHint) {
+            Button("加入常用清理") {
+                store.addToQuickClean(pendingQuickCleanItems)
+                pendingQuickCleanItems = []
+            }
+            Button("加入并不再提示") {
+                quickCleanHintAcknowledged = true
+                store.addToQuickClean(pendingQuickCleanItems)
+                pendingQuickCleanItems = []
+            }
+            Button("取消", role: .cancel) {
+                pendingQuickCleanItems = []
+            }
+        } message: {
+            Text("加入常用清理后，即使该目录被清理后重新生成，以后仍可从「常用清理」中直接一键清理。仅建议用于 node_modules、target、DerivedData 等可重新生成目录。")
         }
         .task {
             try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -239,15 +301,29 @@ struct ContentView: View {
             .padding(.top, 16)
             .padding(.bottom, 10)
 
-            List(selection: $selectedCategory) {
-                Section {
+            List(selection: $destination) {
+                Section("概览") {
                     SidebarRow(
                         title: "全部项目",
                         subtitle: "所有可发现的开发者缓存",
                         icon: "sparkles",
                         size: store.totalSize
                     )
-                    .tag("全部")
+                    .tag(SidebarDestination.all)
+                    SidebarRow(
+                        title: "常用清理",
+                        subtitle: "\(store.quickCleanEntries.count) 个长期授权目录",
+                        icon: "bolt.fill",
+                        size: store.quickCleanSize
+                    )
+                    .tag(SidebarDestination.quickClean)
+                    SidebarRow(
+                        title: "白名单",
+                        subtitle: "\(store.whitelistedPaths.count) 个永久保护目录",
+                        icon: "checkmark.shield",
+                        size: nil
+                    )
+                    .tag(SidebarDestination.whitelist)
                 }
 
                 Section("分类") {
@@ -258,7 +334,7 @@ struct ContentView: View {
                             icon: categoryIcon(category),
                             size: store.categorySize(category)
                         )
-                        .tag(category)
+                        .tag(SidebarDestination.category(category))
                     }
                 }
             }
@@ -271,19 +347,14 @@ struct ContentView: View {
                     Circle()
                         .fill(.green)
                         .frame(width: 8, height: 8)
-                    Text("白名单缓存 + 选定项目目录")
+                    Text("普通清理移入废纸篓，可恢复")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 Text("已配置 \(store.projectRoots.count) 个项目根目录")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
-                if !store.whitelistedPaths.isEmpty {
-                    Text("已忽略 \(store.whitelistedPaths.count) 个目录")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-                Text("文件默认移入废纸篓，可恢复")
+                Text("常用清理 \(store.quickCleanEntries.count) 项 · 白名单 \(store.whitelistedPaths.count) 个目录")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
@@ -295,35 +366,46 @@ struct ContentView: View {
     private var dashboard: some View {
         VStack(spacing: 0) {
             header
-            Divider()
+            if showsCacheList {
+                Divider()
+                if store.isScanning && hasScanReport {
+                    rescanBanner
+                    Divider()
+                }
+            }
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    overviewCard
-                    projectScopeCard
+                    switch destination {
+                    case .all, .category:
+                        overviewCard
+                        projectScopeCard
 
-                    if let report = store.lastReport, !store.isScanning {
-                        scanSummaryCard(report)
-                    }
+                        if let report = store.lastReport, !store.isScanning {
+                            scanSummaryCard(report)
+                        }
 
-                    toolbar
+                        toolbar
 
-                    if store.isScanning {
-                        scanningState
-                    } else if visibleItems.isEmpty {
-                        EmptyStateView(
-                            selectedCategory: selectedCategory,
-                            onlyLarge: onlyLarge,
-                            hasScanReport: hasScanReport
-                        )
-                    } else {
-                        LazyVStack(spacing: 10) {
-                            ForEach(visibleItems) { item in
-                                CacheItemRow(item: item) { item in
-                                    pendingCleanupItems = [item]
-                                    showingConfirmation = true
+                        if store.isScanning && !hasScanReport {
+                            scanningState
+                        } else if visibleItems.isEmpty {
+                            EmptyStateView(
+                                title: emptyStateTitle,
+                                message: emptyStateMessage
+                            )
+                        } else {
+                            LazyVStack(spacing: 10) {
+                                ForEach(visibleItems) { item in
+                                    CacheItemRow(item: item, onClean: onCleanSingleItem) { rowItem in
+                                        requestAddToQuickClean([rowItem])
+                                    }
                                 }
                             }
                         }
+                    case .quickClean:
+                        QuickCleanPageView()
+                    case .whitelist:
+                        WhitelistPageView()
                     }
                 }
                 .frame(maxWidth: 980, alignment: .leading)
@@ -332,7 +414,9 @@ struct ContentView: View {
                 .padding(.bottom, 26)
                 .frame(maxWidth: .infinity)
             }
-            bottomBar
+            if showsCacheList {
+                bottomBar
+            }
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .background {
@@ -343,7 +427,7 @@ struct ContentView: View {
     private var header: some View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(selectedCategory == "全部" ? "开发者垃圾清理" : selectedCategory)
+                Text(headerTitle)
                     .font(.system(size: 24, weight: .bold, design: .rounded))
                 Text(store.statusMessage)
                     .font(.caption)
@@ -397,6 +481,58 @@ struct ContentView: View {
         .controlSize(.large)
         .padding(.horizontal, 30)
         .padding(.vertical, 18)
+    }
+
+    /// 重新扫描期间保留旧列表，只在顶部显示进度；勾选和清理操作暂时禁用。
+    private var rescanBanner: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.small)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("重新扫描中…")
+                    .font(.subheadline.weight(.semibold))
+                Text("已检查 \(store.scanProgress.checkedPaths) 个路径 · 命中 \(store.scanProgress.matchedPaths) 项")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Text("扫描完成前暂时禁用勾选与清理")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.horizontal, 30)
+        .padding(.vertical, 10)
+        .background(Color.accentColor.opacity(0.08))
+    }
+
+    private var emptyStateTitle: String {
+        guard hasScanReport else { return "准备开始扫描" }
+        if case .category = destination { return "这个分类目前很干净" }
+        return "没有发现符合条件的项目"
+    }
+
+    private var emptyStateMessage: String {
+        guard hasScanReport else {
+            return "点击右上角“开始扫描”，扫描完成后这里会显示可清理项目。"
+        }
+        return onlyLarge
+            ? "当前筛选只显示大于 1 GB 的项目，可以关闭筛选查看较小缓存。"
+            : "可以重新扫描，或添加一个项目根目录来查找嵌套生成物。"
+    }
+
+    private func onCleanSingleItem(_ item: CacheItem) {
+        pendingCleanupItems = [item]
+        showingConfirmation = true
+    }
+
+    /// 第一次加入常用清理时出现一次安全说明，之后不再重复。
+    private func requestAddToQuickClean(_ items: [CacheItem]) {
+        if quickCleanHintAcknowledged {
+            store.addToQuickClean(items)
+            return
+        }
+        pendingQuickCleanItems = items
+        showingQuickCleanHint = true
     }
 
     private func enterMiniMode() {
@@ -476,10 +612,10 @@ struct ContentView: View {
                 Label("当前选择", systemImage: "checkmark.circle")
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(.secondary)
-                Text(cleanupSize.devSweepFileSize)
+                Text(selectedCleanupSize.devSweepFileSize)
                     .font(.system(size: 28, weight: .semibold, design: .rounded))
                     .foregroundStyle(.tint)
-                Text("\(cleanupItems.count) 项待清理")
+                Text("\(store.selectedCleanupItems.count) 项待清理")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -552,35 +688,6 @@ struct ContentView: View {
                         }
                         .buttonStyle(.borderless)
                         .help("移除此项目根目录")
-                    }
-                    .padding(.leading, 44)
-                }
-            }
-
-            if !store.whitelistedPaths.isEmpty {
-                Divider()
-                Text("忽略名单")
-                    .font(.subheadline.weight(.semibold))
-                    .padding(.leading, 44)
-                ForEach(store.whitelistedPaths, id: \.path) { path in
-                    HStack(spacing: 8) {
-                        Image(systemName: "checkmark.shield")
-                            .foregroundStyle(.green)
-                        Text(path.devSweepDisplayPath)
-                            .font(.caption.monospaced())
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                            .textSelection(.enabled)
-                            .help(path.path)
-                        Spacer()
-                        Button {
-                            store.removeFromWhitelist(path)
-                        } label: {
-                            Image(systemName: "xmark.circle")
-                        }
-                        .buttonStyle(.borderless)
-                        .help("移出忽略名单")
-                        .disabled(store.isScanning || store.isCleaning)
                     }
                     .padding(.leading, 44)
                 }
@@ -675,8 +782,33 @@ struct ContentView: View {
         .frame(maxWidth: .infinity, minHeight: 260, maxHeight: 260)
     }
 
+    /// 列表头 checkbox：□ 全未选 / − 部分已选 / ✓ 全部已选。
+    private var visibleSelectionStateIcon: String {
+        let selectable = visibleItems.filter { $0.risk != .manual }
+        guard !selectable.isEmpty else { return "square" }
+        if selectable.allSatisfy(\.isSelected) { return "checkmark.square.fill" }
+        if selectable.contains(where: \.isSelected) { return "minus.square" }
+        return "square"
+    }
+
+    private var allVisibleSelected: Bool {
+        let selectable = visibleItems.filter { $0.risk != .manual }
+        return !selectable.isEmpty && selectable.allSatisfy(\.isSelected)
+    }
+
     private var toolbar: some View {
         HStack(spacing: 12) {
+            Button {
+                store.setVisibleSelected(visibleItems, selected: !allVisibleSelected)
+            } label: {
+                Image(systemName: visibleSelectionStateIcon)
+                    .font(.body.weight(.medium))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.tint)
+            .disabled(visibleItems.isEmpty || store.isScanning || store.isCleaning)
+            .help(allVisibleSelected ? "取消当前显示选择" : "全选当前显示")
+
             Label("筛选", systemImage: "line.3.horizontal.decrease.circle")
                 .font(.subheadline.weight(.medium))
                 .foregroundStyle(.secondary)
@@ -684,23 +816,37 @@ struct ContentView: View {
                 .frame(height: 20)
             Toggle("只看已选", isOn: $onlySelected)
                 .toggleStyle(.checkbox)
+            Toggle("常用清理", isOn: $onlyQuickClean)
+                .toggleStyle(.checkbox)
             Toggle("只看大于 1 GB", isOn: $onlyLarge)
                 .toggleStyle(.checkbox)
             Spacer()
-            Text("显示 \(visibleItems.count) 项")
+            Text("显示 \(visibleItems.count) 项 · 已选 \(store.selectedCleanupItems.count) 项")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Menu {
-                Button("全选当前分类") {
-                    store.setAllSelected(true, category: selectedCategory == "全部" ? nil : selectedCategory)
+                Button("全选当前显示") {
+                    store.setVisibleSelected(visibleItems, selected: true)
                 }
-                Button("取消选择") {
-                    store.setAllSelected(false, category: selectedCategory == "全部" ? nil : selectedCategory)
+                Button("取消当前显示选择") {
+                    store.setVisibleSelected(visibleItems, selected: false)
+                }
+                Divider()
+                Button {
+                    requestAddToQuickClean(store.selectedCleanupItems)
+                } label: {
+                    Label("加入常用清理", systemImage: "bolt.fill")
+                }
+                Button {
+                    store.addToWhitelist(store.selectedCleanupItems)
+                } label: {
+                    Label("加入白名单", systemImage: "checkmark.shield")
                 }
             } label: {
-                Label("选择", systemImage: "checkmark.circle")
+                Label("操作", systemImage: "ellipsis.circle")
             }
             .menuStyle(.borderlessButton)
+            .disabled(store.isScanning || store.isCleaning)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
@@ -712,21 +858,25 @@ struct ContentView: View {
             Image(systemName: "checkmark.shield")
                 .foregroundStyle(.green)
             VStack(alignment: .leading, spacing: 2) {
-                Text(cleanupItems.isEmpty ? "选择项目后开始清理" : "准备清理 \(cleanupItems.count) 项")
+                Text(store.selectedCleanupItems.isEmpty
+                    ? "选择项目后开始清理"
+                    : "已选 \(store.selectedCleanupItems.count) 项 · \(selectedCleanupSize.devSweepFileSize)")
                     .font(.subheadline.weight(.medium))
-                Text(cleanupIncludesNonRecoverable ? "包含官方工具或设备清理，执行后不可从废纸篓恢复" : "清理会优先移入废纸篓，不直接永久删除")
+                Text(selectedCleanupIncludesNonRecoverable
+                    ? "包含官方工具或设备清理，执行后不可从废纸篓恢复"
+                    : "普通目录将移入废纸篓，可随时恢复")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             Spacer()
             Button {
-                pendingCleanupItems = cleanupItems
+                pendingCleanupItems = store.selectedCleanupItems
                 showingConfirmation = true
             } label: {
-                Label("清理当前页选中项目", systemImage: "trash")
+                Label("清理 \(store.selectedCleanupItems.count) 项", systemImage: "trash")
             }
             .buttonStyle(.borderedProminent)
-            .disabled(cleanupItems.isEmpty || store.isCleaning || store.isScanning)
+            .disabled(store.selectedCleanupItems.isEmpty || store.isCleaning || store.isScanning)
         }
         .padding(.horizontal, 24)
         .padding(.vertical, 12)
@@ -764,15 +914,333 @@ struct ContentView: View {
     }
 }
 
+/// 顶部短暂提示（1.5～2 秒自动消失），与常驻 statusMessage 分开。
+private struct TransientNoticeView: View {
+    let notice: TransientNotice
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: notice.icon)
+                .foregroundStyle(notice.icon.hasPrefix("exclamation") ? Color.orange : Color.green)
+            Text(notice.text)
+                .font(.subheadline.weight(.medium))
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.regularMaterial, in: Capsule())
+        .overlay {
+            Capsule().stroke(Color.primary.opacity(0.08))
+        }
+        .shadow(color: .black.opacity(0.12), radius: 8, y: 2)
+    }
+}
+
+/// 常用清理页面：独立展示长期授权目录，不要求先完整扫描。
+private struct QuickCleanPageView: View {
+    @EnvironmentObject private var store: DevSweepStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            QuickCleanHeaderCard(
+                cleanableCount: store.cleanableQuickCleanSnapshots.count,
+                cleanableSize: store.quickCleanSize,
+                isBusy: store.isCleaning || store.isScanning,
+                onCleanAll: { store.cleanAllQuickClean() }
+            )
+
+            if store.quickCleanEntries.isEmpty {
+                QuickCleanEmptyView()
+            } else {
+                VStack(spacing: 10) {
+                    ForEach(store.quickCleanEntries) { entry in
+                        QuickCleanEntryRow(
+                            entry: entry,
+                            snapshot: store.quickCleanSnapshots.first { $0.id == entry.id },
+                            onClean: { store.cleanQuickClean([entry]) }
+                        )
+                    }
+                }
+            }
+        }
+        .onAppear {
+            store.refreshQuickCleanSnapshots()
+        }
+    }
+}
+
+private struct QuickCleanHeaderCard: View {
+    let cleanableCount: Int
+    let cleanableSize: Int64
+    let isBusy: Bool
+    let onCleanAll: () -> Void
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Image(systemName: "bolt.fill")
+                .font(.title3)
+                .foregroundStyle(.tint)
+                .frame(width: 34, height: 34)
+                .background(Color.accentColor.opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+            VStack(alignment: .leading, spacing: 3) {
+                Text("你长期授权的可再生成目录")
+                    .font(.subheadline.weight(.semibold))
+                Text("这些目录清理后重新出现，仍可继续一键清理；全部通过废纸篓，可恢复。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 12)
+            VStack(alignment: .trailing, spacing: 2) {
+                Text("当前可清理")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text("\(cleanableCount) 项 · \(cleanableSize.devSweepFileSize)")
+                    .font(.subheadline.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(.tint)
+            }
+            Button {
+                onCleanAll()
+            } label: {
+                Label("一键清理全部", systemImage: "bolt.fill")
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(cleanableCount == 0 || isBusy)
+            .help("常用清理已代表长期授权，点击后直接移入废纸篓，不再二次确认")
+        }
+        .padding(16)
+        .background(.background)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.primary.opacity(0.08))
+        }
+    }
+}
+
+private struct QuickCleanEntryRow: View {
+    @EnvironmentObject private var store: DevSweepStore
+    let entry: QuickCleanEntry
+    let snapshot: QuickCleanSnapshot?
+    let onClean: () -> Void
+
+    private var pathURL: URL {
+        URL(fileURLWithPath: entry.path)
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "folder")
+                .font(.title3)
+                .foregroundStyle(.tint)
+                .frame(width: 32, height: 32)
+                .background(Color.accentColor.opacity(0.10))
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(entry.displayName)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                Text(pathURL.devSweepDisplayPath)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+                    .help(Text(verbatim: entry.path))
+            }
+            Spacer(minLength: 12)
+            VStack(alignment: .trailing, spacing: 4) {
+                Text(statusText)
+                    .font(.subheadline.monospacedDigit().weight(.medium))
+                    .foregroundStyle(snapshot?.exists == true ? Color.primary : Color.secondary)
+                Text(entry.dateAdded.formatted(date: .abbreviated, time: .omitted))
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            .frame(minWidth: 110, alignment: .trailing)
+
+            Button("清理") {
+                onClean()
+            }
+            .buttonStyle(.bordered)
+            .disabled(canClean == false)
+            .help("直接移入废纸篓")
+
+            Menu {
+                Button {
+                    store.removeFromQuickClean(entry)
+                } label: {
+                    Label("移出常用清理", systemImage: "bolt.slash")
+                }
+                .disabled(store.isScanning || store.isCleaning)
+
+                Divider()
+
+                Button {
+                    NSWorkspace.shared.open(pathURL)
+                } label: {
+                    Label("打开文件夹", systemImage: "folder")
+                }
+                .disabled(snapshot?.exists != true)
+
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(entry.path, forType: .string)
+                } label: {
+                    Label("复制完整路径", systemImage: "doc.on.doc")
+                }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+            }
+            .menuStyle(.borderlessButton)
+            .help("操作")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .background(.background)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.primary.opacity(0.07))
+        }
+    }
+
+    private var canClean: Bool {
+        guard let snapshot, snapshot.exists, snapshot.fileIdentity != nil else { return false }
+        return !store.isScanning && !store.isCleaning
+    }
+
+    private var statusText: String {
+        guard let snapshot else { return "检查中…" }
+        return snapshot.exists ? snapshot.size.devSweepFileSize : "当前无内容"
+    }
+}
+
+private struct QuickCleanEmptyView: View {
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "bolt.slash")
+                .font(.system(size: 42))
+                .foregroundStyle(.secondary)
+            Text("还没有常用清理目录")
+                .font(.headline)
+            Text("在扫描结果中找到 node_modules、target、DerivedData 等可重新生成目录，点 ⋯ 选择「加入常用清理」。之后即使目录被清理后重新生成，也可以在这里一键清理。")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 560)
+        }
+        .frame(maxWidth: .infinity, minHeight: 220)
+        .padding(.top, 20)
+    }
+}
+
+/// 白名单页面：这些目录永远不会出现在清理结果中。
+private struct WhitelistPageView: View {
+    @EnvironmentObject private var store: DevSweepStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 14) {
+                Image(systemName: "checkmark.shield.fill")
+                    .font(.title3)
+                    .foregroundStyle(.green)
+                    .frame(width: 34, height: 34)
+                    .background(Color.green.opacity(0.12))
+                    .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("这些目录不会出现在清理结果中")
+                        .font(.subheadline.weight(.semibold))
+                    Text("即使再次扫描也不会被清理；移出白名单后会立即恢复最近一次扫描结果。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 12)
+                Text("\(store.whitelistedPaths.count) 个目录")
+                    .font(.subheadline.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(16)
+            .background(.background)
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(Color.primary.opacity(0.08))
+            }
+
+            if store.whitelistedPaths.isEmpty {
+                VStack(spacing: 12) {
+                    Image(systemName: "checkmark.shield")
+                        .font(.system(size: 42))
+                        .foregroundStyle(.secondary)
+                    Text("白名单是空的")
+                        .font(.headline)
+                    Text("在扫描结果的 ⋯ 菜单中选择「加入白名单」，被保护的目录会立即从清理结果中消失。")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 560)
+                }
+                .frame(maxWidth: .infinity, minHeight: 220)
+                .padding(.top, 20)
+            } else {
+                VStack(spacing: 10) {
+                    ForEach(store.whitelistedPaths, id: \.path) { path in
+                        WhitelistRow(path: path) {
+                            store.removeFromWhitelist(path)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct WhitelistRow: View {
+    @EnvironmentObject private var store: DevSweepStore
+    let path: URL
+    let onRemove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "folder")
+                .foregroundStyle(.secondary)
+            Text(path.devSweepDisplayPath)
+                .font(.caption.monospaced())
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+                .help(Text(verbatim: path.path))
+            Spacer(minLength: 8)
+            Button("移出") {
+                onRemove()
+            }
+            .buttonStyle(.bordered)
+            .disabled(store.isScanning || store.isCleaning)
+            .help("移出白名单后立即恢复最近一次扫描结果")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(.background)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.primary.opacity(0.07))
+        }
+    }
+}
+
 private struct MiniModeView: View {
     @EnvironmentObject private var store: DevSweepStore
 
     let hasScanReport: Bool
     let onExit: () -> Void
     let onCleanup: ([CacheItem]) -> Void
+    let onAddToQuickClean: (CacheItem) -> Void
 
+    /// Mini 模式与普通模式使用同一个清理范围计算，切换模式不改变执行内容。
     private var cleanupItems: [CacheItem] {
-        CleanupSelection.selectedItems(from: store.items, visibleItems: store.items)
+        store.selectedCleanupItems
     }
 
     private var cleanupSize: Int64 {
@@ -850,7 +1318,7 @@ private struct MiniModeView: View {
 
     private var mainContent: some View {
         Group {
-            if store.isScanning {
+            if store.isScanning && !hasScanReport {
                 scanningState
             } else {
                 VStack(alignment: .leading, spacing: 12) {
@@ -944,7 +1412,7 @@ private struct MiniModeView: View {
         ScrollView {
             LazyVStack(spacing: 8) {
                 ForEach(store.items) { item in
-                    MiniItemRow(item: item)
+                    MiniItemRow(item: item, onAddToQuickClean: onAddToQuickClean)
                 }
             }
             .padding(.bottom, 2)
@@ -1010,11 +1478,11 @@ private struct MiniModeView: View {
         VStack(spacing: 10) {
             HStack(spacing: 8) {
                 Menu {
-                    Button("全选可清理项目") {
-                        store.setAllSelected(true)
+                    Button("全选当前显示") {
+                        store.setVisibleSelected(store.items, selected: true)
                     }
-                    Button("取消选择") {
-                        store.setAllSelected(false)
+                    Button("取消当前显示选择") {
+                        store.setVisibleSelected(store.items, selected: false)
                     }
                 } label: {
                     Label("选择", systemImage: "checkmark.circle")
@@ -1076,6 +1544,11 @@ private struct MiniModeView: View {
 private struct MiniItemRow: View {
     @EnvironmentObject private var store: DevSweepStore
     let item: CacheItem
+    let onAddToQuickClean: (CacheItem) -> Void
+
+    private var isQuickClean: Bool {
+        store.isQuickClean(item)
+    }
 
     var body: some View {
         HStack(spacing: 8) {
@@ -1085,16 +1558,24 @@ private struct MiniItemRow: View {
             ))
             .labelsHidden()
             .toggleStyle(.checkbox)
-            .disabled(item.risk == .manual)
+            .disabled(item.risk == .manual || store.isScanning || store.isCleaning)
 
             Circle()
                 .fill(item.risk.color)
                 .frame(width: 7, height: 7)
 
             VStack(alignment: .leading, spacing: 1) {
-                Text(item.name)
-                    .font(.caption.weight(.semibold))
-                    .lineLimit(1)
+                HStack(spacing: 5) {
+                    Text(item.name)
+                        .font(.caption.weight(.semibold))
+                        .lineLimit(1)
+                    if isQuickClean {
+                        Image(systemName: "bolt.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.tint)
+                            .help("已加入常用清理")
+                    }
+                }
                 Text(item.details)
                     .font(.caption2.monospaced())
                     .foregroundStyle(.secondary)
@@ -1113,6 +1594,39 @@ private struct MiniItemRow: View {
         .background(.background)
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .contentShape(Rectangle())
+        .contextMenu {
+            if isQuickClean {
+                Button {
+                    store.removeFromQuickClean(paths: [item.path])
+                } label: {
+                    Label("移出常用清理", systemImage: "bolt.slash")
+                }
+            } else {
+                Button {
+                    onAddToQuickClean(item)
+                } label: {
+                    Label("加入常用清理", systemImage: "bolt.fill")
+                }
+                .disabled(item.kind != .trash || item.risk == .manual)
+            }
+            Button {
+                store.addToWhitelist([item])
+            } label: {
+                Label("加入白名单", systemImage: "checkmark.shield")
+            }
+            Divider()
+            Button {
+                NSWorkspace.shared.open(item.path)
+            } label: {
+                Label("打开文件夹", systemImage: "folder")
+            }
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(item.path.path, forType: .string)
+            } label: {
+                Label("复制路径", systemImage: "doc.on.doc")
+            }
+        }
     }
 }
 
@@ -1120,7 +1634,7 @@ private struct SidebarRow: View {
     let title: String
     let subtitle: String
     let icon: String
-    let size: Int64
+    let size: Int64?
 
     var body: some View {
         HStack(spacing: 10) {
@@ -1135,9 +1649,11 @@ private struct SidebarRow: View {
                     .foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
-            Text(size.devSweepFileSize)
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
+            if let size {
+                Text(size.devSweepFileSize)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding(.vertical, 4)
     }
@@ -1147,6 +1663,15 @@ private struct CacheItemRow: View {
     @EnvironmentObject private var store: DevSweepStore
     let item: CacheItem
     let onClean: (CacheItem) -> Void
+    let onAddToQuickClean: (CacheItem) -> Void
+
+    private var isQuickClean: Bool {
+        store.isQuickClean(item)
+    }
+
+    private var actionsDisabled: Bool {
+        store.isScanning || store.isCleaning
+    }
 
     var body: some View {
         HStack(spacing: 12) {
@@ -1156,7 +1681,7 @@ private struct CacheItemRow: View {
             ))
             .labelsHidden()
             .toggleStyle(.checkbox)
-            .disabled(item.risk == .manual)
+            .disabled(item.risk == .manual || actionsDisabled)
 
             Image(systemName: icon)
                 .font(.title3)
@@ -1170,7 +1695,11 @@ private struct CacheItemRow: View {
                     Text(item.name)
                         .font(.subheadline.weight(.semibold))
                         .lineLimit(1)
+                    // Badge 顺序：风险 → 常用清理。
                     RiskBadge(risk: item.risk)
+                    if isQuickClean {
+                        QuickCleanBadge()
+                    }
                 }
                 Text(item.details)
                     .font(.caption2.monospaced())
@@ -1196,19 +1725,37 @@ private struct CacheItemRow: View {
             }
             .frame(minWidth: 92, alignment: .trailing)
             Menu {
+                if isQuickClean {
+                    Button {
+                        store.removeFromQuickClean(paths: [item.path])
+                    } label: {
+                        Label("移出常用清理", systemImage: "bolt.slash")
+                    }
+                    .disabled(actionsDisabled)
+                } else {
+                    Button {
+                        onAddToQuickClean(item)
+                    } label: {
+                        Label("加入常用清理", systemImage: "bolt.fill")
+                    }
+                    .disabled(item.kind != .trash || item.risk == .manual || actionsDisabled)
+                }
+
                 Button {
                     store.addToWhitelist([item])
                 } label: {
                     Label("加入白名单", systemImage: "checkmark.shield")
                 }
-                .disabled(store.isScanning || store.isCleaning)
+                .disabled(actionsDisabled)
+
+                Divider()
 
                 Button {
                     NSWorkspace.shared.open(item.path)
                 } label: {
                     Label("打开文件夹", systemImage: "folder")
                 }
-                .disabled(item.kind == .dockerPrune || store.isScanning || store.isCleaning)
+                .disabled(item.kind == .dockerPrune || actionsDisabled)
 
                 Button {
                     NSPasteboard.general.clearContents()
@@ -1216,7 +1763,7 @@ private struct CacheItemRow: View {
                 } label: {
                     Label("复制完整路径", systemImage: "doc.on.doc")
                 }
-                .disabled(store.isScanning || store.isCleaning)
+                .disabled(actionsDisabled)
 
                 Divider()
 
@@ -1225,7 +1772,7 @@ private struct CacheItemRow: View {
                 } label: {
                     Label("清理这一项", systemImage: "trash")
                 }
-                .disabled(item.risk == .manual || store.isScanning || store.isCleaning)
+                .disabled(item.risk == .manual || actionsDisabled)
             } label: {
                 Image(systemName: "ellipsis.circle")
             }
@@ -1268,6 +1815,19 @@ private struct CacheItemRow: View {
     }
 }
 
+/// 常用清理标识：扁平、小尺寸、accent tint；不再使用已被大量占用的 sparkles。
+private struct QuickCleanBadge: View {
+    var body: some View {
+        Label("常用清理", systemImage: "bolt.fill")
+            .font(.caption2.weight(.medium))
+            .foregroundStyle(.tint)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(Color.accentColor.opacity(0.11))
+            .clipShape(Capsule())
+    }
+}
+
 private struct RiskBadge: View {
     let risk: RiskLevel
 
@@ -1283,9 +1843,8 @@ private struct RiskBadge: View {
 }
 
 private struct EmptyStateView: View {
-    let selectedCategory: String
-    let onlyLarge: Bool
-    let hasScanReport: Bool
+    let title: String
+    let message: String
 
     var body: some View {
         VStack(spacing: 12) {
@@ -1300,16 +1859,6 @@ private struct EmptyStateView: View {
                 .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity, minHeight: 220)
-    }
-
-    private var title: String {
-        guard hasScanReport else { return "准备开始扫描" }
-        return selectedCategory == "全部" ? "没有发现符合条件的项目" : "这个分类目前很干净"
-    }
-
-    private var message: String {
-        guard hasScanReport else { return "点击右上角“开始扫描”，扫描完成后这里会显示可清理项目。" }
-        return onlyLarge ? "当前筛选只显示大于 1 GB 的项目，可以关闭筛选查看较小缓存。" : "可以重新扫描，或添加一个项目根目录来查找嵌套生成物。"
     }
 }
 
@@ -1404,9 +1953,13 @@ struct HelpView: View {
                 .font(.headline)
             Text("只扫描白名单开发者路径，以及你主动添加的项目目录。项目目录只匹配生成物名称，不会把源码、照片、文档或 Docker 虚拟磁盘当作缓存。")
                 .foregroundStyle(.secondary)
+            Text("四种状态")
+                .font(.headline)
+            Text("已选择：本次准备清理。常用清理：长期授权的可再生成目录，可随时一键清理。白名单：永远忽略，不允许清理。白名单保护优先于一切清理授权。")
+                .foregroundStyle(.secondary)
             Text("清理方式")
                 .font(.headline)
-            Text("普通缓存和 XCTest 克隆设备移入 macOS 废纸篓；CoreSimulator 设备使用 simctl 删除以保持设备注册一致；Docker 资源使用官方 CLI 清理且不可恢复。红色项目不会自动删除，橙色项目默认不勾选。")
+            Text("普通缓存和 XCTest 克隆设备移入 macOS 废纸篓；常用清理目录同样移入废纸篓且不再二次确认；CoreSimulator 设备使用 simctl 删除以保持设备注册一致；Docker 资源使用官方 CLI 清理且不可恢复。红色项目不会自动删除，橙色项目默认不勾选。")
                 .foregroundStyle(.secondary)
             Text("开源参考")
                 .font(.headline)

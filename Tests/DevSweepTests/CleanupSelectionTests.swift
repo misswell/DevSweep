@@ -45,16 +45,17 @@ final class CleanupSelectionTests: XCTestCase {
         XCTAssertEqual(paths.map(\.path), ["/tmp/other", "/tmp/project/target"])
     }
 
-    func testSelectionIsScopedToVisibleItems() {
-        let currentPageItem = CacheItem(
+    /// 选择状态是全局状态：过滤掉（当前不显示）的项目仍然是清理候选，
+    /// 过滤器绝对不能偷偷改变清理范围。
+    func testSelectionIsNotScopedToVisibleItems() {
+        let visibleUnselectedItem = CacheItem(
             category: "Rust / Tauri 项目",
-            name: "target",
-            path: URL(fileURLWithPath: "/tmp/rust-target"),
+            name: "visible-target",
+            path: URL(fileURLWithPath: "/tmp/visible-target"),
             size: 1,
-            risk: .review,
             isSelected: false
         )
-        let itemSelectedOnAnotherPage = CacheItem(
+        let hiddenSelectedItem = CacheItem(
             category: "Xcode",
             name: "DerivedData",
             path: URL(fileURLWithPath: "/tmp/derived-data"),
@@ -62,43 +63,30 @@ final class CleanupSelectionTests: XCTestCase {
             isSelected: true
         )
 
-        let selected = CleanupSelection.selectedItems(
-            from: [currentPageItem, itemSelectedOnAnotherPage],
-            visibleItems: [currentPageItem]
-        )
+        let selected = CleanupSelection.selectedItems(from: [visibleUnselectedItem, hiddenSelectedItem])
 
-        XCTAssertTrue(selected.isEmpty)
+        XCTAssertEqual(selected.map(\.id), [hiddenSelectedItem.id])
     }
 
-    func testSelectionIncludesOnlyVisibleSelectedItems() {
-        let selectedCurrentPageItem = CacheItem(
+    func testSelectionIncludesOnlySelectedItems() {
+        let selectedItem = CacheItem(
             category: "Rust / Tauri 项目",
             name: "selected-target",
             path: URL(fileURLWithPath: "/tmp/selected-target"),
             size: 1,
             isSelected: true
         )
-        let unselectedCurrentPageItem = CacheItem(
+        let unselectedItem = CacheItem(
             category: "Rust / Tauri 项目",
             name: "unselected-target",
             path: URL(fileURLWithPath: "/tmp/unselected-target"),
             size: 2,
             isSelected: false
         )
-        let selectedOtherPageItem = CacheItem(
-            category: "Xcode",
-            name: "selected-derived-data",
-            path: URL(fileURLWithPath: "/tmp/selected-derived-data"),
-            size: 3,
-            isSelected: true
-        )
 
-        let selected = CleanupSelection.selectedItems(
-            from: [selectedCurrentPageItem, unselectedCurrentPageItem, selectedOtherPageItem],
-            visibleItems: [selectedCurrentPageItem, unselectedCurrentPageItem]
-        )
+        let selected = CleanupSelection.selectedItems(from: [selectedItem, unselectedItem])
 
-        XCTAssertEqual(selected.map(\.id), [selectedCurrentPageItem.id])
+        XCTAssertEqual(selected.map(\.id), [selectedItem.id])
     }
 
     func testManualItemsAreNeverCleanupCandidates() {
@@ -111,36 +99,9 @@ final class CleanupSelectionTests: XCTestCase {
             isSelected: true
         )
 
-        let selected = CleanupSelection.selectedItems(
-            from: [manualItem],
-            visibleItems: [manualItem]
-        )
+        let selected = CleanupSelection.selectedItems(from: [manualItem])
 
         XCTAssertTrue(selected.isEmpty)
-    }
-
-    func testSelectionFollowsFilteredVisibleItems() {
-        let visibleLargeItem = CacheItem(
-            category: "Rust / Tauri 项目",
-            name: "large-target",
-            path: URL(fileURLWithPath: "/tmp/large-target"),
-            size: 2,
-            isSelected: true
-        )
-        let filteredOutSmallItem = CacheItem(
-            category: "Rust / Tauri 项目",
-            name: "small-target",
-            path: URL(fileURLWithPath: "/tmp/small-target"),
-            size: 1,
-            isSelected: true
-        )
-
-        let selected = CleanupSelection.selectedItems(
-            from: [visibleLargeItem, filteredOutSmallItem],
-            visibleItems: [visibleLargeItem]
-        )
-
-        XCTAssertEqual(selected.map(\.id), [visibleLargeItem.id])
     }
 
     func testRemainingItemsRemovesOnlySuccessfullyCleanedItems() {
