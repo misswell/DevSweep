@@ -107,13 +107,22 @@ enum SidebarDestination: Hashable {
     case category(String)
 }
 
+/// 「只看大于」筛选的候选阈值，从 100 MB 到 1 GB。
+private struct LargeThresholdOption: Identifiable {
+    let label: String
+    let megabytes: Int
+
+    var id: Int { megabytes }
+}
+
 struct ContentView: View {
     @EnvironmentObject private var store: DevSweepStore
     @EnvironmentObject private var updater: DevSweepSoftwareUpdater
     @State private var destination: SidebarDestination = .all
     @State private var onlySelected = false
     @State private var onlyQuickClean = false
-    @State private var onlyLarge = false
+    @AppStorage("DevSweep.onlyLarge") private var onlyLarge = false
+    @AppStorage("DevSweep.largeThresholdMB") private var largeThresholdMB = 1_024
     @State private var showingConfirmation = false
     @State private var showingQuickCleanHint = false
     @State private var showingError = false
@@ -126,7 +135,27 @@ struct ContentView: View {
     @AppStorage("DevSweep.miniMode") private var miniMode = false
     @AppStorage("DevSweep.quickCleanHintAcknowledged") private var quickCleanHintAcknowledged = false
 
-    private let largeThreshold: Int64 = 1 * 1024 * 1024 * 1024
+    private static let largeThresholdOptions: [LargeThresholdOption] = [
+        .init(label: "100 MB", megabytes: 100),
+        .init(label: "200 MB", megabytes: 200),
+        .init(label: "300 MB", megabytes: 300),
+        .init(label: "400 MB", megabytes: 400),
+        .init(label: "500 MB", megabytes: 500),
+        .init(label: "600 MB", megabytes: 600),
+        .init(label: "700 MB", megabytes: 700),
+        .init(label: "800 MB", megabytes: 800),
+        .init(label: "900 MB", megabytes: 900),
+        .init(label: "1 GB", megabytes: 1_024),
+    ]
+
+    private var largeThreshold: Int64 {
+        Int64(largeThresholdMB) * 1_024 * 1_024
+    }
+
+    private var largeThresholdLabel: String {
+        Self.largeThresholdOptions.first { $0.megabytes == largeThresholdMB }?.label
+            ?? "\(largeThresholdMB) MB"
+    }
 
     private var showsCacheList: Bool {
         switch destination {
@@ -516,7 +545,7 @@ struct ContentView: View {
             return "点击右上角“开始扫描”，扫描完成后这里会显示可清理项目。"
         }
         return onlyLarge
-            ? "当前筛选只显示大于 1 GB 的项目，可以关闭筛选查看较小缓存。"
+            ? "当前筛选只显示大于 \(largeThresholdLabel) 的项目，可以关闭筛选查看较小缓存。"
             : "可以重新扫描，或添加一个项目根目录来查找嵌套生成物。"
     }
 
@@ -818,8 +847,18 @@ struct ContentView: View {
                 .toggleStyle(.checkbox)
             Toggle("常用清理", isOn: $onlyQuickClean)
                 .toggleStyle(.checkbox)
-            Toggle("只看大于 1 GB", isOn: $onlyLarge)
+            Toggle("只看大于", isOn: $onlyLarge)
                 .toggleStyle(.checkbox)
+            Picker("大文件阈值", selection: $largeThresholdMB) {
+                ForEach(Self.largeThresholdOptions) { option in
+                    Text(verbatim: option.label).tag(option.megabytes)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .fixedSize()
+            .disabled(!onlyLarge)
+            .help("选择“只看大于”的文件大小阈值")
             Spacer()
             Text("显示 \(visibleItems.count) 项 · 已选 \(store.selectedCleanupItems.count) 项")
                 .font(.caption)
