@@ -150,12 +150,13 @@ final class QuickCleanAndStoreRulesTests: XCTestCase {
         XCTAssertTrue(store.quickCleanEntries.isEmpty)
     }
 
-    /// 场景 9：普通文件不能进入常用清理，只允许目录。
+    /// 普通数据库等未识别文件不能进入常用清理。
     func testQuickCleanRejectsPlainFiles() throws {
         let store = makeStore()
-        let file = try makeTemporaryDirectory().appendingPathComponent("logs.sqlite")
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("logs.sqlite")
         try Data("db".utf8).write(to: file)
-        defer { try? FileManager.default.removeItem(at: file) }
 
         let item = makeCacheItem(name: "log db", path: file)
         let result = store.addToQuickClean([item])
@@ -163,6 +164,96 @@ final class QuickCleanAndStoreRulesTests: XCTestCase {
         XCTAssertEqual(result.added, 0)
         XCTAssertTrue(store.quickCleanEntries.isEmpty)
         XCTAssertThrowsError(try DeletionValidator.validateQuickCleanRegistration(path: file))
+    }
+
+    func testUpdateArchivesCanJoinQuickCleanAndBeExecutedAfterRegeneration() throws {
+        let store = makeStore()
+        let home = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let updater = home.appendingPathComponent("Library/Caches/xiaomi-mimo-desktop-updater")
+        let files = [updater.appendingPathComponent("update.zip"), updater.appendingPathComponent("pending/app-1.2.3-arm64-mac.zip")]
+        for file in files {
+            try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(repeating: 0xA5, count: 1_100_000).write(to: file)
+        }
+        let report = CacheScanner.scan(
+            projectRoots: [], deepScan: false, home: home, includeSystemCaches: false,
+            progress: { _ in }, environment: [:]
+        )
+        let archives = report.items.filter { files.contains($0.path) }
+        XCTAssertEqual(archives.count, 2)
+        store.applyScanResult(report)
+        for item in archives {
+            let result = store.addToQuickClean([item])
+            XCTAssertEqual(result.added, 1, item.path.lastPathComponent)
+            XCTAssertTrue(store.isQuickClean(item), item.path.lastPathComponent)
+        }
+        XCTAssertEqual(QuickCleanInspector.executableItems(for: store.quickCleanEntries).count, 2)
+        let entry = try XCTUnwrap(store.quickCleanEntries.first)
+        let file = URL(fileURLWithPath: entry.path)
+        try FileManager.default.removeItem(at: file)
+        XCTAssertFalse(QuickCleanInspector.snapshot(for: entry).exists)
+        try Data("new installer".utf8).write(to: file)
+        let executable = QuickCleanInspector.executableItems(for: [entry])
+        XCTAssertEqual(executable.count, 1)
+        XCTAssertEqual(executable.first?.expectedFileIdentity, FileIdentity.capture(file))
+        try DeletionValidator.validate(item: XCTUnwrap(executable.first), context: DeletionContext(
+            whitelistedPaths: [], projectRoots: [], allowedPaths: [file]
+        ))
+        XCTAssertThrowsError(try DeletionValidator.validate(item: XCTUnwrap(executable.first), context: DeletionContext(
+            whitelistedPaths: [file], projectRoots: [], allowedPaths: [file]
+        )))
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: XCTUnwrap(defaultsSuiteName)))
+        let restarted = DevSweepStore(defaults: defaults)
+        XCTAssertEqual(restarted.quickCleanEntries.count, 2)
+        XCTAssertTrue(restarted.quickCleanEntries.allSatisfy(\.isUpdateArchive))
+        XCTAssertEqual(QuickCleanInspector.executableItems(for: restarted.quickCleanEntries).count, 2)
+    }
+
+    func testArchiveAuthorizationRejectsTypeChangesSymlinksAndUnrelatedFiles() throws {
+        let store = makeStore()
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let archive = directory.appendingPathComponent("update.zip")
+        try Data("installer".utf8).write(to: archive)
+        let item = CacheItem(category: "应用缓存", name: "软件更新安装包", path: archive, size: 9, risk: .review)
+        XCTAssertEqual(store.addToQuickClean([item]).added, 1)
+        let entry = try XCTUnwrap(store.quickCleanEntries.first)
+
+        // 相同路径若被替换成目录，不能扩大原来的文件授权。
+        try FileManager.default.removeItem(at: archive)
+        try makeAllocatedDirectory(at: archive)
+        let secondSuite = "DevSweepTypeChange-\(UUID().uuidString)"
+        defer { UserDefaults().removePersistentDomain(forName: secondSuite) }
+        let secondStore = DevSweepStore(defaults: UserDefaults(suiteName: secondSuite)!)
+        XCTAssertEqual(secondStore.addToQuickClean([item]).added, 0)
+        XCTAssertFalse(QuickCleanInspector.snapshot(for: entry).exists)
+        XCTAssertTrue(QuickCleanInspector.executableItems(for: [entry]).isEmpty)
+        try FileManager.default.removeItem(at: archive)
+        let unrelated = directory.appendingPathComponent("customer.zip")
+        try Data("user data".utf8).write(to: unrelated)
+        try FileManager.default.createSymbolicLink(at: archive, withDestinationURL: unrelated)
+        XCTAssertFalse(QuickCleanInspector.snapshot(for: entry).exists)
+        XCTAssertTrue(QuickCleanInspector.executableItems(for: [entry]).isEmpty)
+        XCTAssertEqual(store.addToQuickClean([CacheItem(
+            category: "应用缓存", name: "软件更新安装包", path: unrelated, size: 9, risk: .review
+        )]).added, 0)
+        store.addToWhitelist([item])
+        XCTAssertTrue(store.quickCleanEntries.isEmpty)
+    }
+
+    func testLegacyQuickCleanConfigurationRemainsDirectoryOnly() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let entry = QuickCleanEntry(path: directory.path, displayName: "cache", category: "应用缓存", dateAdded: Date())
+        let data = try JSONEncoder().encode(entry)
+        let decoded = try JSONDecoder().decode(QuickCleanEntry.self, from: data)
+        XCTAssertNil(decoded.targetKind)
+        XCTAssertEqual(QuickCleanInspector.executableItems(for: [decoded]).count, 1)
+        try FileManager.default.removeItem(at: directory)
+        try Data("replacement file".utf8).write(to: directory)
+        XCTAssertFalse(QuickCleanInspector.snapshot(for: decoded).exists)
+        XCTAssertTrue(QuickCleanInspector.executableItems(for: [decoded]).isEmpty)
     }
 
     // MARK: - 常用清理与白名单互斥

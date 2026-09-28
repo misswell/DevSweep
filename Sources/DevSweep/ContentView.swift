@@ -274,7 +274,7 @@ struct ContentView: View {
                 pendingQuickCleanItems = []
             }
         } message: {
-            Text("加入常用清理后，即使该目录被清理后重新生成，以后仍可从「常用清理」中直接一键清理。仅建议用于 node_modules、target、DerivedData 等可重新生成目录。")
+            Text("加入后即授权以后直接清理同一路径的项目，可用于可重新生成目录和已识别的软件更新安装包。清理后重新生成仍可一键清理；安装包文件名改变时需重新加入。清理安装包前请确认相关应用未在更新。")
         }
         .task {
             try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -1022,9 +1022,9 @@ private struct QuickCleanHeaderCard: View {
                 .background(Color.accentColor.opacity(0.12))
                 .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
             VStack(alignment: .leading, spacing: 3) {
-                Text("你长期授权的可再生成目录")
+                Text("你长期授权的目录和更新安装包")
                     .font(.subheadline.weight(.semibold))
-                Text("这些目录清理后重新出现，仍可继续一键清理；全部通过废纸篓，可恢复。")
+                Text("同一路径重新生成后仍可一键清理；文件名改变需重新加入。全部移入废纸篓，可恢复。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -1068,7 +1068,7 @@ private struct QuickCleanEntryRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: "folder")
+            Image(systemName: entry.isUpdateArchive ? "archivebox" : "folder")
                 .font(.title3)
                 .foregroundStyle(.tint)
                 .frame(width: 32, height: 32)
@@ -1116,9 +1116,9 @@ private struct QuickCleanEntryRow: View {
                 Divider()
 
                 Button {
-                    NSWorkspace.shared.open(pathURL)
+                    NSWorkspace.shared.activateFileViewerSelecting([pathURL])
                 } label: {
-                    Label("打开文件夹", systemImage: "folder")
+                    Label("在 Finder 中显示", systemImage: "folder")
                 }
                 .disabled(snapshot?.exists != true)
 
@@ -1161,9 +1161,9 @@ private struct QuickCleanEmptyView: View {
             Image(systemName: "bolt.slash")
                 .font(.system(size: 42))
                 .foregroundStyle(.secondary)
-            Text("还没有常用清理目录")
+            Text("还没有常用清理项目")
                 .font(.headline)
-            Text("在扫描结果中找到 node_modules、target、DerivedData 等可重新生成目录，点 ⋯ 选择「加入常用清理」。之后即使目录被清理后重新生成，也可以在这里一键清理。")
+            Text("在扫描结果中找到可重新生成目录或软件更新安装包，点 ⋯ 选择「加入常用清理」。同一路径重新生成后，可以在这里一键清理。")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -1850,7 +1850,7 @@ private struct CacheItemRow: View {
         case .dockerPrune: return "Docker 资源"
         case .toolCommand: return "官方清理命令"
         case .requestLogTrim: return "就地裁剪日志"
-        case .trash: return "缓存目录"
+        case .trash: return item.expectedFileIdentity?.kind == .regular ? "缓存文件" : "缓存目录"
         }
     }
 }
@@ -1996,11 +1996,11 @@ struct HelpView: View {
                 .foregroundStyle(.secondary)
             Text("四种状态")
                 .font(.headline)
-            Text("已选择：本次准备清理。常用清理：长期授权的可再生成目录，可随时一键清理。白名单：永远忽略，不允许清理。白名单保护优先于一切清理授权。")
+            Text("已选择：本次准备清理。常用清理：长期授权的可再生成目录或更新安装包，可随时一键清理。白名单：永远忽略，不允许清理。白名单保护优先于一切清理授权。")
                 .foregroundStyle(.secondary)
             Text("清理方式")
                 .font(.headline)
-            Text("普通缓存和 XCTest 克隆设备移入 macOS 废纸篓；常用清理目录同样移入废纸篓且不再二次确认；CoreSimulator 设备使用 simctl 删除以保持设备注册一致；Docker 资源使用官方 CLI 清理且不可恢复。红色项目不会自动删除，橙色项目默认不勾选。")
+            Text("普通缓存和 XCTest 克隆设备移入 macOS 废纸篓；常用清理项目同样移入废纸篓且不再二次确认；CoreSimulator 设备使用 simctl 删除以保持设备注册一致；Docker 资源使用官方 CLI 清理且不可恢复。红色项目不会自动删除，橙色项目默认不勾选。")
                 .foregroundStyle(.secondary)
             Text("开源参考")
                 .font(.headline)

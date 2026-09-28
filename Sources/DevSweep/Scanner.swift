@@ -1009,7 +1009,7 @@ struct CacheScanner {
         return items
     }
 
-    private static func softwareUpdateResidueName(for url: URL, isDirectory: Bool) -> String? {
+    static func softwareUpdateResidueName(for url: URL, isDirectory: Bool) -> String? {
         let name = url.lastPathComponent
         let lowercasedName = name.lowercased()
         let hasContext = hasSoftwareUpdateContext(url)
@@ -2383,8 +2383,8 @@ final class DevSweepStore: ObservableObject {
         showTransientNotice("已移出白名单")
     }
 
-    /// 加入常用清理：只接受 Scanner 已识别、kind == .trash、非 manual 的真实目录。
-    /// Docker prune、simctl、官方工具命令、就地裁剪日志、普通文件和手动项目
+    /// 加入常用清理：接受非 manual 的真实目录，以及 Scanner 识别的软件更新安装包。
+    /// Docker prune、simctl、官方工具命令、就地裁剪日志、其他普通文件和手动项目
     /// 都不能进入。加入后扫描列表中的项目不消失，而是立即出现「常用清理」标识。
     @discardableResult
     func addToQuickClean(_ items: [CacheItem]) -> (added: Int, rejected: Int) {
@@ -2393,11 +2393,18 @@ final class DevSweepStore: ObservableObject {
         var newEntries: [QuickCleanEntry] = []
         var rejected = 0
         for item in items {
+            let isUpdateArchive = FileIdentity.capture(item.path)?.kind == .regular
+                && item.category == "应用缓存"
+                && item.name == "软件更新安装包"
+                && CacheScanner.softwareUpdateResidueName(for: item.path, isDirectory: false) != nil
             guard item.kind == .trash,
                   item.risk != .manual,
+                  item.expectedFileIdentity == FileIdentity.capture(item.path),
                   !PathWhitelist.contains(item.path, in: whitelist),
                   !QuickCleanRegistry.contains(item.path, in: quickCleanEntries),
-                  (try? DeletionValidator.validateQuickCleanRegistration(path: item.path)) != nil
+                  (try? DeletionValidator.validateQuickCleanRegistration(
+                    path: item.path, allowRegularFile: isUpdateArchive
+                  )) != nil
             else {
                 rejected += 1
                 continue
@@ -2406,7 +2413,8 @@ final class DevSweepStore: ObservableObject {
                 path: QuickCleanRegistry.key(for: item.path),
                 displayName: item.name,
                 category: item.category,
-                dateAdded: Date()
+                dateAdded: Date(),
+                targetKind: isUpdateArchive ? .updateArchive : .directory
             ))
         }
         guard !newEntries.isEmpty else {
@@ -2492,7 +2500,7 @@ final class DevSweepStore: ObservableObject {
                     let removedSize = report.removed.reduce(0) { $0 + $1.size }
                     self.statusMessage = report.removed.isEmpty
                         ? "没有需要清理的常用项目"
-                        : "已清理 \(report.removed.count) 个常用目录，共 \(removedSize.devSweepFileSize)，文件可从废纸篓恢复"
+                        : "已清理 \(report.removed.count) 个常用项目，共 \(removedSize.devSweepFileSize)，文件可从废纸篓恢复"
                     if !report.removed.isEmpty {
                         self.showTransientNotice("已清理 \(report.removed.count) 项，共 \(removedSize.devSweepFileSize)")
                     }

@@ -182,10 +182,10 @@ struct DeletionValidator {
         }
     }
 
-    /// 「加入常用清理」前的资格检查：只允许真实的、非符号链接的普通目录，
+    /// 「加入常用清理」前的资格检查：默认只允许目录，安装包可显式允许普通文件，
     /// 且不能是受保护路径。真正的删除仍然走 `validate(item:context:)`，
     /// 这里不放宽任何现有保护。
-    static func validateQuickCleanRegistration(path: URL) throws {
+    static func validateQuickCleanRegistration(path: URL, allowRegularFile: Bool = false) throws {
         let standardized = path.standardizedFileURL
         guard fileManager.fileExists(atPath: standardized.path) else {
             throw DeletionValidationError.pathMissing
@@ -202,8 +202,8 @@ struct DeletionValidator {
             throw DeletionValidationError.symbolicLink
         }
 
-        guard let attributes = try? fileManager.attributesOfItem(atPath: standardized.path),
-              (attributes[.type] as? FileAttributeType) == .typeDirectory
+        guard let identity = FileIdentity.capture(standardized),
+              identity.kind == .directory || (allowRegularFile && identity.kind == .regular)
         else {
             throw DeletionValidationError.unsupportedTarget
         }

@@ -274,12 +274,21 @@ struct PathWhitelist {
 }
 
 /// 长期保存的用户清理授权。不保存 `CacheItem.id`（UUID 每次扫描都会变化），
-/// 稳定身份是 normalized path；目录被清理后重新生成，Entry 仍然保留。
+/// 稳定身份是 normalized path；目标被清理后重新生成，Entry 仍然保留。
 struct QuickCleanEntry: Codable, Hashable, Identifiable {
+    enum TargetKind: String, Codable {
+        case directory
+        case updateArchive
+    }
+
     let path: String
     let displayName: String
     let category: String
     let dateAdded: Date
+    // 旧配置没有此字段，继续按目录处理，避免扩大已有授权。
+    var targetKind: TargetKind? = nil
+
+    var isUpdateArchive: Bool { targetKind == .updateArchive }
 
     var id: String {
         URL(fileURLWithPath: path).standardizedFileURL.path
