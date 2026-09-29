@@ -143,6 +143,7 @@ enum DevSweepUpdateError: Error, Equatable, Sendable {
     case invalidRelease
     case missingVerifiedArchive
     case invalidResponse
+    case httpStatus(Int)
     case digestMismatch
     case invalidApplication
     case versionMismatch
@@ -171,9 +172,21 @@ struct DevSweepUpdateFailure: Equatable, Sendable {
         }
 
         switch error {
-        case .invalidRelease, .missingVerifiedArchive, .invalidResponse:
+        case .invalidRelease, .missingVerifiedArchive:
             message = "GitHub Release 信息或安装包无效"
             detail = nil
+        case .invalidResponse:
+            message = "GitHub Release 数据无法解析"
+            detail = nil
+        case .httpStatus(let code) where code == 403 || code == 429:
+            message = "GitHub API 请求受限"
+            detail = "服务器返回 HTTP \(code)，匿名请求达到限额，请稍后重试"
+        case .httpStatus(let code) where (500...599).contains(code):
+            message = "GitHub 服务暂时不可用"
+            detail = "服务器返回 HTTP \(code)，请稍后重试"
+        case .httpStatus(let code):
+            message = "GitHub 返回异常响应"
+            detail = "HTTP \(code)"
         case .digestMismatch:
             message = "下载文件的 SHA-256 校验失败"
             detail = nil
@@ -277,7 +290,8 @@ final class DevSweepSoftwareUpdater: ObservableObject {
         do {
             let (downloadURL, response) = try await session.download(from: release.archiveURL)
             guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-                throw DevSweepUpdateError.invalidResponse
+                let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+                throw DevSweepUpdateError.httpStatus(status)
             }
 
             state = .installing(release)
@@ -298,9 +312,16 @@ final class DevSweepSoftwareUpdater: ObservableObject {
         request.timeoutInterval = 20
         let (data, response) = try await session.data(for: request)
         guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw DevSweepUpdateError.httpStatus(status)
+        }
+        do {
+            return try DevSweepRelease.decodeGitHubResponse(data)
+        } catch let error as DevSweepUpdateError {
+            throw error
+        } catch {
             throw DevSweepUpdateError.invalidResponse
         }
-        return try DevSweepRelease.decodeGitHubResponse(data)
     }
 
     private func launchInstaller(for package: VerifiedDevSweepUpdatePackage) throws {

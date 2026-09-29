@@ -76,6 +76,37 @@ final class SoftwareUpdateTests: XCTestCase {
         XCTAssertFalse(release.isNewer(than: "development"))
     }
 
+    func testFailureMessagesDistinguishHTTPStatusFromInvalidRelease() {
+        XCTAssertEqual(
+            DevSweepUpdateFailure(DevSweepUpdateError.httpStatus(403)).displayText,
+            "GitHub API 请求受限：服务器返回 HTTP 403，匿名请求达到限额，请稍后重试"
+        )
+        XCTAssertEqual(
+            DevSweepUpdateFailure(DevSweepUpdateError.httpStatus(429)).message,
+            "GitHub API 请求受限"
+        )
+        XCTAssertEqual(
+            DevSweepUpdateFailure(DevSweepUpdateError.httpStatus(502)).message,
+            "GitHub 服务暂时不可用"
+        )
+        XCTAssertEqual(
+            DevSweepUpdateFailure(DevSweepUpdateError.httpStatus(418)).displayText,
+            "GitHub 返回异常响应：HTTP 418"
+        )
+        XCTAssertEqual(
+            DevSweepUpdateFailure(DevSweepUpdateError.invalidResponse).message,
+            "GitHub Release 数据无法解析"
+        )
+        XCTAssertEqual(
+            DevSweepUpdateFailure(DevSweepUpdateError.invalidRelease).message,
+            "GitHub Release 信息或安装包无效"
+        )
+        XCTAssertEqual(
+            DevSweepUpdateFailure(DevSweepUpdateError.missingVerifiedArchive).message,
+            "GitHub Release 信息或安装包无效"
+        )
+    }
+
     func testComputesArchiveSHA256() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("DevSweepTests-\(UUID().uuidString)")
