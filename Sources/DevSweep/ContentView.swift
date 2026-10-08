@@ -104,6 +104,7 @@ enum SidebarDestination: Hashable {
     case all
     case quickClean
     case whitelist
+    case backgroundProcesses
     case category(String)
 }
 
@@ -119,6 +120,7 @@ struct ContentView: View {
     @EnvironmentObject private var store: DevSweepStore
     @EnvironmentObject private var updater: DevSweepSoftwareUpdater
     @State private var destination: SidebarDestination = .all
+    @StateObject private var backgroundProcesses = BackgroundProcessStore()
     @State private var onlySelected = false
     @State private var onlyQuickClean = false
     @AppStorage("DevSweep.onlyLarge") private var onlyLarge = false
@@ -160,7 +162,7 @@ struct ContentView: View {
     private var showsCacheList: Bool {
         switch destination {
         case .all, .category: return true
-        case .quickClean, .whitelist: return false
+        case .quickClean, .whitelist, .backgroundProcesses: return false
         }
     }
 
@@ -173,7 +175,7 @@ struct ContentView: View {
                 matchesCategory = true
             case .category(let category):
                 matchesCategory = item.category == category
-            case .quickClean, .whitelist:
+            case .quickClean, .whitelist, .backgroundProcesses:
                 matchesCategory = false
             }
             return matchesCategory
@@ -205,6 +207,7 @@ struct ContentView: View {
         case .all: return "开发者垃圾清理"
         case .quickClean: return "常用清理"
         case .whitelist: return "白名单"
+        case .backgroundProcesses: return "后台进程"
         case .category(let category): return category
         }
     }
@@ -353,6 +356,13 @@ struct ContentView: View {
                         size: nil
                     )
                     .tag(SidebarDestination.whitelist)
+                    SidebarRow(
+                        title: "后台进程",
+                        subtitle: "关闭模拟器与遗留的 Agent 任务",
+                        icon: "cpu",
+                        size: nil
+                    )
+                    .tag(SidebarDestination.backgroundProcesses)
                 }
 
                 Section("分类") {
@@ -435,6 +445,8 @@ struct ContentView: View {
                         QuickCleanPageView()
                     case .whitelist:
                         WhitelistPageView()
+                    case .backgroundProcesses:
+                        BackgroundProcessesView(store: backgroundProcesses)
                     }
                 }
                 .frame(maxWidth: 980, alignment: .leading)
@@ -458,16 +470,16 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(headerTitle)
                     .font(.system(size: 24, weight: .bold, design: .rounded))
-                Text(store.statusMessage)
+                Text(destination == .backgroundProcesses ? backgroundProcesses.status : store.statusMessage)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            if store.isScanning || store.isCleaning {
+            if destination == .backgroundProcesses ? backgroundProcesses.isWorking : (store.isScanning || store.isCleaning) {
                 ProgressView()
                     .controlSize(.small)
             } else {
-                Label("\(store.items.count) 项", systemImage: "square.stack.3d.up")
+                Label("\(destination == .backgroundProcesses ? backgroundProcesses.items.count : store.items.count) 项", systemImage: "square.stack.3d.up")
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 10)
@@ -497,15 +509,16 @@ struct ContentView: View {
             .buttonStyle(.bordered)
             .help("查看清理范围和安全说明")
             Button {
-                store.scan()
+                if destination == .backgroundProcesses { backgroundProcesses.scan() }
+                else { store.scan() }
             } label: {
                 Label(
-                    hasScanReport ? "重新扫描" : "开始扫描",
-                    systemImage: hasScanReport ? "arrow.clockwise" : "play.fill"
+                    (destination == .backgroundProcesses ? backgroundProcesses.hasScanned : hasScanReport) ? "重新扫描" : "开始扫描",
+                    systemImage: (destination == .backgroundProcesses ? backgroundProcesses.hasScanned : hasScanReport) ? "arrow.clockwise" : "play.fill"
                 )
             }
             .buttonStyle(.bordered)
-            .disabled(store.isScanning || store.isCleaning)
+            .disabled(destination == .backgroundProcesses ? backgroundProcesses.isWorking : (store.isScanning || store.isCleaning))
         }
         .controlSize(.large)
         .padding(.horizontal, 30)

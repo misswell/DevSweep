@@ -2,10 +2,11 @@
 
 DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcode、Rust/Tauri、Node、SwiftPM、Cargo、Gradle、Maven、Python、Go、Flutter、VS Code、Cursor 以及 OpenAI Codex、OpenCode、Claude Code、Goose 等 AI agent 开发环境。
 
-当前版本：0.1.40
+当前版本：0.1.41
 
 ## 当前功能
 
+- 新增「后台进程」页：扫描运行中的 iOS Simulator、独立的 agent-browser/无头测试浏览器、旧版 Codex 崩溃报告，以及运行超过一小时的 mas 查询任务；展示运行时间、PID、进程树、RSS 合计和识别依据。默认不勾选，用户确认后关闭或结束所选任务；模拟器通过单设备 `simctl shutdown` 正常关机并保留数据，进程树只发送 SIGTERM。执行前重新核验进程启动时间、用户、可执行文件和进程树，状态变化时跳过；构建/测试期间保护模拟器，安装任务、当前应用及其祖先进程受保护，不按运行时长清理一般 Node/Python/MCP 服务。
 - 按 Xcode、CoreSimulator、XCTest、Docker、项目生成物、包管理器、语言工具链、CI/CD、AI/ML、JVM、IDE、数据库工具和 API/调试工具分类展示占用，并按空间从大到小排列。
 - 扫描常见开发者缓存白名单，不扫描照片、文档、邮件或整个磁盘；目录占用使用 macOS `du` 校准，避免只读到目录元数据而漏报大缓存。
 - 默认发现 `~/Code`、`~/Projects`、`~/Developer`、`~/Development`、`~/Work`、`~/src`、`~/workspace`、`~/www`、`~/GitHub` 以及存在时的 `~/.codex/worktrees`、`~/.claude/worktrees`，也支持添加多个项目根目录并持久化保存；不会把整个 `~/.codex` 或 `~/.claude` 当作项目根。

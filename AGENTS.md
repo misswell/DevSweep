@@ -9,6 +9,12 @@
 - 禁止创建 `~/bin/xcodebuild`、`/usr/local/bin/xcodebuild` 之类的全局 wrapper 或改 PATH 劫持系统 xcodebuild；限制只放在项目 Scheme、项目测试脚本和 Agent 规则三个层次。
 - `~/Library/Developer/XCTestDevices/<UUID>` 是测试临时 clone，可由 DevSweep 清理；`~/Library/Developer/CoreSimulator/Devices` 是真实注册的模拟器，只能用 `xcrun simctl delete <UDID>` 管理，两者逻辑不得合并。
 
+## 后台进程清理规则
+
+- 「后台进程」页只扫描已识别的开发/Agent 临时任务，默认不勾选；不能仅凭运行时间长、PPID 为 1 或名称包含 node/python/MCP 就判定可结束。
+- 清理前重新核验 PID、启动时间、用户、可执行文件和进程树；状态变化、身份不明、其他用户、当前应用及其祖先进程一律保护。仅逐个发送 SIGTERM 并检查退出结果，不使用广泛的 pkill/killall 或自动 SIGKILL。
+- 运行中的模拟器只用单设备 `xcrun simctl shutdown <UDID>` 正常关机并保留数据；有构建/测试进程或无法确认状态时拒绝关闭。此功能与删除 CoreSimulator 设备、清理 XCTest clone 保持独立。
+
 ## 发布偏好
 
 - 每次改动完成并验证通过后，自动提交并推送到 GitHub，并创建新的 patch 版本 GitHub Release 和 tag。
