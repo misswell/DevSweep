@@ -45,8 +45,8 @@ final class CleanupSelectionTests: XCTestCase {
         XCTAssertEqual(paths.map(\.path), ["/tmp/other", "/tmp/project/target"])
     }
 
-    /// 选择状态是全局状态：过滤掉（当前不显示）的项目仍然是清理候选，
-    /// 过滤器绝对不能偷偷改变清理范围。
+    /// 勾选状态不受显示影响：送进来的清理范围里，当前没有显示出来的项目
+    /// 仍然是清理候选，过滤器绝对不能偷偷改变清理范围。
     func testSelectionIsNotScopedToVisibleItems() {
         let visibleUnselectedItem = CacheItem(
             category: "Rust / Tauri 项目",
@@ -102,6 +102,59 @@ final class CleanupSelectionTests: XCTestCase {
         let selected = CleanupSelection.selectedItems(from: [manualItem])
 
         XCTAssertTrue(selected.isEmpty)
+    }
+
+    /// 侧栏分类决定清理范围：分类页的清理候选只有该分类勾选的项目，
+    /// 切换分类不改动其它分类的勾选（切走不等于取消勾选）。
+    func testSidebarCategoryScopesCleanupCandidates() {
+        let selectedXcodeItem = CacheItem(
+            category: "Xcode",
+            name: "DerivedData",
+            path: URL(fileURLWithPath: "/tmp/xcode-derived-data"),
+            size: 2,
+            isSelected: true
+        )
+        let unselectedXcodeItem = CacheItem(
+            category: "Xcode",
+            name: "ModuleCache",
+            path: URL(fileURLWithPath: "/tmp/xcode-module-cache"),
+            size: 1,
+            isSelected: false
+        )
+        let selectedNodeItem = CacheItem(
+            category: "Node.js 项目",
+            name: "node_modules",
+            path: URL(fileURLWithPath: "/tmp/node-modules"),
+            size: 3,
+            isSelected: true
+        )
+        let items = [selectedXcodeItem, unselectedXcodeItem, selectedNodeItem]
+
+        let inXcode = CleanupSelection.selectedItems(
+            from: SidebarDestination.category("Xcode").items(from: items)
+        )
+        let inAll = CleanupSelection.selectedItems(
+            from: SidebarDestination.all.items(from: items)
+        )
+
+        XCTAssertEqual(inXcode.map(\.id), [selectedXcodeItem.id], "分类页只显示并只清理本分类的勾选")
+        XCTAssertEqual(inAll.map(\.id), [selectedXcodeItem.id, selectedNodeItem.id])
+        XCTAssertEqual(items.map(\.isSelected), [true, false, true], "切换分类不改动其它分类的勾选")
+    }
+
+    /// 非列表页面（常用清理 / 白名单 / 后台进程）没有缓存清理范围。
+    func testNonListDestinationsHaveNoCacheScope() {
+        let item = CacheItem(
+            category: "Xcode",
+            name: "DerivedData",
+            path: URL(fileURLWithPath: "/tmp/xcode-derived-data"),
+            size: 1,
+            isSelected: true
+        )
+
+        for destination in [SidebarDestination.quickClean, .whitelist, .backgroundProcesses] {
+            XCTAssertTrue(destination.items(from: [item]).isEmpty, "\(destination) 不应有缓存清理范围")
+        }
     }
 
     func testRemainingItemsRemovesOnlySuccessfullyCleanedItems() {

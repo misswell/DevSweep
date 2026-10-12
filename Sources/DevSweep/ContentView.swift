@@ -106,6 +106,16 @@ enum SidebarDestination: Hashable {
     case whitelist
     case backgroundProcesses
     case category(String)
+
+    /// 侧栏页面决定清理范围：「全部项目」是全量，分类页只有该分类；
+    /// 其它页面不展示缓存列表，因此没有清理范围。
+    func items(from items: [CacheItem]) -> [CacheItem] {
+        switch self {
+        case .all: return items
+        case .category(let category): return items.filter { $0.category == category }
+        case .quickClean, .whitelist, .backgroundProcesses: return []
+        }
+    }
 }
 
 /// 「只看大于」筛选的候选阈值，从 100 MB 到 1 GB。
@@ -166,32 +176,62 @@ struct ContentView: View {
         }
     }
 
+    /// 当前侧栏页面的清理范围，与列表过滤器无关。
+    private var scopedItems: [CacheItem] {
+        destination.items(from: store.items)
+    }
+
+    /// 清理范围 = 当前侧栏页面里勾选的项目；切换分类即切换执行内容。
+    private var scopedSelectedItems: [CacheItem] {
+        CleanupSelection.selectedItems(from: scopedItems)
+    }
+
+    /// 其它分类里仍被勾选的项数，用于提醒「切走不等于取消勾选」。
+    private var selectedOutsideScopeCount: Int {
+        store.selectedCleanupItems.count - scopedSelectedItems.count
+    }
+
+    private var outsideScopeNotice: String? {
+        guard selectedOutsideScopeCount > 0 else { return nil }
+        return "其它分类还有 \(selectedOutsideScopeCount) 项保持勾选，切换分类或选「全部项目」再处理"
+    }
+
+    /// 当前清理范围的名称，用于在底部栏说明「这里清理的是哪一批」。
+    private var scopeName: String {
+        switch destination {
+        case .all: return "全部项目"
+        case .category(let category): return category
+        case .quickClean, .whitelist, .backgroundProcesses: return "当前页面"
+        }
+    }
+
+    private var bottomBarNotice: String {
+        let recoverability = selectedCleanupIncludesNonRecoverable
+            ? "包含官方工具或设备清理，执行后不可从废纸篓恢复"
+            : "普通目录将移入废纸篓，可随时恢复"
+        guard let outsideScopeNotice else { return recoverability }
+        return "\(recoverability)。\(outsideScopeNotice)"
+    }
+
     /// 过滤器只决定「当前看到什么」，永远不影响清理范围。
     private var visibleItems: [CacheItem] {
-        store.items.filter { item in
-            let matchesCategory: Bool
-            switch destination {
-            case .all:
-                matchesCategory = true
-            case .category(let category):
-                matchesCategory = item.category == category
-            case .quickClean, .whitelist, .backgroundProcesses:
-                matchesCategory = false
-            }
-            return matchesCategory
-                && (!onlySelected || item.isSelected)
+        scopedItems.filter { item in
+            (!onlySelected || item.isSelected)
                 && (!onlyQuickClean || store.isQuickClean(item))
                 && (!onlyLarge || item.size >= largeThreshold)
         }
     }
 
-    /// 清理范围永远等于 store.selectedCleanupItems，与当前页面和过滤器无关。
     private var selectedCleanupSize: Int64 {
-        store.selectedCleanupItems.reduce(0) { $0 + $1.size }
+        scopedSelectedItems.reduce(0) { $0 + $1.size }
+    }
+
+    private var scopeTotalSize: Int64 {
+        scopedItems.reduce(0) { $0 + $1.size }
     }
 
     private var selectedCleanupIncludesNonRecoverable: Bool {
-        store.selectedCleanupItems.contains { $0.kind.isNonRecoverable }
+        scopedSelectedItems.contains { $0.kind.isNonRecoverable }
     }
 
     private var pendingCleanupIncludesNonRecoverable: Bool {
@@ -479,7 +519,7 @@ struct ContentView: View {
                 ProgressView()
                     .controlSize(.small)
             } else {
-                Label("\(destination == .backgroundProcesses ? backgroundProcesses.items.count : store.items.count) 项", systemImage: "square.stack.3d.up")
+                Label("\(destination == .backgroundProcesses ? backgroundProcesses.items.count : scopedItems.count) 项", systemImage: "square.stack.3d.up")
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 10)
@@ -633,15 +673,15 @@ struct ContentView: View {
     private var overviewCard: some View {
         HStack(spacing: 24) {
             VStack(alignment: .leading, spacing: 6) {
-                Label("可回收空间", systemImage: "externaldrive.badge.minus")
+                Label(destination == .all ? "可回收空间" : "本分类可回收空间", systemImage: "externaldrive.badge.minus")
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(.secondary)
-                Text(store.totalSize.devSweepFileSize)
+                Text(scopeTotalSize.devSweepFileSize)
                     .font(.system(size: 38, weight: .bold, design: .rounded))
                 Text(
                     !hasScanReport
                         ? "点击“开始扫描”查找可清理的开发者缓存和生成物"
-                        : "扫描到 \(store.items.count) 个缓存或生成物，按占用从大到小排列"
+                        : "扫描到 \(scopedItems.count) 个缓存或生成物，按占用从大到小排列"
                 )
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -651,13 +691,13 @@ struct ContentView: View {
                 .fill(Color.primary.opacity(0.12))
                 .frame(width: 1, height: 64)
             VStack(alignment: .trailing, spacing: 6) {
-                Label("当前选择", systemImage: "checkmark.circle")
+                Label("当前页面选择", systemImage: "checkmark.circle")
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(.secondary)
                 Text(selectedCleanupSize.devSweepFileSize)
                     .font(.system(size: 28, weight: .semibold, design: .rounded))
                     .foregroundStyle(.tint)
-                Text("\(store.selectedCleanupItems.count) 项待清理")
+                Text("\(scopedSelectedItems.count) 项待清理")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -873,9 +913,10 @@ struct ContentView: View {
             .disabled(!onlyLarge)
             .help("选择“只看大于”的文件大小阈值")
             Spacer()
-            Text("显示 \(visibleItems.count) 项 · 已选 \(store.selectedCleanupItems.count) 项")
+            Text("显示 \(visibleItems.count) 项 · 本页已选 \(scopedSelectedItems.count) 项")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .help(outsideScopeNotice ?? "清理范围＝当前侧栏页面勾选的项目，过滤器不改变它")
             Menu {
                 Button("全选当前显示") {
                     store.setVisibleSelected(visibleItems, selected: true)
@@ -885,12 +926,12 @@ struct ContentView: View {
                 }
                 Divider()
                 Button {
-                    requestAddToQuickClean(store.selectedCleanupItems)
+                    requestAddToQuickClean(scopedSelectedItems)
                 } label: {
                     Label("加入常用清理", systemImage: "bolt.fill")
                 }
                 Button {
-                    store.addToWhitelist(store.selectedCleanupItems)
+                    store.addToWhitelist(scopedSelectedItems)
                 } label: {
                     Label("加入白名单", systemImage: "checkmark.shield")
                 }
@@ -910,25 +951,24 @@ struct ContentView: View {
             Image(systemName: "checkmark.shield")
                 .foregroundStyle(.green)
             VStack(alignment: .leading, spacing: 2) {
-                Text(store.selectedCleanupItems.isEmpty
+                Text(scopedSelectedItems.isEmpty
                     ? "选择项目后开始清理"
-                    : "已选 \(store.selectedCleanupItems.count) 项 · \(selectedCleanupSize.devSweepFileSize)")
+                    : "「\(scopeName)」已选 \(scopedSelectedItems.count) 项 · \(selectedCleanupSize.devSweepFileSize)")
                     .font(.subheadline.weight(.medium))
-                Text(selectedCleanupIncludesNonRecoverable
-                    ? "包含官方工具或设备清理，执行后不可从废纸篓恢复"
-                    : "普通目录将移入废纸篓，可随时恢复")
+                Text(bottomBarNotice)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             Spacer()
             Button {
-                pendingCleanupItems = store.selectedCleanupItems
+                pendingCleanupItems = scopedSelectedItems
                 showingConfirmation = true
             } label: {
-                Label("清理 \(store.selectedCleanupItems.count) 项", systemImage: "trash")
+                Label("清理 \(scopedSelectedItems.count) 项", systemImage: "trash")
             }
             .buttonStyle(.borderedProminent)
-            .disabled(store.selectedCleanupItems.isEmpty || store.isCleaning || store.isScanning)
+            .disabled(scopedSelectedItems.isEmpty || store.isCleaning || store.isScanning)
+            .help("只清理「\(scopeName)」里勾选的项目")
         }
         .padding(.horizontal, 24)
         .padding(.vertical, 12)
@@ -1290,7 +1330,7 @@ private struct MiniModeView: View {
     let onCleanup: ([CacheItem]) -> Void
     let onAddToQuickClean: (CacheItem) -> Void
 
-    /// Mini 模式与普通模式使用同一个清理范围计算，切换模式不改变执行内容。
+    /// Mini 模式没有侧栏分类，清理范围是所有分类里勾选的项目。
     private var cleanupItems: [CacheItem] {
         store.selectedCleanupItems
     }

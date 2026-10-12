@@ -200,8 +200,8 @@ struct CacheItem: Identifiable, Hashable {
 }
 
 struct CleanupSelection {
-    /// 全 App 唯一的清理候选计算入口：只由用户勾选状态决定，与当前分类、
-    /// 过滤器和显示窗口无关。过滤只改变 `visibleItems`，永远不改变清理范围。
+    /// 清理候选计算入口：只由勾选状态决定。调用方决定送进来的集合
+    /// （普通模式是当前侧栏分类，Mini 模式是全部项目），列表过滤器永远不参与。
     static func selectedItems(from items: [CacheItem]) -> [CacheItem] {
         items.filter { $0.isSelected && $0.risk != .manual }
     }
