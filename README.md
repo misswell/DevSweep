@@ -2,7 +2,7 @@
 
 DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcode、Rust/Tauri、Node、SwiftPM、Cargo、Gradle、Maven、Python、Go、Flutter、VS Code、Cursor 以及 OpenAI Codex、OpenCode、Claude Code、Goose 等 AI agent 开发环境。
 
-当前版本：0.1.43
+当前版本：0.1.45
 
 ## 当前功能
 
@@ -24,6 +24,7 @@ DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcod
 - 补充 nvm、Volta、SonarQube、pnpm registry 元数据、SwiftPM XDG/旧缓存、Scala/sbt/Ivy/Coursier/Metals，以及 Instruments、SourceKitService 和 Xcode Previews 缓存；同时覆盖 Lingma、Trae CN、Windsurf、Zed、OpenCode Desktop、Nova 等开发工具的明确缓存叶子，并识别 NVM_DIR、VOLTA_HOME、SONAR_USER_HOME、COURSIER_CACHE 和 CocoaPods 自定义目录。
 - 覆盖 Edge、Firefox、Google 应用、媒体分析、剪映和自定义 Chromium 资料目录缓存；跨 Caches、Application Support、Containers、Group Containers、HTTPStorages 和临时目录识别 Sparkle/Squirrel 等软件升级残留，系统级位置仅展示为手动项；存在项目标志时识别项目运行日志与 Nacos 日志。
 - 项目扫描覆盖 `.terragrunt-cache`、`.astro`、`zig-out`、`.cxx`、项目内 DerivedData、monorepo marker 和有效 `CACHEDIR.TAG`；如果扫描根自身是 `node_modules`、`target`、`build`、`dist`、`vendor` 等生成物容器，会跳过其内部项目发现。对 Composer `vendor`、.NET `bin`/`obj` 和通用 `build` 必须先验证项目标志，避免按同名目录误报源码或运行时文件。
+- 识别项目内模型缓存：`tools/models/cache`、`models/`、`checkpoints/`、`weights/` 等目录只有在包含 HF 下载回执（`.cache/huggingface` + `config.json`）或 `config.json` + 权重文件（safetensors、gguf、onnx、pt、mlpackage 等）时才归入 AI/ML「建议确认」；为这类容器把默认扫描深度放宽到第 7 层，普通 `cache` 目录不会按名称误报，删除后模型需要重新下载或重新转换。
 - 识别 CoreSimulator 设备，通过 `xcrun simctl delete` 删除，避免直接破坏设备注册。
 - XCTest 克隆设备按动态状态展示：明确 UUID 命名的 clone 在未检测到 XCTest/UI 测试运行时显示「可安全清理」并默认勾选；检测到 `xcodebuild test`、`test-without-building`、`xctest`、`XCTRunner` 或 `XCTestAgent` 进程时显示「正在测试」并禁止勾选清理；无法确认进程状态时保守显示「无法确认状态」，同样禁止自动清理。标题只显示 8 位短 UUID，完整路径放在详情中；XCTestDevices 根目录或未识别内容永远保持「建议确认」不默认勾选。
 - 清理 XCTestDevices 项目前会重新检测一次测试进程（TOCTOU 二次确认，一次批量清理只检测一次）：扫描后启动的测试同样会阻止删除，被阻止的 clone 不影响同批次普通缓存继续清理；CoreSimulator 设备独立通过 simctl 管理，删除前同样检查设备与构建/测试状态。

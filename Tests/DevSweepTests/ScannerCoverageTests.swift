@@ -322,6 +322,91 @@ final class ScannerCoverageTests: XCTestCase {
         XCTAssertNil(CacheScanner.generatedRule(for: ordinary.appendingPathComponent("build")))
     }
 
+    // MARK: - 项目内模型缓存
+
+    private func makeHuggingFaceModel(at repository: URL) throws {
+        try fileManager.createDirectory(
+            at: repository.appendingPathComponent(".cache/huggingface/download"),
+            withIntermediateDirectories: true
+        )
+        try Data("{}".utf8).write(to: repository.appendingPathComponent("config.json"))
+        try createAllocatedFile(at: repository.appendingPathComponent("model.safetensors"))
+    }
+
+    /// `tools/models/cache/<model>` 比普通项目生成物更深，默认扫描深度
+    /// （4 层）必须为模型容器放宽，同时仍按内容而不是目录名识别。
+    func testNestedProjectModelCacheIsDetectedWithoutDeepScan() throws {
+        let root = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: root) }
+
+        let cache = root.appendingPathComponent("workspace/ml/tools/models/cache")
+        try makeHuggingFaceModel(at: cache.appendingPathComponent("siglip2-base-patch16-256"))
+
+        let report = CacheScanner.scan(
+            projectRoots: [root],
+            deepScan: false,
+            home: root.appendingPathComponent("empty-home"),
+            includeSystemCaches: false,
+            progress: { _ in },
+            environment: [:]
+        )
+
+        let item = report.items.first { $0.path == cache.standardizedFileURL }
+        XCTAssertEqual(item?.category, "AI/ML")
+        XCTAssertEqual(item?.risk, .review)
+        XCTAssertFalse(item?.isSelected ?? true)
+        XCTAssertTrue(item?.note.contains("重新下载") ?? false)
+    }
+
+    func testPlainCacheDirectoryIsNotTreatedAsModelCache() throws {
+        let root = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: root) }
+
+        let cache = root.appendingPathComponent("cache")
+        try createAllocatedCache(at: cache)
+        try Data("{}".utf8).write(to: cache.appendingPathComponent("config.json"))
+
+        XCTAssertNil(CacheScanner.generatedRule(for: cache))
+
+        let report = CacheScanner.scan(
+            projectRoots: [root],
+            deepScan: false,
+            home: root.appendingPathComponent("empty-home"),
+            includeSystemCaches: false,
+            progress: { _ in },
+            environment: [:]
+        )
+        XCTAssertFalse(report.items.contains { $0.path == cache.standardizedFileURL })
+    }
+
+    func testModelCacheRuleRequiresModelEvidence() throws {
+        let root = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: root) }
+
+        let configOnly = root.appendingPathComponent("config-only/models")
+        try fileManager.createDirectory(at: configOnly, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: configOnly.appendingPathComponent("config.json"))
+        XCTAssertNil(CacheScanner.generatedRule(for: configOnly))
+
+        let weightsOnly = root.appendingPathComponent("weights-only/cache")
+        try createAllocatedFile(at: weightsOnly.appendingPathComponent("model.safetensors"))
+        XCTAssertNil(CacheScanner.generatedRule(for: weightsOnly))
+
+        let huggingFace = root.appendingPathComponent("hf/checkpoints")
+        try fileManager.createDirectory(
+            at: huggingFace.appendingPathComponent(".cache/huggingface"),
+            withIntermediateDirectories: true
+        )
+        try Data("{}".utf8).write(to: huggingFace.appendingPathComponent("config.json"))
+        XCTAssertEqual(CacheScanner.generatedRule(for: huggingFace)?.category, "AI/ML")
+
+        let localModels = root.appendingPathComponent("local/models")
+        try fileManager.createDirectory(at: localModels, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: localModels.appendingPathComponent("config.json"))
+        try createAllocatedFile(at: localModels.appendingPathComponent("weights.safetensors"))
+        XCTAssertEqual(CacheScanner.generatedRule(for: localModels)?.category, "AI/ML")
+    }
+
     // MARK: - cargo target 拆分
 
     private func makeCargoTarget(in root: URL) throws -> (project: URL, target: URL, debug: URL) {

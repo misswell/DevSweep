@@ -1492,7 +1492,7 @@ struct CacheScanner {
             }
 
             let depth = url.pathComponents.count - root.standardizedFileURL.pathComponents.count
-            if !deepScan && depth > 4 {
+            if !deepScan && depth > 4 && !allowsModelCacheLookup(url, root: root) {
                 collector.skippedPaths += 1
                 enumerator.skipDescendants()
                 continue
@@ -1968,6 +1968,9 @@ struct CacheScanner {
         if name == "target", let rule = targetDirectoryRule(for: url) {
             return rule
         }
+        if let rule = modelCacheRule(for: url) {
+            return rule
+        }
         // 具名规则优先于 CACHEDIR.TAG：cargo 会在 target/ 写入 CACHEDIR.TAG，
         // 如果让 tag 抢先命中，整个 target 会被误标成「其他开发缓存 / 可直接清理」，
         // 既丢失 Rust 分类，又可能被一键勾选删除。
@@ -1978,6 +1981,74 @@ struct CacheScanner {
             return GeneratedRule(category: "其他开发缓存", risk: .safe, note: "目录包含有效 CACHEDIR.TAG，软件声明其内容可作为缓存重建；仍受删除安全校验和白名单控制")
         }
         return nil
+    }
+
+    /// 项目内模型缓存常见于 `tools/models/cache`、`models/`、`checkpoints/` 等
+    /// 不叫 `.cache` 的目录；按 HF 下载回执或「config.json + 权重文件」识别，
+    /// 不按目录名直接下结论。
+    private static let modelCacheContainerNames: Set<String> = [
+        "cache", "model_cache", "models", "model", "checkpoints", "weights"
+    ]
+
+    private static let modelWeightExtensions: Set<String> = [
+        "safetensors", "gguf", "onnx", "pt", "pth", "ckpt", "tflite", "h5", "mlmodel", "mlpackage"
+    ]
+
+    private static let modelCacheGeneratedRule = GeneratedRule(
+        category: "AI/ML",
+        risk: .review,
+        note: "项目内模型缓存，删除后需要重新下载或重新转换；请确认模型仍可从源获取"
+    )
+
+    /// 模型缓存目录通常比普通项目生成物更深（如 `tools/models/cache/<model>`），
+    /// 默认深度限制会直接跳过。只在路径出现模型容器名时放宽到第 7 层。
+    private static func allowsModelCacheLookup(_ url: URL, root: URL) -> Bool {
+        let rootComponents = root.standardizedFileURL.pathComponents
+        let components = url.standardizedFileURL.pathComponents
+        guard components.count - rootComponents.count <= 7 else { return false }
+        return components.dropFirst(rootComponents.count).contains {
+            modelCacheContainerNames.contains($0.lowercased())
+        }
+    }
+
+    private static func modelCacheRule(for url: URL) -> GeneratedRule? {
+        guard modelCacheContainerNames.contains(url.lastPathComponent.lowercased()) else { return nil }
+        if isModelRepositoryDirectory(url) {
+            return modelCacheGeneratedRule
+        }
+        guard let children = try? fileManager.contentsOfDirectory(
+            at: url,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: []
+        ) else { return nil }
+        let holdsModels = children.contains { child in
+            guard let values = try? child.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+                  values.isDirectory == true,
+                  values.isSymbolicLink != true
+            else { return false }
+            return isModelRepositoryDirectory(child)
+        }
+        return holdsModels ? modelCacheGeneratedRule : nil
+    }
+
+    private static func isModelRepositoryDirectory(_ directory: URL) -> Bool {
+        guard let children = try? fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey],
+            options: []
+        ) else { return false }
+
+        let names = Set(children.map(\.lastPathComponent))
+        let hasHuggingFaceReceipt = fileManager.fileExists(
+            atPath: directory.appendingPathComponent(".cache/huggingface").path
+        )
+        let hasWeights = children.contains { child in
+            modelWeightExtensions.contains(child.pathExtension.lowercased())
+        }
+        if hasHuggingFaceReceipt {
+            return names.contains("config.json") || hasWeights
+        }
+        return names.contains("config.json") && hasWeights
     }
 
     /// `target` 目录的归属判断，按证据优先级：
