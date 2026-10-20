@@ -279,6 +279,40 @@ struct CacheScanner {
         return enumeratedSize(of: url)
     }
 
+    /// 一次 `du` 调用测量多个目录。
+    ///
+    /// macOS 的 du 会在同一次调用的参数之间对硬链接去重：cargo 的 `deps` 与
+    /// `incremental` 大量共享 inode，逐个目录单独调用会把同一份磁盘块算两遍。
+    /// 批量测量既更快，也让拆分后的条目大小加起来仍然接近真实占用。
+    static func sizes(of urls: [URL]) -> [String: Int64] {
+        let standardized = urls.map(\.standardizedFileURL)
+        guard !standardized.isEmpty else { return [:] }
+
+        var measured: [String: Int64] = [:]
+        let arguments = ["-sk"] + standardized.map(\.path)
+        if let output = run(executable: "/usr/bin/du", arguments: arguments),
+           let text = String(data: output.stdout, encoding: .utf8) {
+            // du 按参数顺序输出 "<kb>\t<path>"；路径里可能有空格，所以按 tab 切分。
+            let ordered = text.split(whereSeparator: \.isNewline).compactMap { line -> Int64? in
+                guard let sizeField = line.split(separator: "\t", maxSplits: 1).first,
+                      let kilobytes = Int64(sizeField.trimmingCharacters(in: .whitespaces))
+                else { return nil }
+                return kilobytes * 1024
+            }
+            if ordered.count == standardized.count {
+                for (url, size) in zip(standardized, ordered) {
+                    measured[url.path] = size
+                }
+            }
+        }
+
+        // 权限不足等情况下 du 会少输出行，退回逐目录测量，保证不漏项。
+        for url in standardized where measured[url.path] == nil {
+            measured[url.path] = size(of: url)
+        }
+        return measured
+    }
+
     private static func fixedItems(
         home: URL,
         collector: inout ScanCollector,
@@ -1499,6 +1533,19 @@ struct CacheScanner {
 
             guard let generatedRule = generatedRule(for: url) else { continue }
 
+            // cargo 的 target/ 是几百 GB 的容器，整块只报一条既看不出哪里最占空间，
+            // 也没法只清 incremental 而保留已编译依赖。这里拆成 artifact 级条目。
+            if let cargoArtifacts = cargoTargetArtifacts(
+                at: url,
+                rule: generatedRule,
+                collector: &collector,
+                progress: progress
+            ) {
+                items += cargoArtifacts
+                enumerator.skipDescendants()
+                continue
+            }
+
             if let item = makeItem(
                 category: generatedRule.category,
                 name: "\(name) · \(url.deletingLastPathComponent().lastPathComponent)",
@@ -1515,6 +1562,248 @@ struct CacheScanner {
             enumerator.skipDescendants()
         }
         return items
+    }
+
+    /// 把 cargo `target/` 拆成 artifact 级条目。返回 nil 表示这不是 cargo target，
+    /// 调用方继续按普通生成物目录处理（例如 Maven 的 target/）。
+    ///
+    /// 结构：`target/<profile>/<artifact>`、`target/<triple>/<profile>/<artifact>`，
+    /// 以及 target 根下的 `doc`/`package`/自定义输出目录。
+    /// 只按结构识别，不依赖 `debug`/`release` 字面名，自定义 profile 和三元组同样生效。
+    private static func cargoTargetArtifacts(
+        at target: URL,
+        rule: GeneratedRule,
+        collector: inout ScanCollector,
+        progress: @escaping (ScanProgress) -> Void
+    ) -> [CacheItem]? {
+        guard target.lastPathComponent == "target", rule.category == "Rust / Tauri 项目" else { return nil }
+        guard isCargoTargetRoot(target) else { return nil }
+
+        let projectName = target.deletingLastPathComponent().lastPathComponent
+        let topLevel = childDirectories(at: target, collector: &collector, progress: progress)
+
+        func artifactChildren(of directory: URL) -> [URL] {
+            childDirectories(at: directory, collector: &collector, progress: progress)
+                .filter { cargoArtifactNames.contains($0.lastPathComponent) }
+        }
+
+        var profiles: [(url: URL, prefix: String)] = []
+        var rootArtifacts: [URL] = []
+        var otherDirectories: [URL] = []
+
+        for child in topLevel {
+            // cargo doc / cargo package 直接放在 target 根，不在 profile 里。
+            if cargoRootArtifactNames.contains(child.lastPathComponent) {
+                rootArtifacts.append(child)
+                continue
+            }
+            if !artifactChildren(of: child).isEmpty {
+                profiles.append((child, child.lastPathComponent))
+                continue
+            }
+            // target/<triple>/<profile>
+            var foundNestedProfile = false
+            for grandChild in childDirectories(at: child, collector: &collector, progress: progress)
+            where !artifactChildren(of: grandChild).isEmpty {
+                profiles.append((grandChild, "\(child.lastPathComponent)/\(grandChild.lastPathComponent)"))
+                foundNestedProfile = true
+            }
+            // 既不是 profile 也不是三元组：例如 target/macos-package 这类自定义输出，
+            // 仍然单独列出，避免它在列表里凭空消失。
+            if !foundNestedProfile {
+                otherDirectories.append(child)
+            }
+        }
+        guard !profiles.isEmpty || !rootArtifacts.isEmpty else { return nil }
+
+        var candidates: [(url: URL, name: String, risk: RiskLevel, note: String)] = []
+        for profile in profiles {
+            for artifact in artifactChildren(of: profile.url) {
+                let artifactRule = cargoArtifactRule(artifact.lastPathComponent)
+                candidates.append((
+                    url: artifact,
+                    name: "\(artifact.lastPathComponent) · \(profile.prefix) · \(projectName)",
+                    risk: artifactRule.risk,
+                    note: artifactRule.note
+                ))
+            }
+        }
+        for artifact in rootArtifacts {
+            let artifactRule = cargoArtifactRule(artifact.lastPathComponent)
+            candidates.append((
+                url: artifact,
+                name: "\(artifact.lastPathComponent) · target · \(projectName)",
+                risk: artifactRule.risk,
+                note: artifactRule.note
+            ))
+        }
+        for directory in otherDirectories {
+            candidates.append((
+                url: directory,
+                name: "\(directory.lastPathComponent) · target · \(projectName)",
+                risk: .review,
+                note: "cargo target 下的自定义输出目录（打包或中间产物），请确认内容后清理"
+            ))
+        }
+        guard !candidates.isEmpty else { return nil }
+        // 稳定排序：du 的硬链接去重是「先测到的目录拿走共享块」，顺序必须可复现，
+        // 否则同一份 target 每次扫描的单项数字都会跳动。
+        candidates.sort { left, right in
+            let leftKey = "\(left.url.deletingLastPathComponent().path)/\(cargoArtifactSortRank(left.url.lastPathComponent))"
+            let rightKey = "\(right.url.deletingLastPathComponent().path)/\(cargoArtifactSortRank(right.url.lastPathComponent))"
+            return leftKey < rightKey
+        }
+
+        // 一次 du 测完所有候选：macOS du 会在同一次调用的参数之间对硬链接去重。
+        // cargo 的 deps 与 incremental 共享大量 inode，逐个测量会把同一份磁盘块算两遍。
+        let measured = sizes(of: candidates.map(\.url))
+
+        // 构建进行中时 cargo 持有 target/<profile>/.cargo-lock。此时 deps/incremental
+        // 正在被写入，删除会破坏构建甚至让 cargo 崩溃，因此整组标为手动处理。
+        let isBuilding = cargoBuildState(ofProfiles: profiles.map(\.url)) == .building
+
+        var items: [CacheItem] = []
+        for candidate in candidates {
+            guard let item = makeItem(
+                category: rule.category,
+                name: candidate.name,
+                path: candidate.url,
+                risk: isBuilding ? .manual : candidate.risk,
+                note: isBuilding
+                    ? "检测到 cargo 正在构建该 target（持有 .cargo-lock），为避免破坏构建已禁止清理；请等构建结束后重新扫描"
+                    : candidate.note,
+                collector: &collector,
+                progress: progress,
+                isSelected: isBuilding ? false : nil,
+                statusTitle: isBuilding ? "正在构建" : nil,
+                measuredSize: measured[candidate.url.standardizedFileURL.path]
+            ) else { continue }
+            items.append(item)
+        }
+
+        // 若 profile 结构异常（例如只剩最终二进制、没有 artifact 子目录），
+        // 退回整目录条目，避免 cargo target 在列表里完全消失。
+        guard !items.isEmpty else { return nil }
+        return items
+    }
+
+    /// profile 目录内的 artifact 子目录。
+    private static let cargoArtifactNames: Set<String> = [
+        "deps", "incremental", "build", ".fingerprint", "examples", "doc", "package", "bundle"
+    ]
+
+    /// 直接位于 target 根（而不是 profile 里）的 artifact 目录。
+    private static let cargoRootArtifactNames: Set<String> = ["doc", "package"]
+
+    /// 测量顺序权重：让最「重」的目录先测，把共享硬链接算到它头上。
+    /// 这样 deps（真正占用大头）不会因为 incremental 先测而显得很小。
+    private static func cargoArtifactSortRank(_ name: String) -> String {
+        switch name {
+        case "deps": return "00"
+        case "incremental": return "01"
+        case "build": return "02"
+        case "examples": return "03"
+        case ".fingerprint": return "04"
+        case "doc": return "05"
+        case "package": return "06"
+        case "bundle": return "07"
+        default: return "99-\(name)"
+        }
+    }
+
+    private static func cargoArtifactRule(_ name: String) -> (risk: RiskLevel, note: String) {
+        switch name {
+        case "incremental":
+            return (.safe, "增量编译缓存，删除后下次构建变慢但结果不变；这是 cargo target 里最安全的清理项")
+        case "doc":
+            return (.safe, "cargo doc 生成的文档，可重新生成")
+        case "deps":
+            return (.review, "依赖库与测试可执行文件，删除后 cargo 会重新编译依赖")
+        case "build":
+            return (.review, "build script 的编译输出和 OUT_DIR，删除后重新执行 build script")
+        case ".fingerprint":
+            return (.review, "编译指纹，删除后会触发重新编译")
+        case "examples":
+            return (.review, "example 构建产物，删除后重新编译示例")
+        case "package":
+            return (.review, "cargo package 生成的打包产物，可重新生成")
+        case "bundle":
+            return (.review, "cargo-bundle 等打包工具输出的应用包，可重新生成")
+        default:
+            return (.review, "cargo 构建产物，可重新生成")
+        }
+    }
+
+    /// 判定一个 `target/` 是否真是 cargo 产物：cargo 会在 target 根写入
+    /// CACHEDIR.TAG 和 .rustc_info.json；Maven 的 target 两者都没有。
+    private static func isCargoTargetRoot(_ target: URL) -> Bool {
+        fileManager.fileExists(atPath: target.appendingPathComponent(".rustc_info.json").path)
+            || hasValidCacheDirectoryTag(target)
+    }
+
+    fileprivate enum CargoBuildState {
+        case idle
+        case building
+        case unknown
+    }
+
+    /// 用 cargo 自己的 `.cargo-lock` 判断是否正在构建：
+    /// 以非阻塞方式尝试加 flock，加得上说明没有 cargo 进程持有它。
+    /// 只读检查，不加 --wait，不会阻塞扫描；拿不到结论时返回 unknown（不改变风险）。
+    fileprivate static func cargoBuildState(ofProfiles profiles: [URL]) -> CargoBuildState {
+        var sawLockFile = false
+        var state = CargoBuildState.idle
+        for profile in profiles {
+            let lock = profile.appendingPathComponent(".cargo-lock")
+            guard fileManager.fileExists(atPath: lock.path) else { continue }
+            sawLockFile = true
+            switch cargoLockIsHeld(lock) {
+            case .some(true):
+                return .building
+            case .some(false):
+                continue
+            case .none:
+                state = .unknown
+            }
+        }
+        return sawLockFile ? state : .unknown
+    }
+
+    /// 返回 true 表示已有进程持有该文件的 flock（cargo 正在构建）。
+    fileprivate static func cargoLockIsHeld(_ lock: URL) -> Bool? {
+        let descriptor = open(lock.path, O_RDONLY)
+        guard descriptor >= 0 else { return nil }
+        defer { close(descriptor) }
+
+        if flock(descriptor, LOCK_EX | LOCK_NB) == 0 {
+            flock(descriptor, LOCK_UN)
+            return false
+        }
+        return errno == EWOULDBLOCK ? true : nil
+    }
+
+    /// 由 artifact 路径反推 cargo profile 的锁文件：
+    /// `.../target/<profile>/deps` 与 `.../target/<triple>/<profile>/deps` 都覆盖。
+    /// 根级的 `target/doc`、`target/package` 归到 target 根：cargo 的 `.cargo-lock` 也可能
+    /// 直接放在 target 下，因此两种位置都返回候选锁路径。
+    /// 只认 target 下两层的标准结构，避免把任意路径当 cargo 目标。
+    static func cargoProfileLockPath(forArtifact path: URL) -> URL? {
+        let artifact = path.standardizedFileURL
+        guard cargoArtifactNames.contains(artifact.lastPathComponent) else { return nil }
+        let profile = artifact.deletingLastPathComponent()
+
+        // target/<artifact>：doc、package 直接挂在 target 根。
+        if profile.lastPathComponent == "target" {
+            guard cargoRootArtifactNames.contains(artifact.lastPathComponent) else { return nil }
+            return profile.appendingPathComponent(".cargo-lock")
+        }
+        // target/<profile>/<artifact> 或 target/<triple>/<profile>/<artifact>：
+        // 交叉编译时 profile 的父目录是三元组，再上一层才是 target。
+        let parent = profile.deletingLastPathComponent()
+        guard parent.lastPathComponent == "target"
+                || parent.deletingLastPathComponent().lastPathComponent == "target"
+        else { return nil }
+        return profile.appendingPathComponent(".cargo-lock")
     }
 
     private static let monorepoMarkers: Set<String> = [
@@ -1616,13 +1905,81 @@ struct CacheScanner {
         if url.lastPathComponent == "cache" && url.deletingLastPathComponent().lastPathComponent == ".yarn" {
             return GeneratedRule(category: "Node.js 项目", risk: .review, note: "Yarn 离线缓存，会重新下载依赖")
         }
-        if hasValidCacheDirectoryTag(url) {
-            return GeneratedRule(category: "其他开发缓存", risk: .safe, note: "目录包含有效 CACHEDIR.TAG，软件声明其内容可作为缓存重建；仍受删除安全校验和白名单控制")
-        }
         if url.lastPathComponent.hasPrefix("cmake-build-") {
             return GeneratedRule(category: "项目生成物", risk: .review, note: "CMake 构建产物，可按需重新生成")
         }
-        return generatedRules[url.lastPathComponent]
+        // `target` 是 cargo 和 Maven/Gradle 共用的目录名，必须按内容判断归属，
+        // 不能按名字直接归到 Rust，也不能让 CACHEDIR.TAG 抢先命中。
+        if name == "target", let rule = targetDirectoryRule(for: url) {
+            return rule
+        }
+        // 具名规则优先于 CACHEDIR.TAG：cargo 会在 target/ 写入 CACHEDIR.TAG，
+        // 如果让 tag 抢先命中，整个 target 会被误标成「其他开发缓存 / 可直接清理」，
+        // 既丢失 Rust 分类，又可能被一键勾选删除。
+        if let rule = generatedRules[url.lastPathComponent] {
+            return rule
+        }
+        if hasValidCacheDirectoryTag(url) {
+            return GeneratedRule(category: "其他开发缓存", risk: .safe, note: "目录包含有效 CACHEDIR.TAG，软件声明其内容可作为缓存重建；仍受删除安全校验和白名单控制")
+        }
+        return nil
+    }
+
+    /// `target` 目录的归属判断，按证据优先级：
+    /// 1. cargo 证据（`.rustc_info.json` / 带 cargo 签名的 CACHEDIR.TAG / profile 下的
+    ///    `.cargo-lock`、`.fingerprint`）→ Rust；
+    /// 2. 同级有 `Cargo.toml` → Rust（刚创建、还没构建的 target）；
+    /// 3. Java 构建输出特征（classes、generated-sources 等）→ JVM；
+    /// 4. 同级有其他项目标志 → 通用项目生成物；
+    /// 5. 都没有 → nil，避免按名字误报。
+    private static func targetDirectoryRule(for url: URL) -> GeneratedRule? {
+        let parent = url.deletingLastPathComponent()
+        if isCargoTargetRoot(url) {
+            return GeneratedRule(
+                category: "Rust / Tauri 项目",
+                risk: .review,
+                note: "Rust/Tauri 编译产物，删除后 cargo build 会重新生成"
+            )
+        }
+        if directoryContainsNamedFile(parent, names: ["Cargo.toml"]) {
+            return GeneratedRule(
+                category: "Rust / Tauri 项目",
+                risk: .review,
+                note: "Rust/Tauri 编译产物，删除后 cargo build 会重新生成"
+            )
+        }
+        if isJavaTargetDirectory(url) {
+            return GeneratedRule(
+                category: "JVM",
+                risk: .review,
+                note: "Maven/Gradle 构建输出（classes、生成源码、打包结果），重新构建会重新生成"
+            )
+        }
+        if hasProjectMarker(parent) {
+            return GeneratedRule(
+                category: "项目生成物",
+                risk: .review,
+                note: "项目构建输出目录，可按需重新生成；请确认内容后清理"
+            )
+        }
+        return nil
+    }
+
+    /// Java 构建输出特征。fastbee 这类模块可能没有 pom.xml（父工程统一管理或
+    /// 只保留了 target），因此以目录内容为准，不强制要求同级构建文件。
+    static func isJavaTargetDirectory(_ url: URL) -> Bool {
+        guard url.lastPathComponent == "target" else { return false }
+        let artifactNames: Set<String> = [
+            "classes", "test-classes", "generated-sources", "generated-test-sources",
+            "maven-status", "surefire-reports", "failsafe-reports", "site", "maven-archiver"
+        ]
+        guard let children = try? fileManager.contentsOfDirectory(
+            at: url,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return false }
+        let names = Set(children.map(\.lastPathComponent))
+        return !names.isDisjoint(with: artifactNames)
     }
 
     static func hasValidCacheDirectoryTag(_ directory: URL) -> Bool {
@@ -1828,7 +2185,8 @@ struct CacheScanner {
         kind: CleanupKind = .trash,
         identifier: String? = nil,
         toolAction: ToolCleanupAction? = nil,
-        statusTitle: String? = nil
+        statusTitle: String? = nil,
+        measuredSize: Int64? = nil
     ) -> CacheItem? {
         let standardized = path.standardizedFileURL
         guard fileManager.fileExists(atPath: standardized.path) else { return nil }
@@ -1852,7 +2210,8 @@ struct CacheScanner {
             return nil
         }
 
-        let measuredSize = size(of: standardized)
+        // cargo target 拆分时会用一次 du 批量测量所有子目录，避免硬链接被重复计算。
+        let measuredSize = measuredSize ?? size(of: standardized)
         guard measuredSize >= minimumItemSize else { return nil }
         return CacheItem(
             category: category,
@@ -1999,6 +2358,18 @@ protocol TrashExecuting {
     func trash(_ url: URL) throws
 }
 
+/// cargo 构建期间拒绝清理 target 产物的原因。
+enum CargoCleanupError: LocalizedError, Equatable {
+    case buildInProgress
+
+    var errorDescription: String? {
+        switch self {
+        case .buildInProgress:
+            return "检测到 cargo 正在构建这个 target，为避免破坏构建已跳过。请等构建结束后重新扫描再清理。"
+        }
+    }
+}
+
 struct FileManagerTrashExecutor: TrashExecuting {
     func trash(_ url: URL) throws {
         try FileManager.default.trashItem(at: url, resultingItemURL: nil)
@@ -2028,6 +2399,19 @@ struct CacheCleaner {
             ? xctestActivityInspector.currentState()
             : nil
 
+        // cargo 构建的 TOCTOU 二次确认：扫描时空闲、点击清理时可能已经开跑。
+        // 删除 deps/incremental 会让正在构建的 cargo 读到半截产物甚至失败，
+        // 所以只要这一批里包含 cargo artifact，就在删除前重新检查一次锁文件。
+        let cargoProfileLocks = items.flatMap { item -> [URL] in
+            guard let lock = CacheScanner.cargoProfileLockPath(forArtifact: item.path) else { return [] }
+            // 交叉编译与根级 artifact：cargo 的 .cargo-lock 也可能落在 target 根，
+            // 两处都检查，任一被持有都视为构建中。
+            var locks = [lock]
+            locks.append(lock.deletingLastPathComponent().appendingPathComponent(".cargo-lock"))
+            return locks
+        }
+        let cargoIsBuilding = cargoProfileLocks.contains { CacheScanner.cargoLockIsHeld($0) == true }
+
         for item in items {
             do {
                 if XCTestDeviceLocator.isXCTestDevicesPath(item.path, home: context.home) {
@@ -2039,6 +2423,9 @@ struct CacheCleaner {
                     case .unknown:
                         throw XCTestCleanupError.activityStateUnavailable
                     }
+                }
+                if cargoIsBuilding, CacheScanner.cargoProfileLockPath(forArtifact: item.path) != nil {
+                    throw CargoCleanupError.buildInProgress
                 }
                 switch item.kind {
                 case .trash:

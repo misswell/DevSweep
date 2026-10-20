@@ -322,6 +322,234 @@ final class ScannerCoverageTests: XCTestCase {
         XCTAssertNil(CacheScanner.generatedRule(for: ordinary.appendingPathComponent("build")))
     }
 
+    // MARK: - cargo target 拆分
+
+    private func makeCargoTarget(in root: URL) throws -> (project: URL, target: URL, debug: URL) {
+        let project = root.appendingPathComponent("rust-app")
+        let target = project.appendingPathComponent("target")
+        let debug = target.appendingPathComponent("debug")
+        try fileManager.createDirectory(at: project, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: project.appendingPathComponent("Cargo.toml"))
+        try fileManager.createDirectory(at: target, withIntermediateDirectories: true)
+        try Data("Signature: 8a477f597d28d172789f06886806bc55\n".utf8)
+            .write(to: target.appendingPathComponent("CACHEDIR.TAG"))
+        try Data("{}".utf8).write(to: target.appendingPathComponent(".rustc_info.json"))
+        return (project, target, debug)
+    }
+
+    /// cargo 在 target/ 写入 CACHEDIR.TAG，不能因此把整个 target 当成
+    /// 「其他开发缓存 / 可直接清理」；必须仍按 Rust 项目处理。
+    func testCargoTargetKeepsRustRuleDespiteCachedirTag() throws {
+        let root = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: root) }
+        let (_, target, _) = try makeCargoTarget(in: root)
+
+        let rule = CacheScanner.generatedRule(for: target)
+        XCTAssertEqual(rule?.category, "Rust / Tauri 项目")
+        XCTAssertEqual(rule?.risk, .review)
+    }
+
+    /// 同名 target 的 Maven 目录必须按 JVM 处理，不能被误标成 Rust。
+    func testMavenTargetIsClassifiedAsJVM() throws {
+        let root = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: root) }
+        let module = root.appendingPathComponent("module")
+        let target = module.appendingPathComponent("target")
+        try fileManager.createDirectory(
+            at: target.appendingPathComponent("classes"),
+            withIntermediateDirectories: true
+        )
+        try Data("<project/>".utf8).write(to: module.appendingPathComponent("pom.xml"))
+
+        let rule = CacheScanner.generatedRule(for: target)
+        XCTAssertEqual(rule?.category, "JVM")
+        XCTAssertEqual(rule?.risk, .review)
+        XCTAssertTrue(CacheScanner.isJavaTargetDirectory(target))
+    }
+
+    /// cargo target 必须拆成 artifact 级条目（deps / incremental / build / ...），
+    /// 而不是只报一个巨大的 target 条目。
+    func testCargoTargetIsSplitIntoArtifactLevelItems() throws {
+        let root = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: root) }
+        let (_, target, debug) = try makeCargoTarget(in: root)
+
+        for artifact in ["deps", "incremental", "build", ".fingerprint", "examples"] {
+            try createAllocatedCache(at: debug.appendingPathComponent(artifact))
+        }
+        // 交叉编译：target/<triple>/<profile>/deps
+        try createAllocatedCache(
+            at: target.appendingPathComponent("aarch64-apple-darwin/release/deps")
+        )
+        // 根级 cargo doc
+        try createAllocatedCache(at: target.appendingPathComponent("doc"))
+
+        let report = CacheScanner.scan(
+            projectRoots: [root],
+            deepScan: true,
+            home: root.appendingPathComponent("home"),
+            includeSystemCaches: false,
+            progress: { _ in },
+            environment: [:]
+        )
+        let paths = Set(report.items.map(\.path))
+
+        // target 根条目不应再出现，取而代之的是 artifact 级条目。
+        XCTAssertFalse(paths.contains(target.standardizedFileURL))
+        XCTAssertTrue(paths.contains(debug.appendingPathComponent("deps").standardizedFileURL))
+        XCTAssertTrue(paths.contains(debug.appendingPathComponent("incremental").standardizedFileURL))
+        XCTAssertTrue(paths.contains(debug.appendingPathComponent("build").standardizedFileURL))
+        XCTAssertTrue(paths.contains(debug.appendingPathComponent(".fingerprint").standardizedFileURL))
+        XCTAssertTrue(paths.contains(debug.appendingPathComponent("examples").standardizedFileURL))
+        XCTAssertTrue(paths.contains(
+            target.appendingPathComponent("aarch64-apple-darwin/release/deps").standardizedFileURL
+        ))
+        XCTAssertTrue(paths.contains(target.appendingPathComponent("doc").standardizedFileURL))
+
+        let byPath = Dictionary(uniqueKeysWithValues: report.items.map { ($0.path, $0) })
+        XCTAssertEqual(byPath[debug.appendingPathComponent("incremental").standardizedFileURL]?.risk, .safe)
+        XCTAssertEqual(byPath[target.appendingPathComponent("doc").standardizedFileURL]?.risk, .safe)
+        XCTAssertEqual(byPath[debug.appendingPathComponent("deps").standardizedFileURL]?.risk, .review)
+
+        // 显示名要能区分 profile 和交叉编译三元组。
+        XCTAssertEqual(
+            byPath[debug.appendingPathComponent("deps").standardizedFileURL]?.name,
+            "deps · debug · rust-app"
+        )
+        XCTAssertEqual(
+            byPath[target.appendingPathComponent("aarch64-apple-darwin/release/deps").standardizedFileURL]?.name,
+            "deps · aarch64-apple-darwin/release · rust-app"
+        )
+    }
+
+    /// target 下的自定义输出目录（例如 macos-package）不能在拆分后消失。
+    func testCargoTargetKeepsCustomOutputDirectories() throws {
+        let root = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: root) }
+        let (_, target, _) = try makeCargoTarget(in: root)
+        try createAllocatedCache(at: target.appendingPathComponent("debug/deps"))
+        let package = target.appendingPathComponent("macos-package")
+        try createAllocatedCache(at: package)
+
+        let report = CacheScanner.scan(
+            projectRoots: [root],
+            deepScan: true,
+            home: root.appendingPathComponent("home"),
+            includeSystemCaches: false,
+            progress: { _ in },
+            environment: [:]
+        )
+        let item = report.items.first { $0.path == package.standardizedFileURL }
+        XCTAssertEqual(item?.category, "Rust / Tauri 项目")
+        XCTAssertEqual(item?.risk, .review)
+    }
+
+    /// 构建进行中（cargo 持有 .cargo-lock）时，cargo artifact 必须禁止清理。
+    func testCargoArtifactsAreProtectedWhileBuildHoldsLock() throws {
+        let root = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: root) }
+        let (_, _, debug) = try makeCargoTarget(in: root)
+        try createAllocatedCache(at: debug.appendingPathComponent("incremental"))
+        let lock = debug.appendingPathComponent(".cargo-lock")
+        try Data().write(to: lock)
+
+        // 模拟 cargo 持有构建锁：本进程用 flock 锁住 .cargo-lock。
+        let descriptor = open(lock.path, O_RDONLY)
+        XCTAssertGreaterThanOrEqual(descriptor, 0)
+        defer {
+            flock(descriptor, LOCK_UN)
+            close(descriptor)
+        }
+        XCTAssertEqual(flock(descriptor, LOCK_EX | LOCK_NB), 0)
+
+        let report = CacheScanner.scan(
+            projectRoots: [root],
+            deepScan: true,
+            home: root.appendingPathComponent("home"),
+            includeSystemCaches: false,
+            progress: { _ in },
+            environment: [:]
+        )
+        let item = report.items.first {
+            $0.path == debug.appendingPathComponent("incremental").standardizedFileURL
+        }
+        XCTAssertEqual(item?.risk, .manual)
+        XCTAssertEqual(item?.statusTitle, "正在构建")
+        XCTAssertFalse(item?.isSelected ?? true)
+
+        // 删除侧 TOCTOU：构建锁仍被持有，清理必须被拒绝。
+        let cleanup = CacheCleaner.clean(
+            [item!],
+            context: DeletionContext(
+                whitelistedPaths: [],
+                projectRoots: [root],
+                allowedPaths: [item!.path]
+            )
+        )
+        XCTAssertTrue(cleanup.removed.isEmpty)
+        XCTAssertEqual(cleanup.failures.count, 1)
+        XCTAssertTrue(cleanup.failures.first?.1.contains("cargo 正在构建") ?? false)
+    }
+
+    /// 删除侧要按 artifact 路径反推出 cargo 的锁文件位置，
+    /// 交叉编译（target/<triple>/<profile>）和根级 doc/package 都要覆盖。
+    func testCargoArtifactPathDerivesLockLocationSafely() {
+        let expected: [(String, Bool)] = [
+            ("/a/b/target/debug/deps", true),
+            ("/a/b/target/debug/incremental", true),
+            ("/a/b/target/debug/.fingerprint", true),
+            ("/a/b/target/aarch64-apple-darwin/release/deps", true),
+            ("/a/b/target/wasm32-unknown-unknown/debug/incremental", true),
+            ("/a/b/target/doc", true),
+            ("/a/b/target/package", true),
+            // 反例：不能把普通目录误判成 cargo 目标
+            ("/a/b/notarget/debug/deps", false),
+            ("/a/b/target/random-dir", false),
+            ("/a/b/target/debug", false),
+            ("/a/node_modules/deps", false),
+            ("/a/b/target/x/y/z/deps", false)
+        ]
+        for (path, shouldResolve) in expected {
+            let resolved = CacheScanner.cargoProfileLockPath(forArtifact: URL(fileURLWithPath: path))
+            XCTAssertEqual(resolved != nil, shouldResolve, "unexpected result for \(path)")
+        }
+
+        // 交叉编译的锁文件应指向 profile 目录本身。
+        XCTAssertEqual(
+            CacheScanner.cargoProfileLockPath(
+                forArtifact: URL(fileURLWithPath: "/a/b/target/aarch64-apple-darwin/release/deps")
+            )?.path,
+            "/a/b/target/aarch64-apple-darwin/release/.cargo-lock"
+        )
+    }
+
+    /// 批量测量必须在同一批参数里对硬链接去重，否则拆分后总大小会被重复累加。
+    func testBatchSizeMeasurementDeduplicatesHardLinks() throws {
+        let root = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: root) }
+        let first = root.appendingPathComponent("deps")
+        let second = root.appendingPathComponent("incremental")
+        try fileManager.createDirectory(at: first, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: second, withIntermediateDirectories: true)
+
+        let shared = first.appendingPathComponent("shared.bin")
+        try Data(repeating: 0xA5, count: 2_100_000).write(to: shared)
+        try fileManager.linkItem(at: shared, to: second.appendingPathComponent("shared.bin"))
+        try Data(repeating: 0xA5, count: 1_100_000)
+            .write(to: second.appendingPathComponent("own.bin"))
+
+        let measured = CacheScanner.sizes(of: [first, second])
+        let firstSize = try XCTUnwrap(measured[first.standardizedFileURL.path])
+        let secondSize = try XCTUnwrap(measured[second.standardizedFileURL.path])
+        let total = firstSize + secondSize
+
+        // 两个目录合计约 3.2 MB；若硬链接被重复计算会接近 5.3 MB。
+        XCTAssertGreaterThan(firstSize, 0)
+        XCTAssertGreaterThan(secondSize, 0)
+        XCTAssertLessThan(total, 4_000_000, "hardlinked file must not be counted twice")
+        XCTAssertGreaterThan(total, 3_000_000)
+    }
+
     func testNewProjectArtifactRulesCoverModernToolchains() throws {
         let root = try temporaryDirectory()
         defer { try? fileManager.removeItem(at: root) }

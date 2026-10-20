@@ -2,7 +2,7 @@
 
 DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcode、Rust/Tauri、Node、SwiftPM、Cargo、Gradle、Maven、Python、Go、Flutter、VS Code、Cursor 以及 OpenAI Codex、OpenCode、Claude Code、Goose 等 AI agent 开发环境。
 
-当前版本：0.1.42
+当前版本：0.1.43
 
 ## 当前功能
 
@@ -11,6 +11,8 @@ DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcod
 - 扫描常见开发者缓存白名单，不扫描照片、文档、邮件或整个磁盘；目录占用使用 macOS `du` 校准，避免只读到目录元数据而漏报大缓存。
 - 默认发现 `~/Code`、`~/Projects`、`~/Developer`、`~/Development`、`~/Work`、`~/src`、`~/workspace`、`~/www`、`~/GitHub` 以及存在时的 `~/.codex/worktrees`、`~/.claude/worktrees`，也支持添加多个项目根目录并持久化保存；不会把整个 `~/.codex` 或 `~/.claude` 当作项目根。
 - 深度扫描项目目录，查找 `target`、`node_modules`、`.build`、`Pods`、`build`、`build-*`、`dist`、`output`、`release-v<版本>`、带版本号的项目发布包、`.next`、`.turbo`、`.dart_tool`、Python 缓存、测试产物等生成物；Xcode 自定义 `build-*` 目录必须同时位于 Xcode 项目根目录并具备多个 DerivedData 特征，避免按名称误报。
+- Rust `cargo` 的 `target` 不再只报一个巨大条目，而是按 artifact 拆分：`deps`、`incremental`、`build`、`.fingerprint`、`examples`、`doc`、`package`、`bundle`，并区分 `target/<profile>` 与交叉编译的 `target/<triple>/<profile>`，标题形如 `deps · debug · pdfcraft`；`incremental`/`doc` 视为可直接清理，其余按「建议确认」处理。拆分用一次 `du` 批量测量并利用 macOS du 的硬链接去重，避免 `deps` 与 `incremental` 共享 inode 时重复计算空间；`target` 下的自定义输出目录（如打包暂存）仍单独列出，不会消失。扫描和删除前都会用 cargo 的 `.cargo-lock` flock 二次确认：构建进行中整组标为「正在构建」并禁止勾选，删除侧遇到构建中的 target 会直接跳过该项。
+- 修正 `target` 的分类优先级：cargo 会写入 `CACHEDIR.TAG`，具名规则现在优先于该标签，`target` 始终按 Rust 项目归类，不再被误判为「其他开发缓存 / 可直接清理」；同名目录按内容判归属：有 cargo 证据（`.rustc_info.json`、cargo 签名 `CACHEDIR.TAG`、profile 下的 `.cargo-lock`/`.fingerprint`）或同级有 `Cargo.toml` 才归 Rust；有 `classes`/`generated-sources` 等 Java 构建输出特征的归 JVM；同级有其他项目标志的归「项目生成物」；无证据时不按名字误报。
 - 识别 Xcode `ModuleCache`、`SourcePackages`、Preview、源码控制缓存，以及按 UUID 拆分的 XCTest 克隆设备和 CoreSimulator 设备。
 - 读取 npm、Cargo、Go、pip、uv、Poetry、Gradle 等自定义环境变量和 npm 配置，尽量覆盖不在默认路径的缓存。
 - 覆盖 Docker 官方 CLI 可回收的未使用镜像、已停止容器、未使用卷和 Build Cache，并显示 Docker Desktop 虚拟磁盘占用；虚拟磁盘只读，Docker CLI 清理需单独确认且不能从废纸篓恢复。
