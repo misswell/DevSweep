@@ -422,6 +422,91 @@ final class ScannerCoverageTests: XCTestCase {
         )
     }
 
+    /// Sizqo: after deps/incremental have gone, large static libraries and the
+    /// runnable binary directly in debug must still appear, without the parent.
+    @MainActor
+    func testCargoProfileLooseOutputsAreScannedAndCanJoinQuickClean() throws {
+        let root = try temporaryDirectory().resolvingSymlinksInPath()
+        defer { try? fileManager.removeItem(at: root) }
+        let (_, target, debug) = try makeCargoTarget(in: root)
+        try createAllocatedCache(at: debug.appendingPathComponent(".fingerprint"))
+        let outputs = [debug.appendingPathComponent("libsizqo_lib.a"),
+                       debug.appendingPathComponent("libsizqo_lib.rlib"),
+                       debug.appendingPathComponent("sizqo"),
+                       target.appendingPathComponent("aarch64-apple-darwin/release/libdemo.a")]
+        for output in outputs { try createAllocatedFile(at: output) }
+        try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: outputs[2].path)
+        let unrelated = debug.appendingPathComponent("notes.txt")
+        try createAllocatedFile(at: unrelated)
+        let report = CacheScanner.scan(
+            projectRoots: [root], deepScan: true, home: root.appendingPathComponent("home"),
+            includeSystemCaches: false, progress: { _ in }, environment: [:]
+        )
+        let suite = "CargoOutputs-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = DevSweepStore(defaults: defaults)
+        for output in outputs {
+            let item = try XCTUnwrap(report.items.first { $0.path == output.standardizedFileURL }, output.path)
+            XCTAssertEqual(item.risk, .review)
+            XCTAssertFalse(item.isSelected)
+            XCTAssertEqual(item.expectedFileIdentity?.kind, .regular)
+            XCTAssertEqual(store.addToQuickClean([item]).added, 1)
+        }
+        XCTAssertFalse(report.items.contains { $0.path == debug || $0.path == target || $0.path == unrelated })
+        XCTAssertTrue(store.quickCleanEntries.allSatisfy(\.isCargoBuildFile))
+        let freshItems = QuickCleanInspector.executableItems(for: store.quickCleanEntries)
+        XCTAssertEqual(Set(freshItems.map(\.path)), Set(outputs))
+        XCTAssertTrue(freshItems.allSatisfy { $0.kind == .trash })
+        XCTAssertNotNil(CacheScanner.cargoProfileLockPath(forArtifact: outputs[0]))
+        XCTAssertNil(CacheScanner.cargoBuildFileProfile(for: unrelated))
+    }
+
+    func testNewCargoBuildLockProtectsLooseOutputsAndDeletion() throws {
+        let root = try temporaryDirectory().resolvingSymlinksInPath()
+        defer { try? fileManager.removeItem(at: root) }
+        let (_, target, debug) = try makeCargoTarget(in: root)
+        let output = debug.appendingPathComponent("libsizqo.a")
+        try createAllocatedFile(at: output)
+        let item = CacheItem(category: "Rust / Tauri 项目", name: "libsizqo.a", path: output, size: 1_100_000, risk: .review)
+        let lock = debug.appendingPathComponent(".cargo-build-lock")
+        fileManager.createFile(atPath: lock.path, contents: Data())
+        let descriptor = open(lock.path, O_RDWR)
+        XCTAssertGreaterThanOrEqual(descriptor, 0)
+        defer { flock(descriptor, LOCK_UN); close(descriptor) }
+        XCTAssertEqual(flock(descriptor, LOCK_EX | LOCK_NB), 0)
+        let report = CacheScanner.scan(
+            projectRoots: [root], deepScan: true, home: root.appendingPathComponent("home"),
+            includeSystemCaches: false, progress: { _ in }, environment: [:]
+        )
+        XCTAssertEqual(report.items.first { $0.path == output }?.risk, .manual)
+        let cleanup = CacheCleaner.clean([item], context: DeletionContext(
+            whitelistedPaths: [], projectRoots: [root], allowedPaths: [output]
+        ))
+        XCTAssertEqual(cleanup.failures.count, 1)
+        XCTAssertTrue(cleanup.removed.isEmpty)
+        XCTAssertTrue(fileManager.fileExists(atPath: output.path))
+        XCTAssertTrue(CacheScanner.cargoLockPaths(forArtifact: output).contains(target.appendingPathComponent(".cargo-build-lock")))
+    }
+
+    func testElectronDistributionIsCountedOnceThroughNodeModules() throws {
+        let root = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: root) }
+        let modules = root.appendingPathComponent("solo-office/node_modules")
+        let electronDist = modules.appendingPathComponent("electron/dist")
+        try createAllocatedCache(at: electronDist)
+        try Data("{}".utf8).write(to: modules.deletingLastPathComponent().appendingPathComponent("package.json"))
+        let report = CacheScanner.scan(
+            projectRoots: [root], deepScan: true, home: root.appendingPathComponent("home"),
+            includeSystemCaches: false, progress: { _ in }, environment: [:]
+        )
+        let items = report.items.filter { $0.path.path == modules.path }
+        XCTAssertEqual(items.count, 1, report.items.map(\.path.path).joined(separator: "\n"))
+        XCTAssertFalse(report.items.contains { $0.path.path == electronDist.path })
+        XCTAssertEqual(items.first?.risk, .review)
+        XCTAssertEqual(items.first?.isSelected, false)
+    }
+
     /// target 下的自定义输出目录（例如 macos-package）不能在拆分后消失。
     func testCargoTargetKeepsCustomOutputDirectories() throws {
         let root = try temporaryDirectory()

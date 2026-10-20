@@ -130,7 +130,7 @@ struct DeletionValidator {
         item: CacheItem,
         context: DeletionContext
     ) throws {
-        guard item.kind == .trash || item.kind == .toolCommand else {
+        guard item.kind == .trash || item.kind == .toolCommand || item.kind == .simulatorDevice else {
             throw DeletionValidationError.unsupportedTarget
         }
 
@@ -159,6 +159,11 @@ struct DeletionValidator {
             throw DeletionValidationError.protectedPath
         }
 
+        if item.kind != .simulatorDevice,
+           QuickCleanInspector.isReservedPath(standardized, home: context.home) {
+            throw DeletionValidationError.unsupportedTarget
+        }
+
         guard !PathWhitelist.contains(standardized, in: context.whitelistedPaths),
               !PathWhitelist.contains(physical, in: context.whitelistedPaths)
         else {
@@ -180,6 +185,9 @@ struct DeletionValidator {
         else {
             throw DeletionValidationError.pathChanged
         }
+        if item.kind == .simulatorDevice, currentIdentity.kind != .directory {
+            throw DeletionValidationError.unsupportedTarget
+        }
     }
 
     /// 「加入常用清理」前的资格检查：默认只允许目录，安装包可显式允许普通文件，
@@ -187,6 +195,9 @@ struct DeletionValidator {
     /// 这里不放宽任何现有保护。
     static func validateQuickCleanRegistration(path: URL, allowRegularFile: Bool = false) throws {
         let standardized = path.standardizedFileURL
+        guard !QuickCleanInspector.isReservedPath(
+            standardized, home: fileManager.homeDirectoryForCurrentUser
+        ) else { throw DeletionValidationError.unsupportedTarget }
         guard fileManager.fileExists(atPath: standardized.path) else {
             throw DeletionValidationError.pathMissing
         }

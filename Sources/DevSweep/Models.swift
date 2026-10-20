@@ -279,6 +279,9 @@ struct QuickCleanEntry: Codable, Hashable, Identifiable {
     enum TargetKind: String, Codable {
         case directory
         case updateArchive
+        case cargoBuildFile
+        case simulatorDevice
+        case manual
     }
 
     let path: String
@@ -287,8 +290,20 @@ struct QuickCleanEntry: Codable, Hashable, Identifiable {
     let dateAdded: Date
     // 旧配置没有此字段，继续按目录处理，避免扩大已有授权。
     var targetKind: TargetKind? = nil
+    var identifier: String? = nil
 
     var isUpdateArchive: Bool { targetKind == .updateArchive }
+    var isCargoBuildFile: Bool { targetKind == .cargoBuildFile }
+    var allowsRegularFile: Bool { isUpdateArchive || isCargoBuildFile }
+    var isSimulator: Bool { targetKind == .simulatorDevice }
+    var isManual: Bool { targetKind == .manual }
+    var isAutomatic: Bool { !isSimulator && !isManual }
+
+    var modeTitle: String {
+        if isSimulator { return "需确认删除" }
+        if isManual { return "手动处理" }
+        return "一键清理"
+    }
 
     var id: String {
         URL(fileURLWithPath: path).standardizedFileURL.path
@@ -301,8 +316,10 @@ struct QuickCleanSnapshot: Identifiable {
     let exists: Bool
     let size: Int64
     let fileIdentity: FileIdentity?
+    var protection: String? = nil
 
     var id: String { entry.id }
+    var canClean: Bool { exists && fileIdentity != nil && protection == nil && !entry.isManual }
 }
 
 enum QuickCleanRegistry {

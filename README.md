@@ -12,6 +12,7 @@ DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcod
 - 默认发现 `~/Code`、`~/Projects`、`~/Developer`、`~/Development`、`~/Work`、`~/src`、`~/workspace`、`~/www`、`~/GitHub` 以及存在时的 `~/.codex/worktrees`、`~/.claude/worktrees`，也支持添加多个项目根目录并持久化保存；不会把整个 `~/.codex` 或 `~/.claude` 当作项目根。
 - 深度扫描项目目录，查找 `target`、`node_modules`、`.build`、`Pods`、`build`、`build-*`、`dist`、`output`、`release-v<版本>`、带版本号的项目发布包、`.next`、`.turbo`、`.dart_tool`、Python 缓存、测试产物等生成物；Xcode 自定义 `build-*` 目录必须同时位于 Xcode 项目根目录并具备多个 DerivedData 特征，避免按名称误报。
 - Rust `cargo` 的 `target` 不再只报一个巨大条目，而是按 artifact 拆分：`deps`、`incremental`、`build`、`.fingerprint`、`examples`、`doc`、`package`、`bundle`，并区分 `target/<profile>` 与交叉编译的 `target/<triple>/<profile>`，标题形如 `deps · debug · pdfcraft`；`incremental`/`doc` 视为可直接清理，其余按「建议确认」处理。拆分用一次 `du` 批量测量并利用 macOS du 的硬链接去重，避免 `deps` 与 `incremental` 共享 inode 时重复计算空间；`target` 下的自定义输出目录（如打包暂存）仍单独列出，不会消失。扫描和删除前都会用 cargo 的 `.cargo-lock` flock 二次确认：构建进行中整组标为「正在构建」并禁止勾选，删除侧遇到构建中的 target 会直接跳过该项。
+- Rust/Tauri profile 顶层的静态库（`.a`）、Rust 库（`.rlib`）、动态库和可执行文件也会独立列出，解决 `src-tauri/target/debug` 只剩最终输出时漏扫；均标为“建议确认”，支持加入常用清理。扫描和删除同时检查 `.cargo-lock`、`.cargo-build-lock`、`.cargo-artifact-lock`，有构建锁时禁止清理。Electron 的 `node_modules/electron/dist` 计入外层 `node_modules`，不重复列出或计数；清理后需恢复依赖才能运行 Electron。
 - 修正 `target` 的分类优先级：cargo 会写入 `CACHEDIR.TAG`，具名规则现在优先于该标签，`target` 始终按 Rust 项目归类，不再被误判为「其他开发缓存 / 可直接清理」；同名目录按内容判归属：有 cargo 证据（`.rustc_info.json`、cargo 签名 `CACHEDIR.TAG`、profile 下的 `.cargo-lock`/`.fingerprint`）或同级有 `Cargo.toml` 才归 Rust；有 `classes`/`generated-sources` 等 Java 构建输出特征的归 JVM；同级有其他项目标志的归「项目生成物」；无证据时不按名字误报。
 - 识别 Xcode `ModuleCache`、`SourcePackages`、Preview、源码控制缓存，以及按 UUID 拆分的 XCTest 克隆设备和 CoreSimulator 设备。
 - 读取 npm、Cargo、Go、pip、uv、Poetry、Gradle 等自定义环境变量和 npm 配置，尽量覆盖不在默认路径的缓存。
@@ -25,7 +26,7 @@ DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcod
 - 项目扫描覆盖 `.terragrunt-cache`、`.astro`、`zig-out`、`.cxx`、项目内 DerivedData、monorepo marker 和有效 `CACHEDIR.TAG`；如果扫描根自身是 `node_modules`、`target`、`build`、`dist`、`vendor` 等生成物容器，会跳过其内部项目发现。对 Composer `vendor`、.NET `bin`/`obj` 和通用 `build` 必须先验证项目标志，避免按同名目录误报源码或运行时文件。
 - 识别 CoreSimulator 设备，通过 `xcrun simctl delete` 删除，避免直接破坏设备注册。
 - XCTest 克隆设备按动态状态展示：明确 UUID 命名的 clone 在未检测到 XCTest/UI 测试运行时显示「可安全清理」并默认勾选；检测到 `xcodebuild test`、`test-without-building`、`xctest`、`XCTRunner` 或 `XCTestAgent` 进程时显示「正在测试」并禁止勾选清理；无法确认进程状态时保守显示「无法确认状态」，同样禁止自动清理。标题只显示 8 位短 UUID，完整路径放在详情中；XCTestDevices 根目录或未识别内容永远保持「建议确认」不默认勾选。
-- 清理 XCTestDevices 项目前会重新检测一次测试进程（TOCTOU 二次确认，一次批量清理只检测一次）：扫描后启动的测试同样会阻止删除，被阻止的 clone 不影响同批次普通缓存继续清理；CoreSimulator 设备仍走 simctl，不受影响。
+- 清理 XCTestDevices 项目前会重新检测一次测试进程（TOCTOU 二次确认，一次批量清理只检测一次）：扫描后启动的测试同样会阻止删除，被阻止的 clone 不影响同批次普通缓存继续清理；CoreSimulator 设备独立通过 simctl 管理，删除前同样检查设备与构建/测试状态。
 - 提供 `deploy/ios-project-template/`（`scripts/test-ios.sh`、`scripts/ensure-scheme-serial.sh` 与 Agent 规则文本），用于在 iOS 项目内固定单 Simulator 测试：自动探测 workspace/project/scheme，固定 `-parallel-testing-enabled NO`、`-maximum-parallel-testing-workers 1`，只复用已有 Simulator、绝不 `simctl create`，从源头避免并行测试持续制造 XCTest clone。
 - 对 Xcode Archives、iOS DeviceSupport、SourcePackages、XCTest 克隆设备、项目生成物、自定义 `build-*` DerivedData 和版本化 Release 暂存目录标记为“建议确认”或“手动处理”；包含 Release App/归档或安装包的目录不会默认勾选。
 - 扫描过程中显示当前路径、已检查数量、跳过数量和权限异常；扫描完成后可查看实际扫描范围和诊断详情。
@@ -33,9 +34,9 @@ DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcod
 - 普通目录清理前会重新检查目标是否仍存在、是否发生 symlink/路径替换、是否落在危险根目录或当前白名单中；检查失败只记录该项失败并继续处理其他项目。
 - GitHub CLI、pnpm 和 uv 优先使用官方清理命令，并在执行前检查工具进程、白名单、缓存根目录和超时；命令型清理不会进入废纸篓，默认不勾选。
 - 每个项目都提供操作下拉菜单，可加入白名单/常用清理、在 Finder 中打开目录、复制完整路径或单独清理；加入白名单后条目立即从当前结果消失并清除勾选状态，不需要重新扫描；移出白名单会立即从最近一次扫描结果恢复；长路径可悬浮查看。
-- 新增「常用清理」：对 node_modules、target、DerivedData 等可再生成目录授予长期清理授权，加入后扫描列表出现「常用清理」标识，重新扫描后自动恢复；目录清理后配置保留、显示「当前无内容」，目录重新生成后可再次一键清理；一键清理全部不二次确认，全部走废纸篓、每次执行前重新捕获 FileIdentity；白名单与常用清理互斥，加入白名单会自动退出常用清理。
+- 「常用清理」区分收藏与清理授权：node_modules、DerivedData 等可再生成目录、已识别的软件更新安装包及 Rust 编译输出可长期授权移入废纸篓；清理后同一路径重新生成仍可一键清理，每次执行前重新捕获 FileIdentity。模拟器设备可按 UDID 收藏，每次必须单独确认永久删除；不会进入「一键清理缓存」，删除前重新核验设备登记、目录身份、关机状态及构建/测试活动，状态不明时跳过。设备删除后收藏保留并标记失效，同名新设备不会继承授权。系统级模拟器和 Xcode 文档缓存仅收藏供查看及手动处理，不会自动提权或清理。白名单与常用清理互斥，加入白名单会自动退出常用清理。
 - 侧栏新增「概览」（全部项目 / 常用清理 / 白名单）与分类两级导航；白名单拥有独立页面，可逐条移出；常用清理页面无需完整扫描即可即时刷新快照。
-- 常用清理也支持扫描识别的软件更新安装包（例如 `update.zip` 和 updater 目录中的版本化 ZIP）：只授权所选文件的完整路径，不清理整个父目录；同一路径重新生成可继续清理，文件名改变需重新加入。普通文档、数据库和其他未识别文件不支持加入，旧目录授权不会自动扩展到文件。
+- 常用清理支持扫描识别的软件更新安装包（例如 `update.zip` 和 updater 目录中的版本化 ZIP），以及已确认 Cargo target/profile 中的编译输出文件：只授权所选文件的完整路径，不清理整个父目录；同一路径重新生成可继续清理，文件名改变需重新加入。普通文档、数据库和其他未识别文件不支持加入，旧目录授权不会自动扩展到文件。
 - 「全选当前显示」只作用于当前可见条目（列表头提供三态 checkbox）。侧栏分类决定清理范围：「全部项目」覆盖全部，分类页只覆盖该分类勾选的项目，概览卡、列表头计数、底部「已选 N 项 · 大小」与「清理 N 项」按钮、以及「加入常用清理 / 加入白名单」都跟着当前分类切换，避免在分类页一键清理到没看到的其它分类；切换分类不会取消其它分类的勾选，底部会提示「其它分类还有 M 项保持勾选」。列表过滤器（只看已选 / 常用清理 / 只看大于指定大小，阈值 100 MB～1 GB 下拉可选、默认 1 GB，勾选状态与阈值会记住）只决定显示内容，永远不改变清理范围。迷你模式没有侧栏，清理范围是所有分类里勾选的项目。
 - 重新扫描期间保留上一次结果并在顶部显示进度，勾选与清理操作暂时禁用，新报告完成后一次性替换，避免界面闪空。
 - 支持迷你模式：以 360×640 的手机式竖屏窗口隐藏侧栏和说明卡，只保留扫描进度、缓存列表、选择、扫描和清理操作，并记住上次模式；从迷你模式切回普通模式时会根据窗口所在屏幕边缘向内展开，避免超出屏幕。

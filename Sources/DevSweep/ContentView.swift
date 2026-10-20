@@ -317,7 +317,7 @@ struct ContentView: View {
                 pendingQuickCleanItems = []
             }
         } message: {
-            Text("加入后即授权以后直接清理同一路径的项目，可用于可重新生成目录和已识别的软件更新安装包。清理后重新生成仍可一键清理；安装包文件名改变时需重新加入。清理安装包前请确认相关应用未在更新。")
+            Text("普通缓存、Rust 编译输出和更新安装包加入后，授权以后直接移入废纸篓；清理后同一路径重新生成仍可一键清理。模拟器设备仅收藏，每次删除都需确认且不可恢复；系统级缓存仅收藏供手动处理。清理安装包前请确认相关应用未在更新。")
         }
         .task {
             try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -384,7 +384,7 @@ struct ContentView: View {
                     .tag(SidebarDestination.all)
                     SidebarRow(
                         title: "常用清理",
-                        subtitle: "\(store.quickCleanEntries.count) 个长期授权目录",
+                        subtitle: "\(store.quickCleanEntries.count) 个常用项目 · 按类型清理",
                         icon: "bolt.fill",
                         size: store.quickCleanSize
                     )
@@ -1030,14 +1030,18 @@ private struct TransientNoticeView: View {
 /// 常用清理页面：独立展示长期授权目录，不要求先完整扫描。
 private struct QuickCleanPageView: View {
     @EnvironmentObject private var store: DevSweepStore
+    @State private var pendingSimulator: QuickCleanEntry?
+    @State private var pendingIdentity: FileIdentity?
+    @State private var showingSimulatorConfirmation = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             QuickCleanHeaderCard(
                 cleanableCount: store.cleanableQuickCleanSnapshots.count,
                 cleanableSize: store.quickCleanSize,
-                isBusy: store.isCleaning || store.isScanning,
-                onCleanAll: { store.cleanAllQuickClean() }
+                isBusy: store.isCleaning || store.isScanning || store.isRefreshingQuickClean,
+                onCleanAll: { store.cleanAllQuickClean() },
+                onRefresh: { store.refreshQuickCleanSnapshots() }
             )
 
             if store.quickCleanEntries.isEmpty {
@@ -1048,7 +1052,15 @@ private struct QuickCleanPageView: View {
                         QuickCleanEntryRow(
                             entry: entry,
                             snapshot: store.quickCleanSnapshots.first { $0.id == entry.id },
-                            onClean: { store.cleanQuickClean([entry]) }
+                            onClean: {
+                                if entry.isSimulator {
+                                    pendingSimulator = entry
+                                    pendingIdentity = store.quickCleanSnapshots.first { $0.id == entry.id }?.fileIdentity
+                                    showingSimulatorConfirmation = pendingIdentity != nil
+                                } else {
+                                    store.cleanQuickClean([entry])
+                                }
+                            }
                         )
                     }
                 }
@@ -1056,6 +1068,21 @@ private struct QuickCleanPageView: View {
         }
         .onAppear {
             store.refreshQuickCleanSnapshots()
+        }
+        .confirmationDialog("确认永久删除此模拟器设备？", isPresented: $showingSimulatorConfirmation, titleVisibility: .visible) {
+            Button("永久删除设备", role: .destructive) {
+                if let entry = pendingSimulator, let identity = pendingIdentity {
+                    store.deleteQuickCleanSimulator(entry, expectedIdentity: identity)
+                }
+                pendingSimulator = nil
+                pendingIdentity = nil
+            }
+            Button("取消", role: .cancel) {
+                pendingSimulator = nil
+                pendingIdentity = nil
+            }
+        } message: {
+            Text("\(pendingSimulator?.displayName ?? "模拟器")\nUDID：\(pendingSimulator?.identifier ?? "")\n设备中的 App、登录状态和测试数据将被永久删除，不能从废纸篓恢复。执行前会重新检查设备及构建/测试状态。")
         }
     }
 }
@@ -1065,6 +1092,7 @@ private struct QuickCleanHeaderCard: View {
     let cleanableSize: Int64
     let isBusy: Bool
     let onCleanAll: () -> Void
+    let onRefresh: () -> Void
 
     var body: some View {
         HStack(spacing: 14) {
@@ -1075,15 +1103,15 @@ private struct QuickCleanHeaderCard: View {
                 .background(Color.accentColor.opacity(0.12))
                 .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
             VStack(alignment: .leading, spacing: 3) {
-                Text("你长期授权的目录和更新安装包")
+                Text("常用项目，按类型安全处理")
                     .font(.subheadline.weight(.semibold))
-                Text("同一路径重新生成后仍可一键清理；文件名改变需重新加入。全部移入废纸篓，可恢复。")
+                Text("一键清理仅处理缓存、Rust 编译输出和更新安装包，可从废纸篓恢复。模拟器逐项确认删除；系统缓存手动处理。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             Spacer(minLength: 12)
             VStack(alignment: .trailing, spacing: 2) {
-                Text("当前可清理")
+                Text("可一键清理")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                 Text("\(cleanableCount) 项 · \(cleanableSize.devSweepFileSize)")
@@ -1093,11 +1121,16 @@ private struct QuickCleanHeaderCard: View {
             Button {
                 onCleanAll()
             } label: {
-                Label("一键清理全部", systemImage: "bolt.fill")
+                Label("一键清理缓存", systemImage: "bolt.fill")
             }
             .buttonStyle(.borderedProminent)
             .disabled(cleanableCount == 0 || isBusy)
-            .help("常用清理已代表长期授权，点击后直接移入废纸篓，不再二次确认")
+            .help("仅清理长期授权的普通缓存和更新安装包，不处理模拟器设备或手动项目")
+            Button(action: onRefresh) {
+                Image(systemName: "arrow.clockwise")
+            }
+            .disabled(isBusy)
+            .help("刷新常用项目和模拟器状态")
         }
         .padding(16)
         .background(.background)
@@ -1121,7 +1154,7 @@ private struct QuickCleanEntryRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: entry.isUpdateArchive ? "archivebox" : "folder")
+            Image(systemName: entry.isSimulator ? "iphone.gen3" : (entry.isManual ? "lock.shield" : (entry.isCargoBuildFile ? "hammer" : (entry.isUpdateArchive ? "archivebox" : "folder"))))
                 .font(.title3)
                 .foregroundStyle(.tint)
                 .frame(width: 32, height: 32)
@@ -1129,9 +1162,14 @@ private struct QuickCleanEntryRow: View {
                 .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
 
             VStack(alignment: .leading, spacing: 4) {
-                Text(entry.displayName)
-                    .font(.subheadline.weight(.semibold))
-                    .lineLimit(1)
+                HStack(spacing: 8) {
+                    Text(entry.displayName)
+                        .font(.subheadline.weight(.semibold))
+                        .lineLimit(1)
+                    Text(entry.modeTitle)
+                        .font(.caption2)
+                        .foregroundStyle(entry.isAutomatic ? Color.accentColor : (entry.isManual ? Color.red : Color.orange))
+                }
                 Text(pathURL.devSweepDisplayPath)
                     .font(.caption2.monospaced())
                     .foregroundStyle(.secondary)
@@ -1139,6 +1177,15 @@ private struct QuickCleanEntryRow: View {
                     .truncationMode(.middle)
                     .textSelection(.enabled)
                     .help(Text(verbatim: entry.path))
+                if let protection = snapshot?.protection {
+                    Text(protection)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else if entry.isSimulator {
+                    Text("按 UDID 收藏；删除设备及其中数据，不可从废纸篓恢复")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
             Spacer(minLength: 12)
             VStack(alignment: .trailing, spacing: 4) {
@@ -1151,12 +1198,14 @@ private struct QuickCleanEntryRow: View {
             }
             .frame(minWidth: 110, alignment: .trailing)
 
-            Button("清理") {
-                onClean()
+            Button(entry.isManual ? "打开位置" : (entry.isSimulator ? "删除设备…" : "清理")) {
+                if entry.isManual {
+                    NSWorkspace.shared.activateFileViewerSelecting([pathURL])
+                } else { onClean() }
             }
             .buttonStyle(.bordered)
-            .disabled(canClean == false)
-            .help("直接移入废纸篓")
+            .disabled(entry.isManual ? (snapshot?.exists != true || store.isCleaning) : !canClean)
+            .help(entry.isManual ? "在 Finder 中查看，需手动处理" : (entry.isSimulator ? "逐项确认后使用 simctl 删除，不可恢复" : "直接移入废纸篓"))
 
             Menu {
                 Button {
@@ -1198,12 +1247,13 @@ private struct QuickCleanEntryRow: View {
     }
 
     private var canClean: Bool {
-        guard let snapshot, snapshot.exists, snapshot.fileIdentity != nil else { return false }
-        return !store.isScanning && !store.isCleaning
+        guard let snapshot, snapshot.canClean else { return false }
+        return !store.isScanning && !store.isCleaning && !store.isRefreshingQuickClean
     }
 
     private var statusText: String {
         guard let snapshot else { return "检查中…" }
+        if entry.isSimulator && !snapshot.exists { return "设备已失效" }
         return snapshot.exists ? snapshot.size.devSweepFileSize : "当前无内容"
     }
 }
@@ -1216,7 +1266,7 @@ private struct QuickCleanEmptyView: View {
                 .foregroundStyle(.secondary)
             Text("还没有常用清理项目")
                 .font(.headline)
-            Text("在扫描结果中找到可重新生成目录或软件更新安装包，点 ⋯ 选择「加入常用清理」。同一路径重新生成后，可以在这里一键清理。")
+            Text("在扫描结果中点 ⋯ 选择「加入常用清理」。普通缓存和更新安装包支持一键清理；模拟器设备需逐次确认删除；系统级缓存仅收藏供手动处理。")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -1699,7 +1749,7 @@ private struct MiniItemRow: View {
                 } label: {
                     Label("加入常用清理", systemImage: "bolt.fill")
                 }
-                .disabled(item.kind != .trash || item.risk == .manual)
+                .disabled(QuickCleanInspector.registrationKind(for: item) == nil)
             }
             Button {
                 store.addToWhitelist([item])
@@ -1831,7 +1881,7 @@ private struct CacheItemRow: View {
                     } label: {
                         Label("加入常用清理", systemImage: "bolt.fill")
                     }
-                    .disabled(item.kind != .trash || item.risk == .manual || actionsDisabled)
+                    .disabled(QuickCleanInspector.registrationKind(for: item) == nil || actionsDisabled)
                 }
 
                 Button {
@@ -2049,11 +2099,11 @@ struct HelpView: View {
                 .foregroundStyle(.secondary)
             Text("四种状态")
                 .font(.headline)
-            Text("已选择：本次准备清理。常用清理：长期授权的可再生成目录或更新安装包，可随时一键清理。白名单：永远忽略，不允许清理。白名单保护优先于一切清理授权。")
+            Text("已选择：本次准备清理。常用清理：收藏常用项目，普通缓存和更新安装包长期授权一键清理，模拟器设备逐项确认，系统缓存手动处理。白名单：永远忽略，不允许清理。白名单保护优先于一切清理授权。")
                 .foregroundStyle(.secondary)
             Text("清理方式")
                 .font(.headline)
-            Text("普通缓存和 XCTest 克隆设备移入 macOS 废纸篓；常用清理项目同样移入废纸篓且不再二次确认；CoreSimulator 设备使用 simctl 删除以保持设备注册一致；Docker 资源使用官方 CLI 清理且不可恢复。红色项目不会自动删除，橙色项目默认不勾选。")
+            Text("普通缓存和 XCTest 克隆设备移入 macOS 废纸篓；常用清理中的普通缓存和更新安装包不再二次确认。CoreSimulator 设备逐项确认后使用 simctl 删除，执行前重新核验设备及构建/测试状态，不可从废纸篓恢复；系统级缓存仅供查看和手动处理。Docker 资源使用官方 CLI 清理且不可恢复。红色项目不会自动删除，橙色项目默认不勾选。")
                 .foregroundStyle(.secondary)
             Text("开源参考")
                 .font(.headline)

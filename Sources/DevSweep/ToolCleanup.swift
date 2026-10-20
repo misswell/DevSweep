@@ -17,7 +17,7 @@ protocol ProcessRunning {
     ) -> ProcessResult?
 }
 
-struct ProcessRunner: ProcessRunning {
+struct ProcessRunner: ProcessRunning, Sendable {
     static let shared = ProcessRunner()
 
     static func run(

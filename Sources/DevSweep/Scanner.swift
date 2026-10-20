@@ -1587,6 +1587,13 @@ struct CacheScanner {
                 .filter { cargoArtifactNames.contains($0.lastPathComponent) }
         }
 
+        func buildFiles(of directory: URL) -> [URL] {
+            let children = (try? fileManager.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+            )) ?? []
+            return children.filter { cargoBuildFileProfile(for: $0) != nil }
+        }
+
         var profiles: [(url: URL, prefix: String)] = []
         var rootArtifacts: [URL] = []
         var otherDirectories: [URL] = []
@@ -1597,14 +1604,14 @@ struct CacheScanner {
                 rootArtifacts.append(child)
                 continue
             }
-            if !artifactChildren(of: child).isEmpty {
+            if !artifactChildren(of: child).isEmpty || !buildFiles(of: child).isEmpty {
                 profiles.append((child, child.lastPathComponent))
                 continue
             }
             // target/<triple>/<profile>
             var foundNestedProfile = false
             for grandChild in childDirectories(at: child, collector: &collector, progress: progress)
-            where !artifactChildren(of: grandChild).isEmpty {
+            where !artifactChildren(of: grandChild).isEmpty || !buildFiles(of: grandChild).isEmpty {
                 profiles.append((grandChild, "\(child.lastPathComponent)/\(grandChild.lastPathComponent)"))
                 foundNestedProfile = true
             }
@@ -1618,6 +1625,13 @@ struct CacheScanner {
 
         var candidates: [(url: URL, name: String, risk: RiskLevel, note: String)] = []
         for profile in profiles {
+            for file in buildFiles(of: profile.url) {
+                candidates.append((
+                    url: file, name: "\(file.lastPathComponent) · \(profile.prefix) · \(projectName)",
+                    risk: .review,
+                    note: "Rust/Tauri 编译输出文件，移入废纸篓后需重新构建；请先保留仍需使用的可执行文件或库"
+                ))
+            }
             for artifact in artifactChildren(of: profile.url) {
                 let artifactRule = cargoArtifactRule(artifact.lastPathComponent)
                 candidates.append((
@@ -1660,7 +1674,7 @@ struct CacheScanner {
 
         // 构建进行中时 cargo 持有 target/<profile>/.cargo-lock。此时 deps/incremental
         // 正在被写入，删除会破坏构建甚至让 cargo 崩溃，因此整组标为手动处理。
-        let isBuilding = cargoBuildState(ofProfiles: profiles.map(\.url)) == .building
+        let isBuilding = cargoBuildState(ofProfiles: profiles.map(\.url) + [target]) == .building
 
         var items: [CacheItem] = []
         for candidate in candidates {
@@ -1753,8 +1767,7 @@ struct CacheScanner {
     fileprivate static func cargoBuildState(ofProfiles profiles: [URL]) -> CargoBuildState {
         var sawLockFile = false
         var state = CargoBuildState.idle
-        for profile in profiles {
-            let lock = profile.appendingPathComponent(".cargo-lock")
+        for lock in profiles.flatMap({ profile in cargoLockNames.map { profile.appendingPathComponent($0) } }) {
             guard fileManager.fileExists(atPath: lock.path) else { continue }
             sawLockFile = true
             switch cargoLockIsHeld(lock) {
@@ -1767,6 +1780,21 @@ struct CacheScanner {
             }
         }
         return sawLockFile ? state : .unknown
+    }
+
+    private static let cargoLockNames = [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"]
+
+    static func cargoLockPaths(forArtifact path: URL) -> [URL] {
+        guard let lock = cargoProfileLockPath(forArtifact: path) else { return [] }
+        var directory = lock.deletingLastPathComponent()
+        var paths: [URL] = []
+        // Include profile, optional target triple, and target root locks.
+        for _ in 0..<3 {
+            paths += cargoLockNames.map { directory.appendingPathComponent($0) }
+            if directory.lastPathComponent == "target" { break }
+            directory.deleteLastPathComponent()
+        }
+        return paths
     }
 
     /// 返回 true 表示已有进程持有该文件的 flock（cargo 正在构建）。
@@ -1788,6 +1816,9 @@ struct CacheScanner {
     /// 直接放在 target 下，因此两种位置都返回候选锁路径。
     /// 只认 target 下两层的标准结构，避免把任意路径当 cargo 目标。
     static func cargoProfileLockPath(forArtifact path: URL) -> URL? {
+        if let profile = cargoBuildFileProfile(for: path) {
+            return profile.appendingPathComponent(".cargo-lock")
+        }
         let artifact = path.standardizedFileURL
         guard cargoArtifactNames.contains(artifact.lastPathComponent) else { return nil }
         let profile = artifact.deletingLastPathComponent()
@@ -1804,6 +1835,30 @@ struct CacheScanner {
                 || parent.deletingLastPathComponent().lastPathComponent == "target"
         else { return nil }
         return profile.appendingPathComponent(".cargo-lock")
+    }
+
+    /// Direct profile outputs were previously invisible when deps/incremental
+    /// had already been cleaned. Restrict files to proven Cargo output roots.
+    static func cargoBuildFileProfile(for path: URL) -> URL? {
+        guard !path.lastPathComponent.hasPrefix("."),
+              FileIdentity.capture(path)?.kind == .regular else { return nil }
+        let profile = path.deletingLastPathComponent()
+        let parent = profile.deletingLastPathComponent()
+        let target: URL
+        if parent.lastPathComponent == "target" { target = parent }
+        else if parent.deletingLastPathComponent().lastPathComponent == "target" {
+            target = parent.deletingLastPathComponent()
+        } else { return nil }
+        guard isCargoTargetRoot(target),
+              fileManager.fileExists(atPath: profile.appendingPathComponent(".cargo-lock").path)
+                || fileManager.fileExists(atPath: profile.appendingPathComponent(".fingerprint").path)
+                || ["debug", "release"].contains(profile.lastPathComponent)
+        else { return nil }
+        let outputExtensions: Set<String> = ["a", "rlib", "rmeta", "dylib", "so", "dll", "exe", "pdb", "o", "d"]
+        guard outputExtensions.contains(path.pathExtension.lowercased())
+                || (path.pathExtension.isEmpty && fileManager.isExecutableFile(atPath: path.path))
+        else { return nil }
+        return profile
     }
 
     private static let monorepoMarkers: Set<String> = [
@@ -2383,7 +2438,8 @@ struct CacheCleaner {
         toolExecutor: ToolCommandExecuting = ToolCleanupExecutor(),
         requestLogCleaner: RequestLogCleaner = RequestLogCleaner(),
         xctestActivityInspector: XCTestActivityInspecting = XCTestActivityInspector(),
-        trashExecutor: TrashExecuting = FileManagerTrashExecutor()
+        trashExecutor: TrashExecuting = FileManagerTrashExecutor(),
+        simulatorExecutor: SimulatorCleanupExecuting = SimulatorCleanupExecutor()
     ) -> CleanupReport {
         var removed: [CacheItem] = []
         var failures: [(CacheItem, String)] = []
@@ -2403,12 +2459,7 @@ struct CacheCleaner {
         // 删除 deps/incremental 会让正在构建的 cargo 读到半截产物甚至失败，
         // 所以只要这一批里包含 cargo artifact，就在删除前重新检查一次锁文件。
         let cargoProfileLocks = items.flatMap { item -> [URL] in
-            guard let lock = CacheScanner.cargoProfileLockPath(forArtifact: item.path) else { return [] }
-            // 交叉编译与根级 artifact：cargo 的 .cargo-lock 也可能落在 target 根，
-            // 两处都检查，任一被持有都视为构建中。
-            var locks = [lock]
-            locks.append(lock.deletingLastPathComponent().appendingPathComponent(".cargo-lock"))
-            return locks
+            CacheScanner.cargoLockPaths(forArtifact: item.path)
         }
         let cargoIsBuilding = cargoProfileLocks.contains { CacheScanner.cargoLockIsHeld($0) == true }
 
@@ -2432,10 +2483,7 @@ struct CacheCleaner {
                     try DeletionValidator.validate(item: item, context: context)
                     try trashExecutor.trash(item.path)
                 case .simulatorDevice:
-                    guard let udid = item.identifier else {
-                        throw NSError(domain: "DevSweep", code: 1, userInfo: [NSLocalizedDescriptionKey: "缺少模拟器 UDID"])
-                    }
-                    try runSimctlDelete(udid: udid)
+                    try simulatorExecutor.delete(item, context: context)
                 case .dockerPrune:
                     guard let rawTarget = item.identifier,
                           let target = DockerCleanupTarget(rawValue: rawTarget) else {
@@ -2479,25 +2527,6 @@ struct CacheCleaner {
         return clean(items, context: context)
     }
 
-    private static func runSimctlDelete(udid: String) throws {
-        guard let result = ProcessRunner.run(
-            executable: URL(fileURLWithPath: "/usr/bin/xcrun"),
-            arguments: ["simctl", "delete", udid],
-            timeout: 30
-        ) else {
-            throw NSError(domain: "DevSweep", code: 3, userInfo: [NSLocalizedDescriptionKey: "xcrun 不可用"])
-        }
-        if result.timedOut {
-            throw NSError(domain: "DevSweep", code: 4, userInfo: [NSLocalizedDescriptionKey: "simctl 删除命令超时"])
-        }
-        guard result.status == 0 else {
-            let message = String(data: result.stderr, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-            throw NSError(domain: "DevSweep", code: Int(result.status), userInfo: [
-                NSLocalizedDescriptionKey: message?.isEmpty == false ? message! : "simctl 删除失败"
-            ])
-        }
-    }
-
     private static func runDockerPrune(_ target: DockerCleanupTarget) throws {
         guard let output = DockerSupport.run(arguments: target.arguments) else {
             throw NSError(domain: "DevSweep", code: 3, userInfo: [NSLocalizedDescriptionKey: "Docker CLI 不可用"])
@@ -2539,12 +2568,22 @@ final class DevSweepStore: ObservableObject {
     /// Scanner 本次发现的完整候选条目；白名单等用户规则在 rebuildItems() 中套用。
     private var rawScanItems: [CacheItem] = []
     private let defaults: UserDefaults
+    private let home: URL
+    private let simulatorInspector: SimulatorCleanupInspecting
+    private let simulatorExecutor: SimulatorCleanupExecuting
     private var transientNoticeTask: Task<Void, Never>?
     private var quickCleanRefreshGeneration = 0
 
-    init(defaults: UserDefaults = .standard) {
+    init(
+        defaults: UserDefaults = .standard,
+        home: URL = FileManager.default.homeDirectoryForCurrentUser,
+        simulatorInspector: SimulatorCleanupInspecting = SimulatorCleanupExecutor(),
+        simulatorExecutor: SimulatorCleanupExecuting = SimulatorCleanupExecutor()
+    ) {
         self.defaults = defaults
-        let home = FileManager.default.homeDirectoryForCurrentUser
+        self.home = home
+        self.simulatorInspector = simulatorInspector
+        self.simulatorExecutor = simulatorExecutor
         if let saved = defaults.array(forKey: Self.projectRootsKey) as? [String] {
             let configuredRoots = Self.normalizeProjectRoots(saved.map { URL(fileURLWithPath: $0) })
             projectRoots = saved.isEmpty
@@ -2594,7 +2633,7 @@ final class DevSweepStore: ObservableObject {
 
     /// 常用清理中当前真实存在、可一键清理的条目。
     var cleanableQuickCleanSnapshots: [QuickCleanSnapshot] {
-        quickCleanSnapshots.filter { $0.exists && $0.fileIdentity != nil }
+        quickCleanSnapshots.filter { $0.entry.isAutomatic && $0.canClean }
     }
 
     var quickCleanSize: Int64 {
@@ -2770,9 +2809,7 @@ final class DevSweepStore: ObservableObject {
         showTransientNotice("已移出白名单")
     }
 
-    /// 加入常用清理：接受非 manual 的真实目录，以及 Scanner 识别的软件更新安装包。
-    /// Docker prune、simctl、官方工具命令、就地裁剪日志、其他普通文件和手动项目
-    /// 都不能进入。加入后扫描列表中的项目不消失，而是立即出现「常用清理」标识。
+    /// 收藏与清理授权分开：模拟器需逐次确认，系统缓存仅供手动查看。
     @discardableResult
     func addToQuickClean(_ items: [CacheItem]) -> (added: Int, rejected: Int) {
         guard !items.isEmpty, !isScanning, !isCleaning else { return (0, items.count) }
@@ -2780,28 +2817,38 @@ final class DevSweepStore: ObservableObject {
         var newEntries: [QuickCleanEntry] = []
         var rejected = 0
         for item in items {
-            let isUpdateArchive = FileIdentity.capture(item.path)?.kind == .regular
-                && item.category == "应用缓存"
-                && item.name == "软件更新安装包"
-                && CacheScanner.softwareUpdateResidueName(for: item.path, isDirectory: false) != nil
-            guard item.kind == .trash,
-                  item.risk != .manual,
-                  item.expectedFileIdentity == FileIdentity.capture(item.path),
+            guard let kind = QuickCleanInspector.registrationKind(for: item, home: home),
+                  let identity = FileIdentity.capture(item.path),
+                  item.expectedFileIdentity == identity,
                   !PathWhitelist.contains(item.path, in: whitelist),
-                  !QuickCleanRegistry.contains(item.path, in: quickCleanEntries),
-                  (try? DeletionValidator.validateQuickCleanRegistration(
-                    path: item.path, allowRegularFile: isUpdateArchive
-                  )) != nil
+                  !whitelist.contains(where: { XCTestDeviceLocator.isInside($0, of: item.path) }),
+                  !QuickCleanRegistry.contains(item.path, in: quickCleanEntries)
             else {
                 rejected += 1
                 continue
+            }
+            if kind == .directory || kind == .updateArchive || kind == .cargoBuildFile {
+                guard !QuickCleanInspector.isReservedPath(item.path, home: home),
+                      (try? DeletionValidator.validateQuickCleanRegistration(
+                        path: item.path, allowRegularFile: kind == .updateArchive || kind == .cargoBuildFile
+                      )) != nil else {
+                    rejected += 1
+                    continue
+                }
+            } else {
+                guard identity.kind == .directory,
+                      item.path.resolvingSymlinksInPath().path == item.path.standardizedFileURL.path else {
+                    rejected += 1
+                    continue
+                }
             }
             newEntries.append(QuickCleanEntry(
                 path: QuickCleanRegistry.key(for: item.path),
                 displayName: item.name,
                 category: item.category,
                 dateAdded: Date(),
-                targetKind: isUpdateArchive ? .updateArchive : .directory
+                targetKind: kind,
+                identifier: kind == .simulatorDevice ? item.identifier : nil
             ))
         }
         guard !newEntries.isEmpty else {
@@ -2837,11 +2884,13 @@ final class DevSweepStore: ObservableObject {
     /// 刷新快照：存在性、FileIdentity、大小都重新读取磁盘，绝不调用完整 CacheScanner。
     func refreshQuickCleanSnapshots() {
         let entries = quickCleanEntries
+        let home = home
+        let inspector = simulatorInspector
         quickCleanRefreshGeneration += 1
         let generation = quickCleanRefreshGeneration
         isRefreshingQuickClean = true
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let snapshots = QuickCleanInspector.snapshots(for: entries)
+            let snapshots = QuickCleanInspector.snapshots(for: entries, home: home, simulatorInspector: inspector)
             DispatchQueue.main.async {
                 guard let self, generation == self.quickCleanRefreshGeneration else { return }
                 self.quickCleanSnapshots = snapshots
@@ -2860,14 +2909,54 @@ final class DevSweepStore: ObservableObject {
         cleanQuickCleanEntries(entries)
     }
 
+    /// Called only by the per-device confirmation dialog. Identity comes from
+    /// the snapshot shown before the dialog, never from a fresh replacement path.
+    func deleteQuickCleanSimulator(_ entry: QuickCleanEntry, expectedIdentity: FileIdentity) {
+        guard !isScanning, !isCleaning, entry.isSimulator,
+              quickCleanEntries.contains(entry),
+              SimulatorCleanupExecutor.matches(path: URL(fileURLWithPath: entry.path), udid: entry.identifier, home: home)
+        else { return }
+        isCleaning = true
+        lastError = nil
+        statusMessage = "正在核验并删除模拟器设备…"
+        let path = URL(fileURLWithPath: entry.path)
+        let item = CacheItem(
+            category: entry.category, name: entry.displayName, path: path,
+            size: quickCleanSnapshots.first(where: { $0.id == entry.id })?.size ?? 0,
+            risk: .review, kind: .simulatorDevice, identifier: entry.identifier,
+            expectedFileIdentity: expectedIdentity
+        )
+        let context = DeletionContext(
+            whitelistedPaths: whitelistedPaths, projectRoots: projectRoots, home: home, allowedPaths: [path]
+        )
+        let executor = simulatorExecutor
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let report = CacheCleaner.clean([item], context: context, simulatorExecutor: executor)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isCleaning = false
+                self.applyQuickCleanCleanupResult(report)
+                if report.removed.isEmpty { self.refreshQuickCleanSnapshots() }
+                if let failure = report.failures.first {
+                    self.lastError = failure.1
+                    self.statusMessage = "模拟器未删除：\(failure.1)"
+                } else {
+                    self.statusMessage = "已删除模拟器设备，不能从废纸篓恢复；收藏保留并标记失效"
+                    self.showTransientNotice("已删除模拟器设备")
+                }
+            }
+        }
+    }
+
     private func cleanQuickCleanEntries(_ entries: [QuickCleanEntry]) {
-        let targets = QuickCleanRegistry.normalized(entries)
+        let targets = QuickCleanRegistry.normalized(entries.filter { $0.isAutomatic && quickCleanEntries.contains($0) })
         guard !targets.isEmpty, !isScanning, !isCleaning else { return }
         isCleaning = true
         lastError = nil
         statusMessage = "正在把常用项目移入废纸篓…"
         let whitelist = whitelistedPaths
         let roots = projectRoots
+        let home = home
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             // 执行前重新读取磁盘状态，生成刚刚捕获 FileIdentity 的执行条目；
@@ -2876,6 +2965,7 @@ final class DevSweepStore: ObservableObject {
             let context = DeletionContext(
                 whitelistedPaths: whitelist,
                 projectRoots: roots,
+                home: home,
                 allowedPaths: freshItems.map(\.path)
             )
             let report = CacheCleaner.clean(freshItems, context: context)
@@ -2930,6 +3020,7 @@ final class DevSweepStore: ObservableObject {
         let deletionContext = DeletionContext(
             whitelistedPaths: whitelistedPaths,
             projectRoots: projectRoots,
+            home: home,
             allowedPaths: items.map(\.path)
         )
         statusMessage = includesNonRecoverable ? "正在执行选中项目的清理…" : "正在把选中项目移入废纸篓…"
