@@ -1,46 +1,56 @@
 import Darwin
 import Foundation
 
-/// 目录占用的测量结果。`isComplete == false` 表示有子树没有被计入，
-/// 界面必须把 `allocatedBytes` 当作下限展示，而不是精确值。
-struct SizeMeasurement: Equatable {
+enum MeasurementState: String, Hashable {
+    case complete
+    case partial
+    case failed
+    case timedOut
+}
+
+/// 目录占用的测量结果。只有 `state == .complete` 时 `allocatedBytes` 才是精确值；
+/// 其余状态必须按「至少占用」或「无法统计」展示。
+struct StorageMeasurement: Hashable {
     let allocatedBytes: Int64
-    let isComplete: Bool
+    let state: MeasurementState
     let skippedCount: Int
     let failureReason: String?
 
     init(
         allocatedBytes: Int64,
-        isComplete: Bool = true,
+        state: MeasurementState = .complete,
         skippedCount: Int = 0,
         failureReason: String? = nil
     ) {
         self.allocatedBytes = allocatedBytes
-        self.isComplete = isComplete
+        self.state = state
         self.skippedCount = skippedCount
         self.failureReason = failureReason
     }
 
+    var isComplete: Bool { state == .complete }
+
     var warning: String? {
-        guard !isComplete else { return nil }
-        return failureReason ?? "部分目录无法读取，实际占用可能更大"
+        guard state != .complete else { return nil }
+        if let failureReason { return failureReason }
+        return state == .timedOut ? "统计超时，实际占用可能更大" : "部分目录无法读取，实际占用可能更大"
     }
 }
 
-enum DirectoryMeasurementService {
+enum StorageMeasurementService {
     private static let duURL = URL(fileURLWithPath: "/usr/bin/du")
     static let defaultTimeout: TimeInterval = 30
 
-    static func measure(_ url: URL, timeout: TimeInterval = defaultTimeout) -> SizeMeasurement {
+    static func measure(_ url: URL, timeout: TimeInterval = defaultTimeout) -> StorageMeasurement {
         let standardized = url.standardizedFileURL
         guard FileManager.default.fileExists(atPath: standardized.path) else {
-            return SizeMeasurement(allocatedBytes: 0, isComplete: false, failureReason: "路径不存在")
+            return StorageMeasurement(allocatedBytes: 0, state: .failed, failureReason: "路径不存在")
         }
 
         if let values = try? standardized.resourceValues(forKeys: [.isDirectoryKey]),
            values.isDirectory != true {
             let allocated = (try? standardized.resourceValues(forKeys: [.fileAllocatedSizeKey]))?.fileAllocatedSize
-            return SizeMeasurement(allocatedBytes: Int64(allocated ?? 0))
+            return StorageMeasurement(allocatedBytes: Int64(allocated ?? 0))
         }
 
         guard let result = ProcessRunner.run(
@@ -56,9 +66,9 @@ enum DirectoryMeasurementService {
         }
         // 超时后 stdout 通常没有可解析结果；这时退回逐文件枚举会把整个扫描拖得更久。
         if result.timedOut {
-            return SizeMeasurement(
+            return StorageMeasurement(
                 allocatedBytes: 0,
-                isComplete: false,
+                state: .timedOut,
                 failureReason: "统计超时，未完成全部目录"
             )
         }
@@ -66,19 +76,19 @@ enum DirectoryMeasurementService {
     }
 
     /// 一次 `du` 调用测量多个目录。macOS 的 du 会在同一次调用的参数之间对硬链接去重。
-    static func measure(_ urls: [URL], timeout: TimeInterval = defaultTimeout) -> [String: SizeMeasurement] {
+    static func measure(_ urls: [URL], timeout: TimeInterval = defaultTimeout) -> [String: StorageMeasurement] {
         let standardized = urls.map(\.standardizedFileURL)
         guard !standardized.isEmpty else { return [:] }
 
-        var measurements: [String: SizeMeasurement] = [:]
+        var measurements: [String: StorageMeasurement] = [:]
         var pending: [URL] = []
         for url in standardized {
             if FileManager.default.fileExists(atPath: url.path) {
                 pending.append(url)
             } else {
-                measurements[url.path] = SizeMeasurement(
+                measurements[url.path] = StorageMeasurement(
                     allocatedBytes: 0,
-                    isComplete: false,
+                    state: .failed,
                     failureReason: "路径不存在"
                 )
             }
@@ -101,9 +111,9 @@ enum DirectoryMeasurementService {
             }
             if result.timedOut {
                 for url in pending where measurements[url.path] == nil {
-                    measurements[url.path] = SizeMeasurement(
+                    measurements[url.path] = StorageMeasurement(
                         allocatedBytes: 0,
-                        isComplete: false,
+                        state: .timedOut,
                         failureReason: "统计超时，未完成全部目录"
                     )
                 }
@@ -119,35 +129,35 @@ enum DirectoryMeasurementService {
 
     /// 把一次 `du -sk <dir>` 的输出解释为测量值；stdout 无法解析时返回 nil，
     /// 由调用方决定是否退回逐文件枚举。
-    static func interpretSingle(_ result: ProcessResult) -> SizeMeasurement? {
+    static func interpretSingle(_ result: ProcessResult) -> StorageMeasurement? {
         guard let bytes = parseDuOutput(result.stdout).values.first else { return nil }
         return interpret(bytes: bytes, result: result)
     }
 
-    private static func interpret(bytes: Int64, result: ProcessResult) -> SizeMeasurement {
+    private static func interpret(bytes: Int64, result: ProcessResult) -> StorageMeasurement {
         if result.timedOut {
-            return SizeMeasurement(
+            return StorageMeasurement(
                 allocatedBytes: bytes,
-                isComplete: false,
+                state: .timedOut,
                 failureReason: "统计超时，未完成全部目录"
             )
         }
         if result.status != 0 {
-            return SizeMeasurement(
+            return StorageMeasurement(
                 allocatedBytes: bytes,
-                isComplete: false,
+                state: .partial,
                 failureReason: failureReason(for: result)
             )
         }
         if !result.stderr.isEmpty {
             // du 在 status 0 下仍可能报告个别路径警告；保守地按不完整处理。
-            return SizeMeasurement(
+            return StorageMeasurement(
                 allocatedBytes: bytes,
-                isComplete: false,
+                state: .partial,
                 failureReason: failureReason(for: result)
             )
         }
-        return SizeMeasurement(allocatedBytes: bytes)
+        return StorageMeasurement(allocatedBytes: bytes)
     }
 
     private static func failureReason(for result: ProcessResult) -> String {
@@ -178,7 +188,7 @@ enum DirectoryMeasurementService {
 
     /// du 不可用或输出无法解析时的回退。硬链接按 (device, inode) 去重，
     /// 避免同一份磁盘块被多个目录重复累加。
-    static func measureByEnumeration(_ url: URL) -> SizeMeasurement {
+    static func measureByEnumeration(_ url: URL) -> StorageMeasurement {
         var skippedCount = 0
         var seenInodes = Set<InodeKey>()
         var total: Int64 = 0
@@ -196,7 +206,7 @@ enum DirectoryMeasurementService {
         }
 
         guard FileManager.default.fileExists(atPath: url.path) else {
-            return SizeMeasurement(allocatedBytes: 0, isComplete: false, failureReason: "路径不存在")
+            return StorageMeasurement(allocatedBytes: 0, state: .failed, failureReason: "路径不存在")
         }
         _ = accumulate(url.path)
 
@@ -217,14 +227,14 @@ enum DirectoryMeasurementService {
         }
 
         if skippedCount > 0 {
-            return SizeMeasurement(
+            return StorageMeasurement(
                 allocatedBytes: total,
-                isComplete: false,
+                state: .partial,
                 skippedCount: skippedCount,
                 failureReason: "有 \(skippedCount) 个条目无法读取，实际占用可能更大"
             )
         }
-        return SizeMeasurement(allocatedBytes: total)
+        return StorageMeasurement(allocatedBytes: total)
     }
 
     private struct InodeKey: Hashable {

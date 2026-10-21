@@ -708,7 +708,7 @@ final class ScannerCoverageTests: XCTestCase {
         try Data(repeating: 0xA5, count: 1_100_000)
             .write(to: second.appendingPathComponent("own.bin"))
 
-        let measured = DirectoryMeasurementService.measure([first, second])
+        let measured = StorageMeasurementService.measure([first, second])
         let firstSize = try XCTUnwrap(measured[first.standardizedFileURL.path]).allocatedBytes
         let secondSize = try XCTUnwrap(measured[second.standardizedFileURL.path]).allocatedBytes
         let total = firstSize + secondSize

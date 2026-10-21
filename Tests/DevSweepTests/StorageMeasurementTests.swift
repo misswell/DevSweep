@@ -3,7 +3,7 @@ import Foundation
 import XCTest
 @testable import DevSweep
 
-final class DirectoryMeasurementTests: XCTestCase {
+final class StorageMeasurementTests: XCTestCase {
     private let fileManager = FileManager.default
 
     func testCleanDuOutputIsComplete() throws {
@@ -14,9 +14,9 @@ final class DirectoryMeasurementTests: XCTestCase {
             timedOut: false
         )
 
-        let measurement = try XCTUnwrap(DirectoryMeasurementService.interpretSingle(result))
+        let measurement = try XCTUnwrap(StorageMeasurementService.interpretSingle(result))
         XCTAssertEqual(measurement.allocatedBytes, 2_097_152)
-        XCTAssertTrue(measurement.isComplete)
+        XCTAssertEqual(measurement.state, .complete)
         XCTAssertNil(measurement.warning)
     }
 
@@ -28,9 +28,10 @@ final class DirectoryMeasurementTests: XCTestCase {
             timedOut: false
         )
 
-        let measurement = try XCTUnwrap(DirectoryMeasurementService.interpretSingle(result))
+        let measurement = try XCTUnwrap(StorageMeasurementService.interpretSingle(result))
         XCTAssertEqual(measurement.allocatedBytes, 1_048_576)
-        XCTAssertFalse(measurement.isComplete)
+        XCTAssertNotEqual(measurement.state, .complete)
+        XCTAssertEqual(measurement.state, .partial)
         XCTAssertEqual(measurement.warning, "有 1 个条目无法读取，实际占用可能更大")
     }
 
@@ -42,18 +43,18 @@ final class DirectoryMeasurementTests: XCTestCase {
             timedOut: true
         )
 
-        let measurement = try XCTUnwrap(DirectoryMeasurementService.interpretSingle(result))
+        let measurement = try XCTUnwrap(StorageMeasurementService.interpretSingle(result))
         XCTAssertEqual(measurement.allocatedBytes, 524_288)
-        XCTAssertFalse(measurement.isComplete)
+        XCTAssertEqual(measurement.state, .timedOut)
         XCTAssertEqual(measurement.warning, "统计超时，未完成全部目录")
     }
 
     func testUnusableDuOutputRequestsFallback() {
         let empty = ProcessResult(status: 1, stdout: Data(), stderr: Data(), timedOut: false)
-        XCTAssertNil(DirectoryMeasurementService.interpretSingle(empty))
+        XCTAssertNil(StorageMeasurementService.interpretSingle(empty))
 
         let garbage = ProcessResult(status: 0, stdout: Data("not a size\n".utf8), stderr: Data(), timedOut: false)
-        XCTAssertNil(DirectoryMeasurementService.interpretSingle(garbage))
+        XCTAssertNil(StorageMeasurementService.interpretSingle(garbage))
     }
 
     func testPermissionDeniedSubtreeIsReportedAsIncomplete() throws {
@@ -72,9 +73,9 @@ final class DirectoryMeasurementTests: XCTestCase {
         locked = lockedDirectory
         try fileManager.setAttributes([.posixPermissions: 0o000], ofItemAtPath: lockedDirectory.path)
 
-        let measurement = DirectoryMeasurementService.measure(root)
+        let measurement = StorageMeasurementService.measure(root)
         XCTAssertGreaterThan(measurement.allocatedBytes, 0)
-        XCTAssertFalse(measurement.isComplete)
+        XCTAssertNotEqual(measurement.state, .complete)
         XCTAssertNotNil(measurement.warning)
     }
 
@@ -90,7 +91,7 @@ final class DirectoryMeasurementTests: XCTestCase {
         try Data(repeating: 0xA5, count: 4_200_000).write(to: large.appendingPathComponent("b.bin"))
         let missing = root.appendingPathComponent("missing")
 
-        let measured = DirectoryMeasurementService.measure([small, missing, large])
+        let measured = StorageMeasurementService.measure([small, missing, large])
         let smallSize = try XCTUnwrap(measured[small.standardizedFileURL.path])
         let largeSize = try XCTUnwrap(measured[large.standardizedFileURL.path])
         let missingMeasurement = try XCTUnwrap(measured[missing.standardizedFileURL.path])
@@ -98,7 +99,7 @@ final class DirectoryMeasurementTests: XCTestCase {
         XCTAssertLessThan(abs(smallSize.allocatedBytes - 1_101_824), 64 * 1024)
         XCTAssertLessThan(abs(largeSize.allocatedBytes - 4_202_496), 64 * 1024)
         XCTAssertGreaterThan(largeSize.allocatedBytes, smallSize.allocatedBytes)
-        XCTAssertFalse(missingMeasurement.isComplete)
+        XCTAssertEqual(missingMeasurement.state, .failed)
         XCTAssertEqual(missingMeasurement.failureReason, "路径不存在")
     }
 
@@ -110,8 +111,8 @@ final class DirectoryMeasurementTests: XCTestCase {
         try Data(repeating: 0xA5, count: 2_100_000).write(to: original)
         try fileManager.linkItem(at: original, to: root.appendingPathComponent("hardlink.bin"))
 
-        let measurement = DirectoryMeasurementService.measureByEnumeration(root)
-        XCTAssertTrue(measurement.isComplete)
+        let measurement = StorageMeasurementService.measureByEnumeration(root)
+        XCTAssertEqual(measurement.state, .complete)
         XCTAssertLessThan(measurement.allocatedBytes, 3_000_000, "硬链接不能按两份文件重复累加")
         XCTAssertGreaterThan(measurement.allocatedBytes, 2_000_000)
     }
@@ -131,8 +132,8 @@ final class DirectoryMeasurementTests: XCTestCase {
         locked = lockedDirectory
         try fileManager.setAttributes([.posixPermissions: 0o000], ofItemAtPath: lockedDirectory.path)
 
-        let measurement = DirectoryMeasurementService.measureByEnumeration(root)
-        XCTAssertFalse(measurement.isComplete)
+        let measurement = StorageMeasurementService.measureByEnumeration(root)
+        XCTAssertNotEqual(measurement.state, .complete)
         XCTAssertEqual(measurement.skippedCount, 1)
         XCTAssertGreaterThan(measurement.allocatedBytes, 0)
     }
@@ -168,6 +169,20 @@ final class DirectoryMeasurementTests: XCTestCase {
         XCTAssertNotNil(item.sizeWarning)
         XCTAssertTrue(item.sizeText.hasPrefix("≥ "))
         XCTAssertEqual(report.incompleteMeasurements, 1)
+    }
+
+    func testEmptyDirectoryIsCompleteAndDistinctFromFailedMeasurement() throws {
+        let root = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: root) }
+
+        let empty = StorageMeasurementService.measure(root)
+        XCTAssertEqual(empty.allocatedBytes, 0)
+        XCTAssertEqual(empty.state, .complete)
+
+        let missing = StorageMeasurementService.measure(root.appendingPathComponent("missing"))
+        XCTAssertEqual(missing.allocatedBytes, 0)
+        XCTAssertEqual(missing.state, .failed)
+        XCTAssertEqual(missing.failureReason, "路径不存在")
     }
 
     private func temporaryDirectory() throws -> URL {

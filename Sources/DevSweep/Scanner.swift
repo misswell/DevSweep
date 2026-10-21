@@ -16,6 +16,15 @@ struct GeneratedRule {
     let note: String
 }
 
+/// 固定缓存规则的绝对路径。发现页用它区分「已验证的已知缓存」和未知占用。
+struct KnownCacheLocation: Hashable {
+    let url: URL
+    let category: String
+    let name: String
+    let risk: RiskLevel
+    let note: String
+}
+
 fileprivate typealias ProcessOutput = ProcessResult
 
 fileprivate enum DockerSupport {
@@ -257,9 +266,256 @@ struct CacheScanner {
     }
 
     /// 只需要字节数、不关心统计完整性的调用方使用；扫描列表走
-    /// `DirectoryMeasurementService` 以保留「至少占用」标记。
+    /// `StorageMeasurementService` 以保留「至少占用」标记。
     static func size(of url: URL) -> Int64 {
-        DirectoryMeasurementService.measure(url).allocatedBytes
+        StorageMeasurementService.measure(url).allocatedBytes
+    }
+
+    /// 固定缓存规则模板；只读发现页也用它标注「已知缓存」。
+    private static let fixedRuleTemplates: [CacheRule] = [
+        CacheRule(category: "Xcode", name: "DerivedData", relativePath: "Library/Developer/Xcode/DerivedData", risk: .safe, note: "编译后可自动重新生成"),
+        CacheRule(category: "Xcode", name: "ModuleCache", relativePath: "Library/Developer/Xcode/ModuleCache.noindex", risk: .safe, note: "Clang/Swift 模块缓存，Xcode 会自动重建"),
+        CacheRule(category: "Xcode", name: "BuildCache", relativePath: "Library/Developer/Xcode/BuildCache.noindex", risk: .safe, note: "Xcode 构建缓存，可重新生成"),
+        CacheRule(category: "Xcode", name: "SourcePackages", relativePath: "Library/Developer/Xcode/SourcePackages", risk: .review, note: "Swift Package checkout 和仓库，删除后会重新下载"),
+        CacheRule(category: "Xcode", name: "SwiftUI Preview 缓存", relativePath: "Library/Developer/Xcode/UserData/Previews", risk: .safe, note: "Preview 会自动重建"),
+        CacheRule(category: "Xcode", name: "Xcode 缓存", relativePath: "Library/Caches/com.apple.dt.Xcode", risk: .safe, note: "Xcode 会自动重建缓存"),
+        CacheRule(category: "Xcode", name: "xcodebuild 缓存", relativePath: "Library/Caches/com.apple.dt.xcodebuild", risk: .safe, note: "构建缓存，可重新生成"),
+        CacheRule(category: "Xcode", name: "源码控制 Git 缓存", relativePath: "Library/Caches/com.apple.dt.Xcode.sourcecontrol.Git", risk: .safe, note: "Xcode 会重新获取 Git 数据"),
+        CacheRule(category: "Xcode", name: "文档缓存", relativePath: "Library/Developer/Xcode/DocumentationCache", risk: .safe, note: "需要时会重新下载"),
+        CacheRule(category: "Xcode", name: "Instruments 缓存", relativePath: "Library/Caches/com.apple.dt.instruments", risk: .safe, note: "Instruments 会自动重建缓存"),
+        CacheRule(category: "Xcode", name: "SourceKitService 缓存", relativePath: "Library/Caches/com.apple.dt.SourceKitService", risk: .safe, note: "SourceKit 会自动重建缓存"),
+        CacheRule(category: "Xcode", name: "Xcode Previews 缓存", relativePath: "Library/Caches/com.apple.dt.XcodePreviews", risk: .safe, note: "Preview 会自动重建缓存"),
+        CacheRule(category: "Xcode", name: "iOS Device Logs", relativePath: "Library/Developer/Xcode/iOS Device Logs", risk: .review, note: "真机诊断日志；确认不再需要排查问题后清理"),
+        CacheRule(category: "Xcode", name: "Archives", relativePath: "Library/Developer/Xcode/Archives", risk: .review, note: "可能包含发布归档，请确认后清理"),
+        CacheRule(category: "Xcode", name: "Products", relativePath: "Library/Developer/Xcode/Products", risk: .review, note: "项目产物，可按需重新构建"),
+        CacheRule(category: "Xcode", name: "iOS DeviceSupport", relativePath: "Library/Developer/Xcode/iOS DeviceSupport", risk: .manual, note: "删除后真机调试可能需要重新下载"),
+        CacheRule(category: "Xcode", name: "watchOS DeviceSupport", relativePath: "Library/Developer/Xcode/watchOS DeviceSupport", risk: .manual, note: "删除后 Apple Watch 真机调试可能需要重新下载符号"),
+        CacheRule(category: "Xcode", name: "tvOS DeviceSupport", relativePath: "Library/Developer/Xcode/tvOS DeviceSupport", risk: .manual, note: "删除后 Apple TV 真机调试可能需要重新下载符号"),
+        CacheRule(category: "Xcode", name: "macOS DeviceSupport", relativePath: "Library/Developer/Xcode/macOS DeviceSupport", risk: .manual, note: "删除后 macOS 设备调试可能需要重新下载符号"),
+        CacheRule(category: "Xcode", name: "visionOS DeviceSupport", relativePath: "Library/Developer/Xcode/visionOS DeviceSupport", risk: .manual, note: "删除后 Vision Pro 真机调试可能需要重新下载符号"),
+        CacheRule(category: "Xcode", name: "Playgrounds", relativePath: "Library/Developer/Xcode/UserData/Playgrounds", risk: .review, note: "Playground 生成数据和缓存；请确认没有需要保留的结果"),
+        CacheRule(category: "CoreSimulator", name: "模拟器缓存", relativePath: "Library/Developer/CoreSimulator/Caches", risk: .safe, note: "模拟器缓存，不含设备数据"),
+        CacheRule(category: "CoreSimulator", name: "模拟器日志", relativePath: "Library/Logs/CoreSimulator", risk: .safe, note: "模拟器会重新生成日志"),
+
+        // AI coding agents: only disposable caches and logs are included.
+        // Codex databases that hold goals, memories, queue, and thread history
+        // are intentionally not listed here because they are agent state.
+        CacheRule(category: "AI Agent", name: "Codex 日志数据库", relativePath: ".codex/logs_2.sqlite", risk: .review, note: "Codex 日志数据库可能包含会话调试信息；确认不再需要后清理，不会触碰目标、记忆、队列或线程历史"),
+        CacheRule(category: "AI Agent", name: "OpenCode 缓存", relativePath: ".cache/opencode", risk: .safe, note: "OpenCode 可重建缓存；数据、配置、状态和仓库目录不会清理"),
+        CacheRule(category: "AI Agent", name: "OpenCode 日志", relativePath: ".local/share/opencode/log", risk: .review, note: "OpenCode 日志；确认不再需要排查问题后清理，数据和仓库目录不会清理"),
+        // OpenCode's CLI follows XDG paths; desktop wrappers on macOS may
+        // use the conventional Library locations instead.
+        CacheRule(category: "AI Agent", name: "OpenCode 缓存（macOS）", relativePath: "Library/Caches/opencode", risk: .safe, note: "OpenCode 可重建缓存；数据、配置、状态和仓库目录不会清理"),
+        CacheRule(category: "AI Agent", name: "OpenCode 日志（macOS）", relativePath: "Library/Application Support/opencode/log", risk: .review, note: "OpenCode 日志；确认不再需要排查问题后清理，数据、配置、状态和仓库目录不会清理"),
+        CacheRule(category: "AI Agent", name: "Claude Code 调试日志", relativePath: ".claude/debug-logs", risk: .review, note: "Claude Code 调试日志可能包含提示词和路径；确认不再需要后清理，不会触碰项目、历史、凭据或任务状态"),
+        CacheRule(category: "AI Agent", name: "Goose 更新缓存", relativePath: "Library/Caches/goose-updater", risk: .review, note: "Goose 更新程序下载缓存；确认没有正在进行的更新后清理"),
+
+        CacheRule(category: "包管理器", name: "npm 下载缓存", relativePath: ".npm/_cacache", risk: .safe, note: "npm 会重新下载依赖"),
+        CacheRule(category: "包管理器", name: "npm 日志", relativePath: ".npm/_logs", risk: .safe, note: "仅为 npm 日志"),
+        CacheRule(category: "包管理器", name: "npx 临时包", relativePath: ".npm/_npx", risk: .safe, note: "npx 会在下次执行时重新下载临时包"),
+        CacheRule(category: "包管理器", name: "npm 预编译缓存", relativePath: ".npm/_prebuilds", risk: .safe, note: "原生模块会在需要时重新下载或编译"),
+        CacheRule(category: "包管理器", name: "npm（旧路径）", relativePath: ".npm-cache-user/_cacache", risk: .safe, note: "npm 会重新下载依赖"),
+        CacheRule(category: "包管理器", name: "tnpm 下载缓存", relativePath: ".tnpm/_cacache", risk: .safe, note: "tnpm 会重新下载依赖"),
+        CacheRule(category: "包管理器", name: "tnpm 日志", relativePath: ".tnpm/_logs", risk: .safe, note: "仅为 tnpm 日志"),
+        CacheRule(category: "包管理器", name: "Yarn", relativePath: "Library/Caches/Yarn", risk: .safe, note: "Yarn 会重新下载依赖"),
+        CacheRule(category: "包管理器", name: "Yarn（旧缓存）", relativePath: ".cache/yarn", risk: .safe, note: "Yarn 会重新下载依赖"),
+        CacheRule(category: "包管理器", name: "Yarn 离线缓存", relativePath: ".yarn/cache", risk: .review, note: "Yarn 会重新下载依赖；离线环境下请保留"),
+        CacheRule(category: "包管理器", name: "pnpm 元数据缓存", relativePath: "Library/Caches/pnpm", risk: .safe, note: "pnpm 会重新获取 registry 元数据"),
+        CacheRule(category: "包管理器", name: "Bun", relativePath: ".bun/install/cache", risk: .safe, note: "Bun 会重新下载依赖"),
+        CacheRule(category: "包管理器", name: "Deno", relativePath: "Library/Caches/deno", risk: .safe, note: "Deno 会重新下载依赖和工具"),
+        CacheRule(category: "包管理器", name: "Deno（旧缓存）", relativePath: ".cache/deno", risk: .safe, note: "Deno 会重新下载依赖和工具"),
+        CacheRule(category: "包管理器", name: "Node.js 通用缓存", relativePath: ".cache/node", risk: .safe, note: "Node.js 工具会自动重建缓存"),
+        CacheRule(category: "包管理器", name: "Corepack", relativePath: "Library/Caches/node/corepack", risk: .safe, note: "Corepack 会重新下载包管理器"),
+        CacheRule(category: "包管理器", name: "Playwright 浏览器缓存", relativePath: "Library/Caches/ms-playwright", risk: .review, note: "Playwright 会重新下载浏览器，确认不再需要对应版本后清理"),
+        CacheRule(category: "包管理器", name: "Puppeteer 浏览器缓存", relativePath: "Library/Caches/puppeteer", risk: .review, note: "Puppeteer 会重新下载浏览器，确认不再需要对应版本后清理"),
+        CacheRule(category: "包管理器", name: "CocoaPods", relativePath: "Library/Caches/CocoaPods", risk: .safe, note: "Pods 会重新下载"),
+        CacheRule(category: "包管理器", name: "Homebrew 下载缓存", relativePath: "Library/Caches/Homebrew", risk: .safe, note: "Homebrew 会重新下载包"),
+        CacheRule(category: "包管理器", name: "SwiftPM 下载缓存", relativePath: "Library/Caches/org.swift.swiftpm", risk: .safe, note: "SwiftPM 会重新解析依赖"),
+        CacheRule(category: "包管理器", name: "SwiftPM（XDG 缓存）", relativePath: ".cache/org.swift.swiftpm", risk: .safe, note: "SwiftPM 会重新解析依赖"),
+        CacheRule(category: "包管理器", name: "SwiftPM（旧缓存）", relativePath: ".swiftpm/cache", risk: .safe, note: "SwiftPM 会重新解析依赖"),
+        CacheRule(category: "包管理器", name: "SwiftPM 仓库缓存", relativePath: ".swiftpm/repositories", risk: .review, note: "可能包含依赖仓库 checkout；删除后会重新下载，请确认后清理"),
+        CacheRule(category: "包管理器", name: "Composer", relativePath: "Library/Caches/composer", risk: .safe, note: "Composer 会重新下载依赖"),
+        CacheRule(category: "包管理器", name: "NuGet 全局包缓存", relativePath: ".nuget/packages", risk: .review, note: "NuGet 全局依赖包目录。清理后项目可以重新 restore，但可能需要大量网络下载，离线环境建议保留"),
+        CacheRule(category: "包管理器", name: "CocoaPods Specs 仓库", relativePath: ".cocoapods/repos", risk: .review, note: "Specs 索引会重新下载；离线环境下请保留"),
+
+        CacheRule(category: "语言工具链", name: "Cargo registry cache", relativePath: ".cargo/registry/cache", risk: .safe, note: "Cargo 会重新下载 crate"),
+        CacheRule(category: "语言工具链", name: "Cargo registry index", relativePath: ".cargo/registry/index", risk: .safe, note: "Cargo 会重新获取 registry 索引"),
+        CacheRule(category: "语言工具链", name: "Cargo registry source", relativePath: ".cargo/registry/src", risk: .review, note: "Cargo 已解压的依赖源码；删除后会重新下载，可能影响离线构建和 IDE 索引"),
+        CacheRule(category: "语言工具链", name: "Cargo git checkout", relativePath: ".cargo/git/checkouts", risk: .review, note: "Cargo Git 依赖 checkout；删除后会重新获取，请确认离线构建不受影响"),
+        CacheRule(category: "语言工具链", name: "Cargo git database", relativePath: ".cargo/git/db", risk: .review, note: "Cargo Git 依赖数据库；删除后会重新获取，请确认离线构建不受影响"),
+        CacheRule(category: "语言工具链", name: "rustup 下载缓存", relativePath: ".rustup/downloads", risk: .safe, note: "rustup 会重新下载工具链安装包"),
+        CacheRule(category: "语言工具链", name: "rustup 临时缓存", relativePath: ".rustup/tmp", risk: .safe, note: "rustup 会重新创建临时文件"),
+        CacheRule(category: "语言工具链", name: "pip", relativePath: "Library/Caches/pip", risk: .safe, note: "pip 会重新下载 wheel"),
+        CacheRule(category: "语言工具链", name: "pip（旧缓存）", relativePath: ".cache/pip", risk: .safe, note: "pip 会重新下载 wheel"),
+        CacheRule(category: "语言工具链", name: "uv", relativePath: "Library/Caches/uv", risk: .safe, note: "uv 会重新下载包"),
+        CacheRule(category: "语言工具链", name: "uv（旧缓存）", relativePath: ".cache/uv", risk: .safe, note: "uv 会重新下载包"),
+        CacheRule(category: "语言工具链", name: "Poetry", relativePath: "Library/Caches/pypoetry", risk: .safe, note: "Poetry 会重新下载包"),
+        CacheRule(category: "AI/ML", name: "Hugging Face 模型缓存", relativePath: ".cache/huggingface", risk: .review, note: "模型会重新下载；请确认不再需要这些模型"),
+        CacheRule(category: "AI/ML", name: "PyTorch 缓存", relativePath: ".cache/torch", risk: .review, note: "PyTorch 模型和数据会重新下载；请确认后清理"),
+        CacheRule(category: "AI/ML", name: "Whisper 缓存", relativePath: ".cache/whisper", risk: .review, note: "Whisper 模型会重新下载；请确认后清理"),
+        CacheRule(category: "AI/ML", name: "Keras 缓存", relativePath: ".keras", risk: .review, note: "Keras 模型会重新下载；请确认后清理"),
+        CacheRule(category: "AI/ML", name: "TensorFlow Hub 缓存", relativePath: ".cache/tfhub_modules", risk: .review, note: "TensorFlow Hub 模型会重新下载；请确认后清理"),
+        CacheRule(category: "AI/ML", name: "Ollama 模型", relativePath: ".ollama/models", risk: .review, note: "Ollama 模型会重新下载；请确认不再需要本地模型"),
+        CacheRule(category: "AI/ML", name: "LM Studio 模型缓存", relativePath: ".cache/lm-studio", risk: .review, note: "LM Studio 模型会重新下载；请确认不再需要本地模型"),
+        CacheRule(category: "AI/ML", name: "LM Studio 模型（应用目录）", relativePath: "Library/Application Support/LM Studio/models", risk: .review, note: "LM Studio 模型会重新下载；请确认不再需要本地模型"),
+        CacheRule(category: "AI/ML", name: "Ollama 日志", relativePath: "Library/Logs/Ollama", risk: .safe, note: "Ollama 会重新生成日志"),
+        CacheRule(category: "语言工具链", name: "Conda 包缓存", relativePath: ".conda/pkgs", risk: .safe, note: "Conda 会重新下载包"),
+        CacheRule(category: "语言工具链", name: "Miniconda 包缓存", relativePath: "miniconda3/pkgs", risk: .safe, note: "Conda 会重新下载包"),
+        CacheRule(category: "语言工具链", name: "Miniforge 包缓存", relativePath: "miniforge3/pkgs", risk: .safe, note: "Conda 会重新下载包"),
+        CacheRule(category: "语言工具链", name: "Anaconda 包缓存", relativePath: "anaconda3/pkgs", risk: .safe, note: "Conda 会重新下载包"),
+        CacheRule(category: "语言工具链", name: "Go build cache", relativePath: "Library/Caches/go-build", risk: .safe, note: "Go 会重新编译"),
+        CacheRule(category: "语言工具链", name: "Go modules", relativePath: "go/pkg/mod", risk: .review, note: "删除后 Go 项目需要重新下载模块"),
+        CacheRule(category: "语言工具链", name: "Flutter / Dart", relativePath: ".pub-cache", risk: .review, note: "Dart/Flutter 依赖缓存。清理后可以重新获取依赖，但会增加下一次构建的网络和时间成本"),
+
+        CacheRule(category: "JVM", name: "Gradle caches", relativePath: ".gradle/caches", risk: .safe, note: "Gradle 会重新下载依赖"),
+        CacheRule(category: "JVM", name: "Gradle wrapper distributions", relativePath: ".gradle/wrapper/dists", risk: .safe, note: "Gradle wrapper 会重新下载发行版"),
+        CacheRule(category: "JVM", name: "Gradle daemon", relativePath: ".gradle/daemon", risk: .review, note: "建议停止 Gradle 构建后清理"),
+        CacheRule(category: "JVM", name: "Maven repository", relativePath: ".m2/repository", risk: .review, note: "Maven 会重新下载依赖"),
+        CacheRule(category: "JVM", name: "Maven wrapper distributions", relativePath: ".m2/wrapper/dists", risk: .safe, note: "Maven Wrapper 会重新下载发行版"),
+        CacheRule(category: "JVM", name: "sbt boot 缓存", relativePath: ".sbt/boot", risk: .review, note: "Scala/sbt 工具组件会重新下载；请确认后清理"),
+        CacheRule(category: "JVM", name: "sbt launcher 缓存", relativePath: ".sbt/launchers", risk: .review, note: "sbt 启动器会重新下载；请确认后清理"),
+        CacheRule(category: "JVM", name: "Ivy 依赖缓存", relativePath: ".ivy2/cache", risk: .review, note: "sbt/Ivy 依赖会重新下载；离线环境下请保留"),
+        CacheRule(category: "JVM", name: "Coursier 缓存", relativePath: ".coursier/cache", risk: .review, note: "Scala/JVM 依赖会重新下载；请确认后清理"),
+        CacheRule(category: "JVM", name: "Ammonite 缓存", relativePath: ".ammonite/cache", risk: .review, note: "Ammonite 会重新下载依赖；请确认后清理"),
+        CacheRule(category: "JVM", name: "Metals 缓存", relativePath: ".cache/metals", risk: .review, note: "Scala IDE 索引会重新生成；请确认后清理"),
+        CacheRule(category: "JVM", name: "Android SDK 临时下载", relativePath: "Library/Android/sdk/.temp", risk: .safe, note: "Android SDK 会重新下载组件"),
+        CacheRule(category: "JVM", name: "Android SDK 缓存", relativePath: "Library/Android/sdk/.cache", risk: .safe, note: "Android SDK 会自动重建缓存"),
+        CacheRule(category: "JVM", name: "Android 用户缓存", relativePath: ".android/cache", risk: .safe, note: "Android 工具会自动重建缓存"),
+        CacheRule(category: "JVM", name: "Android 旧构建缓存", relativePath: ".android/build-cache", risk: .safe, note: "Android 工具会重新构建"),
+        CacheRule(category: "JVM", name: "Bazel 缓存", relativePath: "Library/Caches/bazel", risk: .safe, note: "Bazel 会重新构建"),
+        CacheRule(category: "JVM", name: "Bazel（旧缓存）", relativePath: ".cache/bazel", risk: .safe, note: "Bazel 会重新构建"),
+
+        CacheRule(category: "语言工具链", name: "mise 缓存", relativePath: ".cache/mise", risk: .safe, note: "mise 会重新下载工具"),
+        CacheRule(category: "语言工具链", name: "asdf 下载缓存", relativePath: ".asdf/downloads", risk: .safe, note: "asdf 会重新下载工具"),
+        CacheRule(category: "语言工具链", name: "asdf 临时缓存", relativePath: ".asdf/tmp", risk: .safe, note: "asdf 会重新创建临时文件"),
+        CacheRule(category: "语言工具链", name: "nvm 下载缓存", relativePath: ".nvm/.cache", risk: .safe, note: "nvm 会重新下载 Node.js 安装包"),
+        CacheRule(category: "语言工具链", name: "Volta 下载缓存", relativePath: ".volta/cache", risk: .safe, note: "Volta 会重新下载工具链"),
+        CacheRule(category: "语言工具链", name: "ccache", relativePath: ".cache/ccache", risk: .safe, note: "编译器会重新编译"),
+        CacheRule(category: "语言工具链", name: "sccache", relativePath: ".cache/sccache", risk: .safe, note: "编译器会重新编译"),
+        CacheRule(category: "语言工具链", name: "ccache（macOS）", relativePath: "Library/Caches/ccache", risk: .safe, note: "编译器会重新编译"),
+        CacheRule(category: "语言工具链", name: "sccache（macOS）", relativePath: "Library/Caches/sccache", risk: .safe, note: "编译器会重新编译"),
+        CacheRule(category: "语言工具链", name: "ccache（经典路径）", relativePath: ".ccache", risk: .safe, note: "编译器会重新编译"),
+        CacheRule(category: "语言工具链", name: "Zig 全局缓存", relativePath: ".cache/zig", risk: .safe, note: "Zig 会重新生成构建缓存"),
+        CacheRule(category: "Ruby", name: "Bundler 下载缓存", relativePath: ".bundle/cache", risk: .safe, note: "Bundler 会重新下载 gem"),
+        CacheRule(category: "Ruby", name: "RubyGems 索引缓存", relativePath: ".gem/specs", risk: .safe, note: "RubyGems 会重新获取索引"),
+        CacheRule(category: "Ruby", name: "rbenv 下载缓存", relativePath: ".rbenv/cache", risk: .safe, note: "rbenv 会重新下载安装包"),
+        CacheRule(category: "Ruby", name: "CPAN 构建缓存", relativePath: ".cpan/build", risk: .safe, note: "CPAN 会重新创建构建目录"),
+        CacheRule(category: "语言工具链", name: "Hex 缓存", relativePath: ".hex/cache", risk: .safe, note: "Hex 会重新下载 Elixir/Erlang 包"),
+        CacheRule(category: "Python 项目", name: "pipx 缓存", relativePath: ".cache/pipx", risk: .safe, note: "pipx 会重新下载包"),
+        CacheRule(category: "Python 项目", name: "pre-commit 缓存", relativePath: ".cache/pre-commit", risk: .safe, note: "pre-commit 会重新下载环境"),
+        CacheRule(category: "Python 项目", name: "Jupyter 缓存", relativePath: ".cache/jupyter", risk: .safe, note: "Jupyter 会重新生成缓存"),
+
+        CacheRule(category: "IDE", name: "VS Code Cache", relativePath: "Library/Application Support/Code/Cache", risk: .safe, note: "编辑器会自动重建"),
+        CacheRule(category: "IDE", name: "VS Code CachedData", relativePath: "Library/Application Support/Code/CachedData", risk: .safe, note: "编辑器会自动重建"),
+        CacheRule(category: "IDE", name: "VS Code 扩展安装包缓存", relativePath: "Library/Application Support/Code/CachedExtensionVSIXs", risk: .safe, note: "扩展更新时会重新下载安装包"),
+        CacheRule(category: "IDE", name: "VS Code Code Cache", relativePath: "Library/Application Support/Code/Code Cache", risk: .safe, note: "编辑器会自动重建"),
+        CacheRule(category: "IDE", name: "VS Code GPUCache", relativePath: "Library/Application Support/Code/GPUCache", risk: .safe, note: "编辑器会自动重建"),
+        CacheRule(category: "IDE", name: "VS Code Service Worker", relativePath: "Library/Application Support/Code/Service Worker", risk: .review, note: "编辑器会重建；清理前建议退出 VS Code"),
+        CacheRule(category: "IDE", name: "VS Code 日志", relativePath: "Library/Application Support/Code/logs", risk: .safe, note: "仅为编辑器日志"),
+        CacheRule(category: "IDE", name: "VS Code 系统缓存", relativePath: "Library/Caches/com.microsoft.VSCode", risk: .safe, note: "编辑器会自动重建"),
+        CacheRule(category: "IDE", name: "VS Code workspaceStorage", relativePath: "Library/Application Support/Code/User/workspaceStorage", risk: .review, note: "工作区状态和扩展数据，确认后再清理"),
+        CacheRule(category: "IDE", name: "Cursor Cache", relativePath: "Library/Application Support/Cursor/Cache", risk: .safe, note: "编辑器会自动重建"),
+        CacheRule(category: "IDE", name: "Cursor CachedData", relativePath: "Library/Application Support/Cursor/CachedData", risk: .safe, note: "编辑器会自动重建"),
+        CacheRule(category: "IDE", name: "Cursor Code Cache", relativePath: "Library/Application Support/Cursor/Code Cache", risk: .safe, note: "编辑器会自动重建"),
+        CacheRule(category: "IDE", name: "Cursor GPUCache", relativePath: "Library/Application Support/Cursor/GPUCache", risk: .safe, note: "编辑器会自动重建"),
+        CacheRule(category: "IDE", name: "Cursor 扩展安装包缓存", relativePath: "Library/Application Support/Cursor/CachedExtensionVSIXs", risk: .safe, note: "扩展更新时会重新下载安装包"),
+        CacheRule(category: "IDE", name: "Cursor Service Worker", relativePath: "Library/Application Support/Cursor/Service Worker", risk: .review, note: "编辑器会重建；清理前建议退出 Cursor"),
+        CacheRule(category: "IDE", name: "Cursor 日志", relativePath: "Library/Application Support/Cursor/logs", risk: .safe, note: "仅为编辑器日志"),
+        CacheRule(category: "IDE", name: "Cursor workspaceStorage", relativePath: "Library/Application Support/Cursor/User/workspaceStorage", risk: .review, note: "工作区状态和扩展数据，确认后再清理"),
+        CacheRule(category: "IDE", name: "Lingma Cache", relativePath: "Library/Application Support/Lingma/Cache", risk: .safe, note: "Lingma 会自动重建缓存"),
+        CacheRule(category: "IDE", name: "Lingma CachedData", relativePath: "Library/Application Support/Lingma/CachedData", risk: .safe, note: "Lingma 会自动重建缓存"),
+        CacheRule(category: "IDE", name: "Lingma 扩展安装包缓存", relativePath: "Library/Application Support/Lingma/CachedExtensionVSIXs", risk: .safe, note: "扩展更新时会重新下载安装包"),
+        CacheRule(category: "IDE", name: "Lingma CachedProfilesData", relativePath: "Library/Application Support/Lingma/CachedProfilesData", risk: .safe, note: "Lingma 会自动重建缓存"),
+        CacheRule(category: "IDE", name: "Lingma Code Cache", relativePath: "Library/Application Support/Lingma/Code Cache", risk: .safe, note: "Lingma 会自动重建缓存"),
+        CacheRule(category: "IDE", name: "Lingma GPUCache", relativePath: "Library/Application Support/Lingma/GPUCache", risk: .safe, note: "Lingma 会自动重建缓存"),
+        CacheRule(category: "IDE", name: "Lingma DawnWebGPUCache", relativePath: "Library/Application Support/Lingma/DawnWebGPUCache", risk: .safe, note: "Lingma 会自动重建缓存"),
+        CacheRule(category: "IDE", name: "Lingma DawnGraphiteCache", relativePath: "Library/Application Support/Lingma/DawnGraphiteCache", risk: .safe, note: "Lingma 会自动重建缓存"),
+        CacheRule(category: "IDE", name: "Trae CN Cache", relativePath: "Library/Application Support/Trae CN/Cache", risk: .safe, note: "Trae 会自动重建缓存"),
+        CacheRule(category: "IDE", name: "Trae CN CachedData", relativePath: "Library/Application Support/Trae CN/CachedData", risk: .safe, note: "Trae 会自动重建缓存"),
+        CacheRule(category: "IDE", name: "Trae CN 扩展安装包缓存", relativePath: "Library/Application Support/Trae CN/CachedExtensionVSIXs", risk: .safe, note: "扩展更新时会重新下载安装包"),
+        CacheRule(category: "IDE", name: "Trae CN CachedProfilesData", relativePath: "Library/Application Support/Trae CN/CachedProfilesData", risk: .safe, note: "Trae 会自动重建缓存"),
+        CacheRule(category: "IDE", name: "Trae CN Code Cache", relativePath: "Library/Application Support/Trae CN/Code Cache", risk: .safe, note: "Trae 会自动重建缓存"),
+        CacheRule(category: "IDE", name: "Trae CN GPUCache", relativePath: "Library/Application Support/Trae CN/GPUCache", risk: .safe, note: "Trae 会自动重建缓存"),
+        CacheRule(category: "IDE", name: "Trae CN DawnWebGPUCache", relativePath: "Library/Application Support/Trae CN/DawnWebGPUCache", risk: .safe, note: "Trae 会自动重建缓存"),
+        CacheRule(category: "IDE", name: "Trae CN DawnGraphiteCache", relativePath: "Library/Application Support/Trae CN/DawnGraphiteCache", risk: .safe, note: "Trae 会自动重建缓存"),
+        CacheRule(category: "IDE", name: "Windsurf Cache", relativePath: "Library/Application Support/Windsurf/Cache", risk: .safe, note: "Windsurf 会自动重建缓存"),
+        CacheRule(category: "IDE", name: "Windsurf CachedData", relativePath: "Library/Application Support/Windsurf/CachedData", risk: .safe, note: "Windsurf 会自动重建缓存"),
+        CacheRule(category: "IDE", name: "Windsurf 扩展安装包缓存", relativePath: "Library/Application Support/Windsurf/CachedExtensionVSIXs", risk: .safe, note: "扩展更新时会重新下载安装包"),
+        CacheRule(category: "IDE", name: "Windsurf Code Cache", relativePath: "Library/Application Support/Windsurf/Code Cache", risk: .safe, note: "Windsurf 会自动重建缓存"),
+        CacheRule(category: "IDE", name: "Windsurf GPUCache", relativePath: "Library/Application Support/Windsurf/GPUCache", risk: .safe, note: "Windsurf 会自动重建缓存"),
+        CacheRule(category: "IDE", name: "Zed 缓存", relativePath: "Library/Caches/Zed", risk: .safe, note: "Zed 会自动重建缓存"),
+        CacheRule(category: "IDE", name: "Zed Node 缓存", relativePath: "Library/Application Support/Zed/node/cache", risk: .safe, note: "Zed 会自动重建缓存"),
+        CacheRule(category: "IDE", name: "OpenCode Desktop Cache", relativePath: "Library/Application Support/ai.opencode.desktop/Cache", risk: .safe, note: "OpenCode Desktop 会自动重建缓存"),
+        CacheRule(category: "IDE", name: "OpenCode Desktop CachedData", relativePath: "Library/Application Support/ai.opencode.desktop/CachedData", risk: .safe, note: "OpenCode Desktop 会自动重建缓存"),
+        CacheRule(category: "IDE", name: "OpenCode Desktop Code Cache", relativePath: "Library/Application Support/ai.opencode.desktop/Code Cache", risk: .safe, note: "OpenCode Desktop 会自动重建缓存"),
+        CacheRule(category: "IDE", name: "OpenCode Desktop GPUCache", relativePath: "Library/Application Support/ai.opencode.desktop/GPUCache", risk: .safe, note: "OpenCode Desktop 会自动重建缓存"),
+        CacheRule(category: "IDE", name: "OpenCode Desktop 扩展安装包缓存", relativePath: "Library/Application Support/ai.opencode.desktop/CachedExtensionVSIXs", risk: .safe, note: "扩展更新时会重新下载安装包"),
+        CacheRule(category: "IDE", name: "Nova 缓存", relativePath: "Library/Application Support/Nova/Caches", risk: .safe, note: "Nova 会自动重建缓存"),
+        CacheRule(category: "IDE", name: "JetBrains 缓存", relativePath: "Library/Caches/JetBrains", risk: .safe, note: "IDE 会自动重建"),
+        CacheRule(category: "IDE", name: "JetBrains 日志", relativePath: "Library/Logs/JetBrains", risk: .safe, note: "IDE 会重新生成日志"),
+        CacheRule(category: "IDE", name: "Android Studio 日志", relativePath: "Library/Logs/AndroidStudio", risk: .safe, note: "Android Studio 会重新生成日志"),
+        CacheRule(category: "IDE", name: "Unity Hub 缓存", relativePath: "Library/Caches/com.unity3d.unityhub", risk: .safe, note: "Unity Hub 会自动重建缓存"),
+
+        CacheRule(category: "浏览器缓存", name: "Microsoft Edge 缓存", relativePath: "Library/Caches/Microsoft Edge", risk: .safe, note: "退出 Edge 后清理；浏览器会自动重建缓存"),
+        CacheRule(category: "浏览器缓存", name: "Microsoft Edge Dev 缓存", relativePath: "Library/Caches/Microsoft Edge Dev", risk: .safe, note: "退出 Edge Dev 后清理；浏览器会自动重建缓存"),
+        CacheRule(category: "浏览器缓存", name: "Microsoft Edge Beta 缓存", relativePath: "Library/Caches/Microsoft Edge Beta", risk: .safe, note: "退出 Edge Beta 后清理；浏览器会自动重建缓存"),
+        CacheRule(category: "浏览器缓存", name: "Firefox 缓存", relativePath: "Library/Caches/Firefox", risk: .safe, note: "退出 Firefox 后清理；浏览器会自动重建缓存"),
+        CacheRule(category: "浏览器缓存", name: "Google 应用缓存", relativePath: "Library/Caches/Google", risk: .safe, note: "退出 Chrome、Android Studio 等 Google 应用后清理；缓存会自动重建"),
+        CacheRule(category: "应用缓存", name: "Google 更新下载缓存", relativePath: "Library/Application Support/Google/GoogleUpdater/crx_cache", risk: .safe, note: "Google Updater 会在需要时重新下载安装包"),
+        CacheRule(category: "应用缓存", name: "媒体分析缓存", relativePath: "Library/Containers/com.apple.mediaanalysisd/Data/Library/Caches", risk: .safe, note: "macOS 媒体分析服务会重新生成缓存"),
+        CacheRule(category: "应用缓存", name: "剪映缓存", relativePath: "Movies/JianyingPro/User Data/Cache", risk: .review, note: "退出剪映后清理；请先确认没有仍需使用的草稿缓存"),
+        CacheRule(category: "前端工具链", name: "TypeScript 缓存", relativePath: ".cache/typescript", risk: .safe, note: "TypeScript 工具会重新生成缓存"),
+        CacheRule(category: "前端工具链", name: "Electron 缓存", relativePath: ".cache/electron", risk: .safe, note: "Electron 会重新下载或生成缓存"),
+        CacheRule(category: "前端工具链", name: "node-gyp 缓存", relativePath: ".cache/node-gyp", risk: .safe, note: "node-gyp 会重新下载头文件并编译"),
+        CacheRule(category: "前端工具链", name: "node-gyp（经典路径）", relativePath: ".node-gyp", risk: .safe, note: "node-gyp 会重新下载头文件并编译"),
+        CacheRule(category: "前端工具链", name: "Turborepo 全局缓存", relativePath: ".turbo/cache", risk: .safe, note: "Turborepo 会重新生成缓存"),
+        CacheRule(category: "前端工具链", name: "Webpack 缓存", relativePath: ".cache/webpack", risk: .safe, note: "Webpack 会重新生成缓存"),
+        CacheRule(category: "前端工具链", name: "ESLint 缓存", relativePath: ".cache/eslint", risk: .safe, note: "ESLint 会重新生成缓存"),
+        CacheRule(category: "前端工具链", name: "Prettier 缓存", relativePath: ".cache/prettier", risk: .safe, note: "Prettier 会重新生成缓存"),
+        CacheRule(category: "测试工具", name: "Cypress 浏览器缓存", relativePath: "Library/Caches/Cypress", risk: .review, note: "Cypress 会重新下载浏览器组件"),
+        CacheRule(category: "测试工具", name: "Selenium 缓存", relativePath: ".cache/selenium", risk: .review, note: "Selenium Manager 会重新下载驱动和浏览器组件"),
+        CacheRule(category: "测试工具", name: "SonarQube 缓存", relativePath: ".sonar/cache", risk: .safe, note: "Sonar 扫描器会重新下载分析器和插件"),
+
+        CacheRule(category: "云与基础设施", name: "Terraform Provider 缓存", relativePath: ".terraform.d/plugin-cache", risk: .safe, note: "Terraform 会重新下载 provider"),
+        CacheRule(category: "云与基础设施", name: "Helm 缓存", relativePath: "Library/Caches/helm", risk: .safe, note: "Helm 会重新获取仓库数据"),
+        CacheRule(category: "云与基础设施", name: "Kubernetes 缓存", relativePath: ".kube/cache", risk: .safe, note: "kubectl 会重新获取服务端数据"),
+        CacheRule(category: "云与基础设施", name: "AWS CLI 缓存", relativePath: ".aws/cli/cache", risk: .safe, note: "AWS CLI 会重新获取临时缓存"),
+        CacheRule(category: "云与基础设施", name: "Google Cloud 日志", relativePath: ".config/gcloud/logs", risk: .safe, note: "仅为 gcloud 日志"),
+        CacheRule(category: "云与基础设施", name: "Azure CLI 日志", relativePath: ".azure/logs", risk: .safe, note: "仅为 Azure CLI 日志"),
+        CacheRule(category: "Docker", name: "Docker BuildX 缓存", relativePath: ".docker/buildx/cache", risk: .safe, note: "BuildX 会重新生成构建缓存"),
+        CacheRule(category: "包管理器", name: "Homebrew 日志", relativePath: "Library/Logs/Homebrew", risk: .safe, note: "仅为 Homebrew 构建和安装日志"),
+
+        CacheRule(category: "数据库工具", name: "Sequel Ace 缓存", relativePath: "Library/Caches/com.sequel-ace.sequel-ace", risk: .safe, note: "仅删除 Sequel Ace 的 macOS Cache 数据"),
+        CacheRule(category: "数据库工具", name: "Sequel Pro 缓存", relativePath: "Library/Caches/com.eggerapps.Sequel-Pro", risk: .safe, note: "仅删除 Sequel Pro 的 macOS Cache 数据"),
+        CacheRule(category: "数据库工具", name: "Redis Desktop Manager 缓存", relativePath: "Library/Caches/redis-desktop-manager", risk: .safe, note: "仅删除 Redis Desktop Manager 的 macOS Cache 数据"),
+        CacheRule(category: "数据库工具", name: "RedisInsight 缓存", relativePath: "Library/Caches/com.redis.RedisInsight", risk: .safe, note: "仅删除 RedisInsight 的 macOS Cache 数据"),
+        CacheRule(category: "数据库工具", name: "MongoDB Compass 缓存", relativePath: "Library/Caches/com.mongodb.compass", risk: .safe, note: "仅删除 MongoDB Compass 的 macOS Cache 数据"),
+        CacheRule(category: "API / 调试工具", name: "Postman 缓存", relativePath: "Library/Caches/com.postmanlabs.mac", risk: .safe, note: "退出 Postman 后仅清理 macOS Cache 数据，不触碰工作区、请求历史或凭据"),
+        CacheRule(category: "API / 调试工具", name: "Insomnia 缓存", relativePath: "Library/Caches/com.konghq.insomnia", risk: .safe, note: "退出 Insomnia 后仅清理 macOS Cache 数据，不触碰工作区或凭据"),
+        CacheRule(category: "API / 调试工具", name: "TablePlus 缓存", relativePath: "Library/Caches/com.tinyapp.TablePlus", risk: .safe, note: "仅删除 TablePlus 的 macOS Cache 数据"),
+        CacheRule(category: "API / 调试工具", name: "Paw 缓存", relativePath: "Library/Caches/com.getpaw.Paw", risk: .safe, note: "仅删除 Paw 的 macOS Cache 数据"),
+        CacheRule(category: "API / 调试工具", name: "Charles 缓存", relativePath: "Library/Caches/com.charlesproxy.charles", risk: .safe, note: "仅删除 Charles 的 macOS Cache 数据，不触碰配置、证书或请求历史"),
+        CacheRule(category: "开发工具", name: "GitHub Desktop 缓存", relativePath: "Library/Caches/com.github.GitHubDesktop", risk: .safe, note: "仅删除 GitHub Desktop 的 macOS Cache 数据，不触碰仓库或凭据"),
+        CacheRule(category: "开发工具", name: "SentryCrash 诊断数据", relativePath: "Library/Caches/SentryCrash", risk: .review, note: "崩溃诊断数据；确认不再需要排查相关问题后清理"),
+        CacheRule(category: "CI/CD", name: "GitLab Runner 缓存", relativePath: ".cache/gitlab-runner", risk: .safe, note: "GitLab Runner 会重新生成缓存"),
+        CacheRule(category: "CI/CD", name: "GitHub Actions 缓存", relativePath: ".github/cache", risk: .safe, note: "GitHub 工具会重新生成缓存"),
+        CacheRule(category: "CI/CD", name: "CircleCI 缓存", relativePath: ".circleci/cache", risk: .safe, note: "CircleCI 工具会重新生成缓存"),
+        CacheRule(category: "云与基础设施", name: "Grafana 缓存", relativePath: ".grafana/cache", risk: .safe, note: "Grafana 会重新生成缓存"),
+
+    ]
+
+    static func knownCacheLocations(
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> [KnownCacheLocation] {
+        fixedRuleTemplates.map {
+            KnownCacheLocation(
+                url: home.appendingPathComponent($0.relativePath),
+                category: $0.category,
+                name: $0.name,
+                risk: $0.risk,
+                note: $0.note
+            )
+        }
     }
 
     private static func fixedItems(
@@ -267,237 +523,7 @@ struct CacheScanner {
         collector: inout ScanCollector,
         progress: @escaping (ScanProgress) -> Void
     ) -> [CacheItem] {
-        let rules: [CacheRule] = [
-            CacheRule(category: "Xcode", name: "DerivedData", relativePath: "Library/Developer/Xcode/DerivedData", risk: .safe, note: "编译后可自动重新生成"),
-            CacheRule(category: "Xcode", name: "ModuleCache", relativePath: "Library/Developer/Xcode/ModuleCache.noindex", risk: .safe, note: "Clang/Swift 模块缓存，Xcode 会自动重建"),
-            CacheRule(category: "Xcode", name: "BuildCache", relativePath: "Library/Developer/Xcode/BuildCache.noindex", risk: .safe, note: "Xcode 构建缓存，可重新生成"),
-            CacheRule(category: "Xcode", name: "SourcePackages", relativePath: "Library/Developer/Xcode/SourcePackages", risk: .review, note: "Swift Package checkout 和仓库，删除后会重新下载"),
-            CacheRule(category: "Xcode", name: "SwiftUI Preview 缓存", relativePath: "Library/Developer/Xcode/UserData/Previews", risk: .safe, note: "Preview 会自动重建"),
-            CacheRule(category: "Xcode", name: "Xcode 缓存", relativePath: "Library/Caches/com.apple.dt.Xcode", risk: .safe, note: "Xcode 会自动重建缓存"),
-            CacheRule(category: "Xcode", name: "xcodebuild 缓存", relativePath: "Library/Caches/com.apple.dt.xcodebuild", risk: .safe, note: "构建缓存，可重新生成"),
-            CacheRule(category: "Xcode", name: "源码控制 Git 缓存", relativePath: "Library/Caches/com.apple.dt.Xcode.sourcecontrol.Git", risk: .safe, note: "Xcode 会重新获取 Git 数据"),
-            CacheRule(category: "Xcode", name: "文档缓存", relativePath: "Library/Developer/Xcode/DocumentationCache", risk: .safe, note: "需要时会重新下载"),
-            CacheRule(category: "Xcode", name: "Instruments 缓存", relativePath: "Library/Caches/com.apple.dt.instruments", risk: .safe, note: "Instruments 会自动重建缓存"),
-            CacheRule(category: "Xcode", name: "SourceKitService 缓存", relativePath: "Library/Caches/com.apple.dt.SourceKitService", risk: .safe, note: "SourceKit 会自动重建缓存"),
-            CacheRule(category: "Xcode", name: "Xcode Previews 缓存", relativePath: "Library/Caches/com.apple.dt.XcodePreviews", risk: .safe, note: "Preview 会自动重建缓存"),
-            CacheRule(category: "Xcode", name: "iOS Device Logs", relativePath: "Library/Developer/Xcode/iOS Device Logs", risk: .review, note: "真机诊断日志；确认不再需要排查问题后清理"),
-            CacheRule(category: "Xcode", name: "Archives", relativePath: "Library/Developer/Xcode/Archives", risk: .review, note: "可能包含发布归档，请确认后清理"),
-            CacheRule(category: "Xcode", name: "Products", relativePath: "Library/Developer/Xcode/Products", risk: .review, note: "项目产物，可按需重新构建"),
-            CacheRule(category: "Xcode", name: "iOS DeviceSupport", relativePath: "Library/Developer/Xcode/iOS DeviceSupport", risk: .manual, note: "删除后真机调试可能需要重新下载"),
-            CacheRule(category: "Xcode", name: "watchOS DeviceSupport", relativePath: "Library/Developer/Xcode/watchOS DeviceSupport", risk: .manual, note: "删除后 Apple Watch 真机调试可能需要重新下载符号"),
-            CacheRule(category: "Xcode", name: "tvOS DeviceSupport", relativePath: "Library/Developer/Xcode/tvOS DeviceSupport", risk: .manual, note: "删除后 Apple TV 真机调试可能需要重新下载符号"),
-            CacheRule(category: "Xcode", name: "macOS DeviceSupport", relativePath: "Library/Developer/Xcode/macOS DeviceSupport", risk: .manual, note: "删除后 macOS 设备调试可能需要重新下载符号"),
-            CacheRule(category: "Xcode", name: "visionOS DeviceSupport", relativePath: "Library/Developer/Xcode/visionOS DeviceSupport", risk: .manual, note: "删除后 Vision Pro 真机调试可能需要重新下载符号"),
-            CacheRule(category: "Xcode", name: "Playgrounds", relativePath: "Library/Developer/Xcode/UserData/Playgrounds", risk: .review, note: "Playground 生成数据和缓存；请确认没有需要保留的结果"),
-            CacheRule(category: "CoreSimulator", name: "模拟器缓存", relativePath: "Library/Developer/CoreSimulator/Caches", risk: .safe, note: "模拟器缓存，不含设备数据"),
-            CacheRule(category: "CoreSimulator", name: "模拟器日志", relativePath: "Library/Logs/CoreSimulator", risk: .safe, note: "模拟器会重新生成日志"),
-
-            // AI coding agents: only disposable caches and logs are included.
-            // Codex databases that hold goals, memories, queue, and thread history
-            // are intentionally not listed here because they are agent state.
-            CacheRule(category: "AI Agent", name: "Codex 日志数据库", relativePath: ".codex/logs_2.sqlite", risk: .review, note: "Codex 日志数据库可能包含会话调试信息；确认不再需要后清理，不会触碰目标、记忆、队列或线程历史"),
-            CacheRule(category: "AI Agent", name: "OpenCode 缓存", relativePath: ".cache/opencode", risk: .safe, note: "OpenCode 可重建缓存；数据、配置、状态和仓库目录不会清理"),
-            CacheRule(category: "AI Agent", name: "OpenCode 日志", relativePath: ".local/share/opencode/log", risk: .review, note: "OpenCode 日志；确认不再需要排查问题后清理，数据和仓库目录不会清理"),
-            // OpenCode's CLI follows XDG paths; desktop wrappers on macOS may
-            // use the conventional Library locations instead.
-            CacheRule(category: "AI Agent", name: "OpenCode 缓存（macOS）", relativePath: "Library/Caches/opencode", risk: .safe, note: "OpenCode 可重建缓存；数据、配置、状态和仓库目录不会清理"),
-            CacheRule(category: "AI Agent", name: "OpenCode 日志（macOS）", relativePath: "Library/Application Support/opencode/log", risk: .review, note: "OpenCode 日志；确认不再需要排查问题后清理，数据、配置、状态和仓库目录不会清理"),
-            CacheRule(category: "AI Agent", name: "Claude Code 调试日志", relativePath: ".claude/debug-logs", risk: .review, note: "Claude Code 调试日志可能包含提示词和路径；确认不再需要后清理，不会触碰项目、历史、凭据或任务状态"),
-            CacheRule(category: "AI Agent", name: "Goose 更新缓存", relativePath: "Library/Caches/goose-updater", risk: .review, note: "Goose 更新程序下载缓存；确认没有正在进行的更新后清理"),
-
-            CacheRule(category: "包管理器", name: "npm 下载缓存", relativePath: ".npm/_cacache", risk: .safe, note: "npm 会重新下载依赖"),
-            CacheRule(category: "包管理器", name: "npm 日志", relativePath: ".npm/_logs", risk: .safe, note: "仅为 npm 日志"),
-            CacheRule(category: "包管理器", name: "npx 临时包", relativePath: ".npm/_npx", risk: .safe, note: "npx 会在下次执行时重新下载临时包"),
-            CacheRule(category: "包管理器", name: "npm 预编译缓存", relativePath: ".npm/_prebuilds", risk: .safe, note: "原生模块会在需要时重新下载或编译"),
-            CacheRule(category: "包管理器", name: "npm（旧路径）", relativePath: ".npm-cache-user/_cacache", risk: .safe, note: "npm 会重新下载依赖"),
-            CacheRule(category: "包管理器", name: "tnpm 下载缓存", relativePath: ".tnpm/_cacache", risk: .safe, note: "tnpm 会重新下载依赖"),
-            CacheRule(category: "包管理器", name: "tnpm 日志", relativePath: ".tnpm/_logs", risk: .safe, note: "仅为 tnpm 日志"),
-            CacheRule(category: "包管理器", name: "Yarn", relativePath: "Library/Caches/Yarn", risk: .safe, note: "Yarn 会重新下载依赖"),
-            CacheRule(category: "包管理器", name: "Yarn（旧缓存）", relativePath: ".cache/yarn", risk: .safe, note: "Yarn 会重新下载依赖"),
-            CacheRule(category: "包管理器", name: "Yarn 离线缓存", relativePath: ".yarn/cache", risk: .review, note: "Yarn 会重新下载依赖；离线环境下请保留"),
-            CacheRule(category: "包管理器", name: "pnpm 元数据缓存", relativePath: "Library/Caches/pnpm", risk: .safe, note: "pnpm 会重新获取 registry 元数据"),
-            CacheRule(category: "包管理器", name: "Bun", relativePath: ".bun/install/cache", risk: .safe, note: "Bun 会重新下载依赖"),
-            CacheRule(category: "包管理器", name: "Deno", relativePath: "Library/Caches/deno", risk: .safe, note: "Deno 会重新下载依赖和工具"),
-            CacheRule(category: "包管理器", name: "Deno（旧缓存）", relativePath: ".cache/deno", risk: .safe, note: "Deno 会重新下载依赖和工具"),
-            CacheRule(category: "包管理器", name: "Node.js 通用缓存", relativePath: ".cache/node", risk: .safe, note: "Node.js 工具会自动重建缓存"),
-            CacheRule(category: "包管理器", name: "Corepack", relativePath: "Library/Caches/node/corepack", risk: .safe, note: "Corepack 会重新下载包管理器"),
-            CacheRule(category: "包管理器", name: "Playwright 浏览器缓存", relativePath: "Library/Caches/ms-playwright", risk: .review, note: "Playwright 会重新下载浏览器，确认不再需要对应版本后清理"),
-            CacheRule(category: "包管理器", name: "Puppeteer 浏览器缓存", relativePath: "Library/Caches/puppeteer", risk: .review, note: "Puppeteer 会重新下载浏览器，确认不再需要对应版本后清理"),
-            CacheRule(category: "包管理器", name: "CocoaPods", relativePath: "Library/Caches/CocoaPods", risk: .safe, note: "Pods 会重新下载"),
-            CacheRule(category: "包管理器", name: "Homebrew 下载缓存", relativePath: "Library/Caches/Homebrew", risk: .safe, note: "Homebrew 会重新下载包"),
-            CacheRule(category: "包管理器", name: "SwiftPM 下载缓存", relativePath: "Library/Caches/org.swift.swiftpm", risk: .safe, note: "SwiftPM 会重新解析依赖"),
-            CacheRule(category: "包管理器", name: "SwiftPM（XDG 缓存）", relativePath: ".cache/org.swift.swiftpm", risk: .safe, note: "SwiftPM 会重新解析依赖"),
-            CacheRule(category: "包管理器", name: "SwiftPM（旧缓存）", relativePath: ".swiftpm/cache", risk: .safe, note: "SwiftPM 会重新解析依赖"),
-            CacheRule(category: "包管理器", name: "SwiftPM 仓库缓存", relativePath: ".swiftpm/repositories", risk: .review, note: "可能包含依赖仓库 checkout；删除后会重新下载，请确认后清理"),
-            CacheRule(category: "包管理器", name: "Composer", relativePath: "Library/Caches/composer", risk: .safe, note: "Composer 会重新下载依赖"),
-            CacheRule(category: "包管理器", name: "NuGet 全局包缓存", relativePath: ".nuget/packages", risk: .review, note: "NuGet 全局依赖包目录。清理后项目可以重新 restore，但可能需要大量网络下载，离线环境建议保留"),
-            CacheRule(category: "包管理器", name: "CocoaPods Specs 仓库", relativePath: ".cocoapods/repos", risk: .review, note: "Specs 索引会重新下载；离线环境下请保留"),
-
-            CacheRule(category: "语言工具链", name: "Cargo registry cache", relativePath: ".cargo/registry/cache", risk: .safe, note: "Cargo 会重新下载 crate"),
-            CacheRule(category: "语言工具链", name: "Cargo registry index", relativePath: ".cargo/registry/index", risk: .safe, note: "Cargo 会重新获取 registry 索引"),
-            CacheRule(category: "语言工具链", name: "Cargo registry source", relativePath: ".cargo/registry/src", risk: .review, note: "Cargo 已解压的依赖源码；删除后会重新下载，可能影响离线构建和 IDE 索引"),
-            CacheRule(category: "语言工具链", name: "Cargo git checkout", relativePath: ".cargo/git/checkouts", risk: .review, note: "Cargo Git 依赖 checkout；删除后会重新获取，请确认离线构建不受影响"),
-            CacheRule(category: "语言工具链", name: "Cargo git database", relativePath: ".cargo/git/db", risk: .review, note: "Cargo Git 依赖数据库；删除后会重新获取，请确认离线构建不受影响"),
-            CacheRule(category: "语言工具链", name: "rustup 下载缓存", relativePath: ".rustup/downloads", risk: .safe, note: "rustup 会重新下载工具链安装包"),
-            CacheRule(category: "语言工具链", name: "rustup 临时缓存", relativePath: ".rustup/tmp", risk: .safe, note: "rustup 会重新创建临时文件"),
-            CacheRule(category: "语言工具链", name: "pip", relativePath: "Library/Caches/pip", risk: .safe, note: "pip 会重新下载 wheel"),
-            CacheRule(category: "语言工具链", name: "pip（旧缓存）", relativePath: ".cache/pip", risk: .safe, note: "pip 会重新下载 wheel"),
-            CacheRule(category: "语言工具链", name: "uv", relativePath: "Library/Caches/uv", risk: .safe, note: "uv 会重新下载包"),
-            CacheRule(category: "语言工具链", name: "uv（旧缓存）", relativePath: ".cache/uv", risk: .safe, note: "uv 会重新下载包"),
-            CacheRule(category: "语言工具链", name: "Poetry", relativePath: "Library/Caches/pypoetry", risk: .safe, note: "Poetry 会重新下载包"),
-            CacheRule(category: "AI/ML", name: "Hugging Face 模型缓存", relativePath: ".cache/huggingface", risk: .review, note: "模型会重新下载；请确认不再需要这些模型"),
-            CacheRule(category: "AI/ML", name: "PyTorch 缓存", relativePath: ".cache/torch", risk: .review, note: "PyTorch 模型和数据会重新下载；请确认后清理"),
-            CacheRule(category: "AI/ML", name: "Whisper 缓存", relativePath: ".cache/whisper", risk: .review, note: "Whisper 模型会重新下载；请确认后清理"),
-            CacheRule(category: "AI/ML", name: "Keras 缓存", relativePath: ".keras", risk: .review, note: "Keras 模型会重新下载；请确认后清理"),
-            CacheRule(category: "AI/ML", name: "TensorFlow Hub 缓存", relativePath: ".cache/tfhub_modules", risk: .review, note: "TensorFlow Hub 模型会重新下载；请确认后清理"),
-            CacheRule(category: "AI/ML", name: "Ollama 模型", relativePath: ".ollama/models", risk: .review, note: "Ollama 模型会重新下载；请确认不再需要本地模型"),
-            CacheRule(category: "AI/ML", name: "LM Studio 模型缓存", relativePath: ".cache/lm-studio", risk: .review, note: "LM Studio 模型会重新下载；请确认不再需要本地模型"),
-            CacheRule(category: "AI/ML", name: "LM Studio 模型（应用目录）", relativePath: "Library/Application Support/LM Studio/models", risk: .review, note: "LM Studio 模型会重新下载；请确认不再需要本地模型"),
-            CacheRule(category: "AI/ML", name: "Ollama 日志", relativePath: "Library/Logs/Ollama", risk: .safe, note: "Ollama 会重新生成日志"),
-            CacheRule(category: "语言工具链", name: "Conda 包缓存", relativePath: ".conda/pkgs", risk: .safe, note: "Conda 会重新下载包"),
-            CacheRule(category: "语言工具链", name: "Miniconda 包缓存", relativePath: "miniconda3/pkgs", risk: .safe, note: "Conda 会重新下载包"),
-            CacheRule(category: "语言工具链", name: "Miniforge 包缓存", relativePath: "miniforge3/pkgs", risk: .safe, note: "Conda 会重新下载包"),
-            CacheRule(category: "语言工具链", name: "Anaconda 包缓存", relativePath: "anaconda3/pkgs", risk: .safe, note: "Conda 会重新下载包"),
-            CacheRule(category: "语言工具链", name: "Go build cache", relativePath: "Library/Caches/go-build", risk: .safe, note: "Go 会重新编译"),
-            CacheRule(category: "语言工具链", name: "Go modules", relativePath: "go/pkg/mod", risk: .review, note: "删除后 Go 项目需要重新下载模块"),
-            CacheRule(category: "语言工具链", name: "Flutter / Dart", relativePath: ".pub-cache", risk: .review, note: "Dart/Flutter 依赖缓存。清理后可以重新获取依赖，但会增加下一次构建的网络和时间成本"),
-
-            CacheRule(category: "JVM", name: "Gradle caches", relativePath: ".gradle/caches", risk: .safe, note: "Gradle 会重新下载依赖"),
-            CacheRule(category: "JVM", name: "Gradle wrapper distributions", relativePath: ".gradle/wrapper/dists", risk: .safe, note: "Gradle wrapper 会重新下载发行版"),
-            CacheRule(category: "JVM", name: "Gradle daemon", relativePath: ".gradle/daemon", risk: .review, note: "建议停止 Gradle 构建后清理"),
-            CacheRule(category: "JVM", name: "Maven repository", relativePath: ".m2/repository", risk: .review, note: "Maven 会重新下载依赖"),
-            CacheRule(category: "JVM", name: "Maven wrapper distributions", relativePath: ".m2/wrapper/dists", risk: .safe, note: "Maven Wrapper 会重新下载发行版"),
-            CacheRule(category: "JVM", name: "sbt boot 缓存", relativePath: ".sbt/boot", risk: .review, note: "Scala/sbt 工具组件会重新下载；请确认后清理"),
-            CacheRule(category: "JVM", name: "sbt launcher 缓存", relativePath: ".sbt/launchers", risk: .review, note: "sbt 启动器会重新下载；请确认后清理"),
-            CacheRule(category: "JVM", name: "Ivy 依赖缓存", relativePath: ".ivy2/cache", risk: .review, note: "sbt/Ivy 依赖会重新下载；离线环境下请保留"),
-            CacheRule(category: "JVM", name: "Coursier 缓存", relativePath: ".coursier/cache", risk: .review, note: "Scala/JVM 依赖会重新下载；请确认后清理"),
-            CacheRule(category: "JVM", name: "Ammonite 缓存", relativePath: ".ammonite/cache", risk: .review, note: "Ammonite 会重新下载依赖；请确认后清理"),
-            CacheRule(category: "JVM", name: "Metals 缓存", relativePath: ".cache/metals", risk: .review, note: "Scala IDE 索引会重新生成；请确认后清理"),
-            CacheRule(category: "JVM", name: "Android SDK 临时下载", relativePath: "Library/Android/sdk/.temp", risk: .safe, note: "Android SDK 会重新下载组件"),
-            CacheRule(category: "JVM", name: "Android SDK 缓存", relativePath: "Library/Android/sdk/.cache", risk: .safe, note: "Android SDK 会自动重建缓存"),
-            CacheRule(category: "JVM", name: "Android 用户缓存", relativePath: ".android/cache", risk: .safe, note: "Android 工具会自动重建缓存"),
-            CacheRule(category: "JVM", name: "Android 旧构建缓存", relativePath: ".android/build-cache", risk: .safe, note: "Android 工具会重新构建"),
-            CacheRule(category: "JVM", name: "Bazel 缓存", relativePath: "Library/Caches/bazel", risk: .safe, note: "Bazel 会重新构建"),
-            CacheRule(category: "JVM", name: "Bazel（旧缓存）", relativePath: ".cache/bazel", risk: .safe, note: "Bazel 会重新构建"),
-
-            CacheRule(category: "语言工具链", name: "mise 缓存", relativePath: ".cache/mise", risk: .safe, note: "mise 会重新下载工具"),
-            CacheRule(category: "语言工具链", name: "asdf 下载缓存", relativePath: ".asdf/downloads", risk: .safe, note: "asdf 会重新下载工具"),
-            CacheRule(category: "语言工具链", name: "asdf 临时缓存", relativePath: ".asdf/tmp", risk: .safe, note: "asdf 会重新创建临时文件"),
-            CacheRule(category: "语言工具链", name: "nvm 下载缓存", relativePath: ".nvm/.cache", risk: .safe, note: "nvm 会重新下载 Node.js 安装包"),
-            CacheRule(category: "语言工具链", name: "Volta 下载缓存", relativePath: ".volta/cache", risk: .safe, note: "Volta 会重新下载工具链"),
-            CacheRule(category: "语言工具链", name: "ccache", relativePath: ".cache/ccache", risk: .safe, note: "编译器会重新编译"),
-            CacheRule(category: "语言工具链", name: "sccache", relativePath: ".cache/sccache", risk: .safe, note: "编译器会重新编译"),
-            CacheRule(category: "语言工具链", name: "ccache（macOS）", relativePath: "Library/Caches/ccache", risk: .safe, note: "编译器会重新编译"),
-            CacheRule(category: "语言工具链", name: "sccache（macOS）", relativePath: "Library/Caches/sccache", risk: .safe, note: "编译器会重新编译"),
-            CacheRule(category: "语言工具链", name: "ccache（经典路径）", relativePath: ".ccache", risk: .safe, note: "编译器会重新编译"),
-            CacheRule(category: "语言工具链", name: "Zig 全局缓存", relativePath: ".cache/zig", risk: .safe, note: "Zig 会重新生成构建缓存"),
-            CacheRule(category: "Ruby", name: "Bundler 下载缓存", relativePath: ".bundle/cache", risk: .safe, note: "Bundler 会重新下载 gem"),
-            CacheRule(category: "Ruby", name: "RubyGems 索引缓存", relativePath: ".gem/specs", risk: .safe, note: "RubyGems 会重新获取索引"),
-            CacheRule(category: "Ruby", name: "rbenv 下载缓存", relativePath: ".rbenv/cache", risk: .safe, note: "rbenv 会重新下载安装包"),
-            CacheRule(category: "Ruby", name: "CPAN 构建缓存", relativePath: ".cpan/build", risk: .safe, note: "CPAN 会重新创建构建目录"),
-            CacheRule(category: "语言工具链", name: "Hex 缓存", relativePath: ".hex/cache", risk: .safe, note: "Hex 会重新下载 Elixir/Erlang 包"),
-            CacheRule(category: "Python 项目", name: "pipx 缓存", relativePath: ".cache/pipx", risk: .safe, note: "pipx 会重新下载包"),
-            CacheRule(category: "Python 项目", name: "pre-commit 缓存", relativePath: ".cache/pre-commit", risk: .safe, note: "pre-commit 会重新下载环境"),
-            CacheRule(category: "Python 项目", name: "Jupyter 缓存", relativePath: ".cache/jupyter", risk: .safe, note: "Jupyter 会重新生成缓存"),
-
-            CacheRule(category: "IDE", name: "VS Code Cache", relativePath: "Library/Application Support/Code/Cache", risk: .safe, note: "编辑器会自动重建"),
-            CacheRule(category: "IDE", name: "VS Code CachedData", relativePath: "Library/Application Support/Code/CachedData", risk: .safe, note: "编辑器会自动重建"),
-            CacheRule(category: "IDE", name: "VS Code 扩展安装包缓存", relativePath: "Library/Application Support/Code/CachedExtensionVSIXs", risk: .safe, note: "扩展更新时会重新下载安装包"),
-            CacheRule(category: "IDE", name: "VS Code Code Cache", relativePath: "Library/Application Support/Code/Code Cache", risk: .safe, note: "编辑器会自动重建"),
-            CacheRule(category: "IDE", name: "VS Code GPUCache", relativePath: "Library/Application Support/Code/GPUCache", risk: .safe, note: "编辑器会自动重建"),
-            CacheRule(category: "IDE", name: "VS Code Service Worker", relativePath: "Library/Application Support/Code/Service Worker", risk: .review, note: "编辑器会重建；清理前建议退出 VS Code"),
-            CacheRule(category: "IDE", name: "VS Code 日志", relativePath: "Library/Application Support/Code/logs", risk: .safe, note: "仅为编辑器日志"),
-            CacheRule(category: "IDE", name: "VS Code 系统缓存", relativePath: "Library/Caches/com.microsoft.VSCode", risk: .safe, note: "编辑器会自动重建"),
-            CacheRule(category: "IDE", name: "VS Code workspaceStorage", relativePath: "Library/Application Support/Code/User/workspaceStorage", risk: .review, note: "工作区状态和扩展数据，确认后再清理"),
-            CacheRule(category: "IDE", name: "Cursor Cache", relativePath: "Library/Application Support/Cursor/Cache", risk: .safe, note: "编辑器会自动重建"),
-            CacheRule(category: "IDE", name: "Cursor CachedData", relativePath: "Library/Application Support/Cursor/CachedData", risk: .safe, note: "编辑器会自动重建"),
-            CacheRule(category: "IDE", name: "Cursor Code Cache", relativePath: "Library/Application Support/Cursor/Code Cache", risk: .safe, note: "编辑器会自动重建"),
-            CacheRule(category: "IDE", name: "Cursor GPUCache", relativePath: "Library/Application Support/Cursor/GPUCache", risk: .safe, note: "编辑器会自动重建"),
-            CacheRule(category: "IDE", name: "Cursor 扩展安装包缓存", relativePath: "Library/Application Support/Cursor/CachedExtensionVSIXs", risk: .safe, note: "扩展更新时会重新下载安装包"),
-            CacheRule(category: "IDE", name: "Cursor Service Worker", relativePath: "Library/Application Support/Cursor/Service Worker", risk: .review, note: "编辑器会重建；清理前建议退出 Cursor"),
-            CacheRule(category: "IDE", name: "Cursor 日志", relativePath: "Library/Application Support/Cursor/logs", risk: .safe, note: "仅为编辑器日志"),
-            CacheRule(category: "IDE", name: "Cursor workspaceStorage", relativePath: "Library/Application Support/Cursor/User/workspaceStorage", risk: .review, note: "工作区状态和扩展数据，确认后再清理"),
-            CacheRule(category: "IDE", name: "Lingma Cache", relativePath: "Library/Application Support/Lingma/Cache", risk: .safe, note: "Lingma 会自动重建缓存"),
-            CacheRule(category: "IDE", name: "Lingma CachedData", relativePath: "Library/Application Support/Lingma/CachedData", risk: .safe, note: "Lingma 会自动重建缓存"),
-            CacheRule(category: "IDE", name: "Lingma 扩展安装包缓存", relativePath: "Library/Application Support/Lingma/CachedExtensionVSIXs", risk: .safe, note: "扩展更新时会重新下载安装包"),
-            CacheRule(category: "IDE", name: "Lingma CachedProfilesData", relativePath: "Library/Application Support/Lingma/CachedProfilesData", risk: .safe, note: "Lingma 会自动重建缓存"),
-            CacheRule(category: "IDE", name: "Lingma Code Cache", relativePath: "Library/Application Support/Lingma/Code Cache", risk: .safe, note: "Lingma 会自动重建缓存"),
-            CacheRule(category: "IDE", name: "Lingma GPUCache", relativePath: "Library/Application Support/Lingma/GPUCache", risk: .safe, note: "Lingma 会自动重建缓存"),
-            CacheRule(category: "IDE", name: "Lingma DawnWebGPUCache", relativePath: "Library/Application Support/Lingma/DawnWebGPUCache", risk: .safe, note: "Lingma 会自动重建缓存"),
-            CacheRule(category: "IDE", name: "Lingma DawnGraphiteCache", relativePath: "Library/Application Support/Lingma/DawnGraphiteCache", risk: .safe, note: "Lingma 会自动重建缓存"),
-            CacheRule(category: "IDE", name: "Trae CN Cache", relativePath: "Library/Application Support/Trae CN/Cache", risk: .safe, note: "Trae 会自动重建缓存"),
-            CacheRule(category: "IDE", name: "Trae CN CachedData", relativePath: "Library/Application Support/Trae CN/CachedData", risk: .safe, note: "Trae 会自动重建缓存"),
-            CacheRule(category: "IDE", name: "Trae CN 扩展安装包缓存", relativePath: "Library/Application Support/Trae CN/CachedExtensionVSIXs", risk: .safe, note: "扩展更新时会重新下载安装包"),
-            CacheRule(category: "IDE", name: "Trae CN CachedProfilesData", relativePath: "Library/Application Support/Trae CN/CachedProfilesData", risk: .safe, note: "Trae 会自动重建缓存"),
-            CacheRule(category: "IDE", name: "Trae CN Code Cache", relativePath: "Library/Application Support/Trae CN/Code Cache", risk: .safe, note: "Trae 会自动重建缓存"),
-            CacheRule(category: "IDE", name: "Trae CN GPUCache", relativePath: "Library/Application Support/Trae CN/GPUCache", risk: .safe, note: "Trae 会自动重建缓存"),
-            CacheRule(category: "IDE", name: "Trae CN DawnWebGPUCache", relativePath: "Library/Application Support/Trae CN/DawnWebGPUCache", risk: .safe, note: "Trae 会自动重建缓存"),
-            CacheRule(category: "IDE", name: "Trae CN DawnGraphiteCache", relativePath: "Library/Application Support/Trae CN/DawnGraphiteCache", risk: .safe, note: "Trae 会自动重建缓存"),
-            CacheRule(category: "IDE", name: "Windsurf Cache", relativePath: "Library/Application Support/Windsurf/Cache", risk: .safe, note: "Windsurf 会自动重建缓存"),
-            CacheRule(category: "IDE", name: "Windsurf CachedData", relativePath: "Library/Application Support/Windsurf/CachedData", risk: .safe, note: "Windsurf 会自动重建缓存"),
-            CacheRule(category: "IDE", name: "Windsurf 扩展安装包缓存", relativePath: "Library/Application Support/Windsurf/CachedExtensionVSIXs", risk: .safe, note: "扩展更新时会重新下载安装包"),
-            CacheRule(category: "IDE", name: "Windsurf Code Cache", relativePath: "Library/Application Support/Windsurf/Code Cache", risk: .safe, note: "Windsurf 会自动重建缓存"),
-            CacheRule(category: "IDE", name: "Windsurf GPUCache", relativePath: "Library/Application Support/Windsurf/GPUCache", risk: .safe, note: "Windsurf 会自动重建缓存"),
-            CacheRule(category: "IDE", name: "Zed 缓存", relativePath: "Library/Caches/Zed", risk: .safe, note: "Zed 会自动重建缓存"),
-            CacheRule(category: "IDE", name: "Zed Node 缓存", relativePath: "Library/Application Support/Zed/node/cache", risk: .safe, note: "Zed 会自动重建缓存"),
-            CacheRule(category: "IDE", name: "OpenCode Desktop Cache", relativePath: "Library/Application Support/ai.opencode.desktop/Cache", risk: .safe, note: "OpenCode Desktop 会自动重建缓存"),
-            CacheRule(category: "IDE", name: "OpenCode Desktop CachedData", relativePath: "Library/Application Support/ai.opencode.desktop/CachedData", risk: .safe, note: "OpenCode Desktop 会自动重建缓存"),
-            CacheRule(category: "IDE", name: "OpenCode Desktop Code Cache", relativePath: "Library/Application Support/ai.opencode.desktop/Code Cache", risk: .safe, note: "OpenCode Desktop 会自动重建缓存"),
-            CacheRule(category: "IDE", name: "OpenCode Desktop GPUCache", relativePath: "Library/Application Support/ai.opencode.desktop/GPUCache", risk: .safe, note: "OpenCode Desktop 会自动重建缓存"),
-            CacheRule(category: "IDE", name: "OpenCode Desktop 扩展安装包缓存", relativePath: "Library/Application Support/ai.opencode.desktop/CachedExtensionVSIXs", risk: .safe, note: "扩展更新时会重新下载安装包"),
-            CacheRule(category: "IDE", name: "Nova 缓存", relativePath: "Library/Application Support/Nova/Caches", risk: .safe, note: "Nova 会自动重建缓存"),
-            CacheRule(category: "IDE", name: "JetBrains 缓存", relativePath: "Library/Caches/JetBrains", risk: .safe, note: "IDE 会自动重建"),
-            CacheRule(category: "IDE", name: "JetBrains 日志", relativePath: "Library/Logs/JetBrains", risk: .safe, note: "IDE 会重新生成日志"),
-            CacheRule(category: "IDE", name: "Android Studio 日志", relativePath: "Library/Logs/AndroidStudio", risk: .safe, note: "Android Studio 会重新生成日志"),
-            CacheRule(category: "IDE", name: "Unity Hub 缓存", relativePath: "Library/Caches/com.unity3d.unityhub", risk: .safe, note: "Unity Hub 会自动重建缓存"),
-
-            CacheRule(category: "浏览器缓存", name: "Microsoft Edge 缓存", relativePath: "Library/Caches/Microsoft Edge", risk: .safe, note: "退出 Edge 后清理；浏览器会自动重建缓存"),
-            CacheRule(category: "浏览器缓存", name: "Microsoft Edge Dev 缓存", relativePath: "Library/Caches/Microsoft Edge Dev", risk: .safe, note: "退出 Edge Dev 后清理；浏览器会自动重建缓存"),
-            CacheRule(category: "浏览器缓存", name: "Microsoft Edge Beta 缓存", relativePath: "Library/Caches/Microsoft Edge Beta", risk: .safe, note: "退出 Edge Beta 后清理；浏览器会自动重建缓存"),
-            CacheRule(category: "浏览器缓存", name: "Firefox 缓存", relativePath: "Library/Caches/Firefox", risk: .safe, note: "退出 Firefox 后清理；浏览器会自动重建缓存"),
-            CacheRule(category: "浏览器缓存", name: "Google 应用缓存", relativePath: "Library/Caches/Google", risk: .safe, note: "退出 Chrome、Android Studio 等 Google 应用后清理；缓存会自动重建"),
-            CacheRule(category: "应用缓存", name: "Google 更新下载缓存", relativePath: "Library/Application Support/Google/GoogleUpdater/crx_cache", risk: .safe, note: "Google Updater 会在需要时重新下载安装包"),
-            CacheRule(category: "应用缓存", name: "媒体分析缓存", relativePath: "Library/Containers/com.apple.mediaanalysisd/Data/Library/Caches", risk: .safe, note: "macOS 媒体分析服务会重新生成缓存"),
-            CacheRule(category: "应用缓存", name: "剪映缓存", relativePath: "Movies/JianyingPro/User Data/Cache", risk: .review, note: "退出剪映后清理；请先确认没有仍需使用的草稿缓存"),
-            CacheRule(category: "前端工具链", name: "TypeScript 缓存", relativePath: ".cache/typescript", risk: .safe, note: "TypeScript 工具会重新生成缓存"),
-            CacheRule(category: "前端工具链", name: "Electron 缓存", relativePath: ".cache/electron", risk: .safe, note: "Electron 会重新下载或生成缓存"),
-            CacheRule(category: "前端工具链", name: "node-gyp 缓存", relativePath: ".cache/node-gyp", risk: .safe, note: "node-gyp 会重新下载头文件并编译"),
-            CacheRule(category: "前端工具链", name: "node-gyp（经典路径）", relativePath: ".node-gyp", risk: .safe, note: "node-gyp 会重新下载头文件并编译"),
-            CacheRule(category: "前端工具链", name: "Turborepo 全局缓存", relativePath: ".turbo/cache", risk: .safe, note: "Turborepo 会重新生成缓存"),
-            CacheRule(category: "前端工具链", name: "Webpack 缓存", relativePath: ".cache/webpack", risk: .safe, note: "Webpack 会重新生成缓存"),
-            CacheRule(category: "前端工具链", name: "ESLint 缓存", relativePath: ".cache/eslint", risk: .safe, note: "ESLint 会重新生成缓存"),
-            CacheRule(category: "前端工具链", name: "Prettier 缓存", relativePath: ".cache/prettier", risk: .safe, note: "Prettier 会重新生成缓存"),
-            CacheRule(category: "测试工具", name: "Cypress 浏览器缓存", relativePath: "Library/Caches/Cypress", risk: .review, note: "Cypress 会重新下载浏览器组件"),
-            CacheRule(category: "测试工具", name: "Selenium 缓存", relativePath: ".cache/selenium", risk: .review, note: "Selenium Manager 会重新下载驱动和浏览器组件"),
-            CacheRule(category: "测试工具", name: "SonarQube 缓存", relativePath: ".sonar/cache", risk: .safe, note: "Sonar 扫描器会重新下载分析器和插件"),
-
-            CacheRule(category: "云与基础设施", name: "Terraform Provider 缓存", relativePath: ".terraform.d/plugin-cache", risk: .safe, note: "Terraform 会重新下载 provider"),
-            CacheRule(category: "云与基础设施", name: "Helm 缓存", relativePath: "Library/Caches/helm", risk: .safe, note: "Helm 会重新获取仓库数据"),
-            CacheRule(category: "云与基础设施", name: "Kubernetes 缓存", relativePath: ".kube/cache", risk: .safe, note: "kubectl 会重新获取服务端数据"),
-            CacheRule(category: "云与基础设施", name: "AWS CLI 缓存", relativePath: ".aws/cli/cache", risk: .safe, note: "AWS CLI 会重新获取临时缓存"),
-            CacheRule(category: "云与基础设施", name: "Google Cloud 日志", relativePath: ".config/gcloud/logs", risk: .safe, note: "仅为 gcloud 日志"),
-            CacheRule(category: "云与基础设施", name: "Azure CLI 日志", relativePath: ".azure/logs", risk: .safe, note: "仅为 Azure CLI 日志"),
-            CacheRule(category: "Docker", name: "Docker BuildX 缓存", relativePath: ".docker/buildx/cache", risk: .safe, note: "BuildX 会重新生成构建缓存"),
-            CacheRule(category: "包管理器", name: "Homebrew 日志", relativePath: "Library/Logs/Homebrew", risk: .safe, note: "仅为 Homebrew 构建和安装日志"),
-
-            CacheRule(category: "数据库工具", name: "Sequel Ace 缓存", relativePath: "Library/Caches/com.sequel-ace.sequel-ace", risk: .safe, note: "仅删除 Sequel Ace 的 macOS Cache 数据"),
-            CacheRule(category: "数据库工具", name: "Sequel Pro 缓存", relativePath: "Library/Caches/com.eggerapps.Sequel-Pro", risk: .safe, note: "仅删除 Sequel Pro 的 macOS Cache 数据"),
-            CacheRule(category: "数据库工具", name: "Redis Desktop Manager 缓存", relativePath: "Library/Caches/redis-desktop-manager", risk: .safe, note: "仅删除 Redis Desktop Manager 的 macOS Cache 数据"),
-            CacheRule(category: "数据库工具", name: "RedisInsight 缓存", relativePath: "Library/Caches/com.redis.RedisInsight", risk: .safe, note: "仅删除 RedisInsight 的 macOS Cache 数据"),
-            CacheRule(category: "数据库工具", name: "MongoDB Compass 缓存", relativePath: "Library/Caches/com.mongodb.compass", risk: .safe, note: "仅删除 MongoDB Compass 的 macOS Cache 数据"),
-            CacheRule(category: "API / 调试工具", name: "Postman 缓存", relativePath: "Library/Caches/com.postmanlabs.mac", risk: .safe, note: "退出 Postman 后仅清理 macOS Cache 数据，不触碰工作区、请求历史或凭据"),
-            CacheRule(category: "API / 调试工具", name: "Insomnia 缓存", relativePath: "Library/Caches/com.konghq.insomnia", risk: .safe, note: "退出 Insomnia 后仅清理 macOS Cache 数据，不触碰工作区或凭据"),
-            CacheRule(category: "API / 调试工具", name: "TablePlus 缓存", relativePath: "Library/Caches/com.tinyapp.TablePlus", risk: .safe, note: "仅删除 TablePlus 的 macOS Cache 数据"),
-            CacheRule(category: "API / 调试工具", name: "Paw 缓存", relativePath: "Library/Caches/com.getpaw.Paw", risk: .safe, note: "仅删除 Paw 的 macOS Cache 数据"),
-            CacheRule(category: "API / 调试工具", name: "Charles 缓存", relativePath: "Library/Caches/com.charlesproxy.charles", risk: .safe, note: "仅删除 Charles 的 macOS Cache 数据，不触碰配置、证书或请求历史"),
-            CacheRule(category: "开发工具", name: "GitHub Desktop 缓存", relativePath: "Library/Caches/com.github.GitHubDesktop", risk: .safe, note: "仅删除 GitHub Desktop 的 macOS Cache 数据，不触碰仓库或凭据"),
-            CacheRule(category: "开发工具", name: "SentryCrash 诊断数据", relativePath: "Library/Caches/SentryCrash", risk: .review, note: "崩溃诊断数据；确认不再需要排查相关问题后清理"),
-            CacheRule(category: "CI/CD", name: "GitLab Runner 缓存", relativePath: ".cache/gitlab-runner", risk: .safe, note: "GitLab Runner 会重新生成缓存"),
-            CacheRule(category: "CI/CD", name: "GitHub Actions 缓存", relativePath: ".github/cache", risk: .safe, note: "GitHub 工具会重新生成缓存"),
-            CacheRule(category: "CI/CD", name: "CircleCI 缓存", relativePath: ".circleci/cache", risk: .safe, note: "CircleCI 工具会重新生成缓存"),
-            CacheRule(category: "云与基础设施", name: "Grafana 缓存", relativePath: ".grafana/cache", risk: .safe, note: "Grafana 会重新生成缓存"),
-
-        ]
+        let rules = fixedRuleTemplates
 
         var items: [CacheItem] = []
         for rule in rules {
@@ -1320,7 +1346,7 @@ struct CacheScanner {
                 knownIdentifiers.insert(udid)
                 let path = devicesRoot.appendingPathComponent(udid)
                 let reportedSize = (device["dataPathSize"] as? NSNumber)?.int64Value ?? 0
-                let measurement = DirectoryMeasurementService.measure(path)
+                let measurement = StorageMeasurementService.measure(path)
                 let size = max(measurement.allocatedBytes, reportedSize)
                 guard size >= minimumItemSize else { continue }
                 let state = device["state"] as? String ?? "Unknown"
@@ -1372,7 +1398,7 @@ struct CacheScanner {
         for child in children {
             let udid = child.lastPathComponent
             guard UUID(uuidString: udid) != nil, !knownIdentifiers.contains(udid) else { continue }
-            let measurement = DirectoryMeasurementService.measure(child)
+            let measurement = StorageMeasurementService.measure(child)
             guard measurement.allocatedBytes >= minimumItemSize else { continue }
             items.append(CacheItem(
                 category: "CoreSimulator",
@@ -1621,7 +1647,7 @@ struct CacheScanner {
 
         // 一次 du 测完所有候选：macOS du 会在同一次调用的参数之间对硬链接去重。
         // cargo 的 deps 与 incremental 共享大量 inode，逐个测量会把同一份磁盘块算两遍。
-        let measured = DirectoryMeasurementService.measure(candidates.map(\.url))
+        let measured = StorageMeasurementService.measure(candidates.map(\.url))
 
         // 构建进行中时 cargo 持有 target/<profile>/.cargo-lock。此时 deps/incremental
         // 正在被写入，删除会破坏构建甚至让 cargo 崩溃，因此整组标为手动处理。
@@ -2002,6 +2028,24 @@ struct CacheScanner {
         return names.contains("config.json") && hasWeights
     }
 
+    /// 只读发现页的模型证据：Hugging Face 的 `models--组织--模型` 仓库有
+    /// snapshots / blobs 引用结构，必须按仓库整体识别，不能把子目录当独立缓存。
+    static func huggingFaceModelEvidence(for url: URL) -> String? {
+        guard url.lastPathComponent.hasPrefix("models--") else { return nil }
+        let names = Set((try? fileManager.contentsOfDirectory(atPath: url.path)) ?? [])
+        guard names.contains("snapshots") || names.contains("blobs") else { return nil }
+        return "Hugging Face 模型仓库（models--…，包含 snapshots / blobs 引用结构）"
+    }
+
+    /// 项目内 `models/`、`checkpoints/` 等容器的模型证据；没有权重文件时不返回。
+    static func modelDirectoryEvidence(for url: URL) -> String? {
+        guard modelCacheRule(for: url) != nil else { return nil }
+        if fileManager.fileExists(atPath: url.appendingPathComponent(".cache/huggingface").path) {
+            return "包含 Hugging Face 下载回执和模型文件"
+        }
+        return "包含 config.json 与模型权重文件"
+    }
+
     /// `target` 目录的归属判断，按证据优先级：
     /// 1. cargo 证据（`.rustc_info.json` / 带 cargo 签名的 CACHEDIR.TAG / profile 下的
     ///    `.cargo-lock`、`.fingerprint`）→ Rust；
@@ -2263,7 +2307,7 @@ struct CacheScanner {
         identifier: String? = nil,
         toolAction: ToolCleanupAction? = nil,
         statusTitle: String? = nil,
-        measurement: SizeMeasurement? = nil
+        measurement: StorageMeasurement? = nil
     ) -> CacheItem? {
         let standardized = path.standardizedFileURL
         guard fileManager.fileExists(atPath: standardized.path) else { return nil }
@@ -2288,7 +2332,7 @@ struct CacheScanner {
         }
 
         // cargo target 拆分时会用一次 du 批量测量所有子目录，避免硬链接被重复计算。
-        let measured = measurement ?? DirectoryMeasurementService.measure(standardized)
+        let measured = measurement ?? StorageMeasurementService.measure(standardized)
         guard measured.allocatedBytes >= minimumItemSize else { return nil }
         return CacheItem(
             category: category,

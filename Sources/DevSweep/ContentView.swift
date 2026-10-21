@@ -105,6 +105,7 @@ enum SidebarDestination: Hashable {
     case quickClean
     case whitelist
     case backgroundProcesses
+    case storageDiscovery
     case category(String)
 
     /// 侧栏页面决定清理范围：「全部项目」是全量，分类页只有该分类；
@@ -113,7 +114,7 @@ enum SidebarDestination: Hashable {
         switch self {
         case .all: return items
         case .category(let category): return items.filter { $0.category == category }
-        case .quickClean, .whitelist, .backgroundProcesses: return []
+        case .quickClean, .whitelist, .backgroundProcesses, .storageDiscovery: return []
         }
     }
 }
@@ -131,6 +132,7 @@ struct ContentView: View {
     @EnvironmentObject private var updater: DevSweepSoftwareUpdater
     @State private var destination: SidebarDestination = .all
     @StateObject private var backgroundProcesses = BackgroundProcessStore()
+    @StateObject private var storageDiscovery = StorageDiscoveryStore()
     @State private var onlySelected = false
     @State private var onlyQuickClean = false
     @AppStorage("DevSweep.onlyLarge") private var onlyLarge = false
@@ -172,7 +174,7 @@ struct ContentView: View {
     private var showsCacheList: Bool {
         switch destination {
         case .all, .category: return true
-        case .quickClean, .whitelist, .backgroundProcesses: return false
+        case .quickClean, .whitelist, .backgroundProcesses, .storageDiscovery: return false
         }
     }
 
@@ -201,7 +203,7 @@ struct ContentView: View {
         switch destination {
         case .all: return "全部项目"
         case .category(let category): return category
-        case .quickClean, .whitelist, .backgroundProcesses: return "当前页面"
+        case .quickClean, .whitelist, .backgroundProcesses, .storageDiscovery: return "当前页面"
         }
     }
 
@@ -222,12 +224,12 @@ struct ContentView: View {
         }
     }
 
-    private var selectedCleanupSize: Int64 {
-        scopedSelectedItems.reduce(0) { $0 + $1.size }
+    private var selectedCleanupSize: SizeSummary {
+        SizeSummary.of(scopedSelectedItems)
     }
 
-    private var scopeTotalSize: Int64 {
-        scopedItems.reduce(0) { $0 + $1.size }
+    private var scopeTotalSize: SizeSummary {
+        SizeSummary.of(scopedItems)
     }
 
     private var selectedCleanupIncludesNonRecoverable: Bool {
@@ -236,6 +238,10 @@ struct ContentView: View {
 
     private var pendingCleanupIncludesNonRecoverable: Bool {
         pendingCleanupItems.contains { $0.kind.isNonRecoverable }
+    }
+
+    private var pendingCleanupSize: SizeSummary {
+        SizeSummary.of(pendingCleanupItems)
     }
 
     private var hasScanReport: Bool {
@@ -248,7 +254,24 @@ struct ContentView: View {
         case .quickClean: return "常用清理"
         case .whitelist: return "白名单"
         case .backgroundProcesses: return "后台进程"
+        case .storageDiscovery: return "磁盘发现"
         case .category(let category): return category
+        }
+    }
+
+    private var headerSubtitle: String {
+        switch destination {
+        case .backgroundProcesses: return backgroundProcesses.status
+        case .storageDiscovery: return "只读浏览：发现目录占用，不删除任何内容"
+        default: return store.statusMessage
+        }
+    }
+
+    private var isHeaderWorking: Bool {
+        switch destination {
+        case .backgroundProcesses: return backgroundProcesses.isWorking
+        case .storageDiscovery: return storageDiscovery.isScanning
+        default: return store.isScanning || store.isCleaning
         }
     }
 
@@ -299,8 +322,8 @@ struct ContentView: View {
         } message: {
             Text(
                 pendingCleanupIncludesNonRecoverable
-                    ? "将处理 \(pendingCleanupItems.count) 项，共 \(pendingCleanupItems.reduce(0) { $0 + $1.size }.devSweepFileSize)。部分项目会通过开发工具自己的清理命令执行，不会进入废纸篓；普通目录会移入废纸篓。"
-                    : "将处理 \(pendingCleanupItems.count) 项，共 \(pendingCleanupItems.reduce(0) { $0 + $1.size }.devSweepFileSize)。运行中的模拟器、未登记目录和手动项目不会自动删除。"
+                    ? "将处理 \(pendingCleanupItems.count) 项，共 \(pendingCleanupSize.text)\(pendingCleanupSize.note.map { "（\($0)）" } ?? "")。部分项目会通过开发工具自己的清理命令执行，不会进入废纸篓；普通目录会移入废纸篓。"
+                    : "将处理 \(pendingCleanupItems.count) 项，共 \(pendingCleanupSize.text)\(pendingCleanupSize.note.map { "（\($0)）" } ?? "")。运行中的模拟器、未登记目录和手动项目不会自动删除。"
             )
         }
         .alert("加入常用清理？", isPresented: $showingQuickCleanHint) {
@@ -403,6 +426,13 @@ struct ContentView: View {
                         size: nil
                     )
                     .tag(SidebarDestination.backgroundProcesses)
+                    SidebarRow(
+                        title: "磁盘发现",
+                        subtitle: "只读查找未登记的目录占用",
+                        icon: "externaldrive",
+                        size: nil
+                    )
+                    .tag(SidebarDestination.storageDiscovery)
                 }
 
                 Section("分类") {
@@ -487,6 +517,8 @@ struct ContentView: View {
                         WhitelistPageView()
                     case .backgroundProcesses:
                         BackgroundProcessesView(store: backgroundProcesses)
+                    case .storageDiscovery:
+                        StorageDiscoveryView(store: storageDiscovery, projectRoots: store.projectRoots)
                     }
                 }
                 .frame(maxWidth: 980, alignment: .leading)
@@ -510,14 +542,22 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(headerTitle)
                     .font(.system(size: 24, weight: .bold, design: .rounded))
-                Text(destination == .backgroundProcesses ? backgroundProcesses.status : store.statusMessage)
+                Text(headerSubtitle)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            if destination == .backgroundProcesses ? backgroundProcesses.isWorking : (store.isScanning || store.isCleaning) {
+            if isHeaderWorking {
                 ProgressView()
                     .controlSize(.small)
+            } else if destination == .storageDiscovery {
+                Label("只读", systemImage: "lock")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(.quaternary.opacity(0.55))
+                    .clipShape(Capsule())
             } else {
                 Label("\(destination == .backgroundProcesses ? backgroundProcesses.items.count : scopedItems.count) 项", systemImage: "square.stack.3d.up")
                     .font(.caption.weight(.medium))
@@ -548,17 +588,19 @@ struct ContentView: View {
             }
             .buttonStyle(.bordered)
             .help("查看清理范围和安全说明")
-            Button {
-                if destination == .backgroundProcesses { backgroundProcesses.scan() }
-                else { store.scan() }
-            } label: {
-                Label(
-                    (destination == .backgroundProcesses ? backgroundProcesses.hasScanned : hasScanReport) ? "重新扫描" : "开始扫描",
-                    systemImage: (destination == .backgroundProcesses ? backgroundProcesses.hasScanned : hasScanReport) ? "arrow.clockwise" : "play.fill"
-                )
+            if destination != .storageDiscovery {
+                Button {
+                    if destination == .backgroundProcesses { backgroundProcesses.scan() }
+                    else { store.scan() }
+                } label: {
+                    Label(
+                        (destination == .backgroundProcesses ? backgroundProcesses.hasScanned : hasScanReport) ? "重新扫描" : "开始扫描",
+                        systemImage: (destination == .backgroundProcesses ? backgroundProcesses.hasScanned : hasScanReport) ? "arrow.clockwise" : "play.fill"
+                    )
+                }
+                .buttonStyle(.bordered)
+                .disabled(destination == .backgroundProcesses ? backgroundProcesses.isWorking : (store.isScanning || store.isCleaning))
             }
-            .buttonStyle(.bordered)
-            .disabled(destination == .backgroundProcesses ? backgroundProcesses.isWorking : (store.isScanning || store.isCleaning))
         }
         .controlSize(.large)
         .padding(.horizontal, 30)
@@ -676,8 +718,13 @@ struct ContentView: View {
                 Label(destination == .all ? "可回收空间" : "本分类可回收空间", systemImage: "externaldrive.badge.minus")
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(.secondary)
-                Text(scopeTotalSize.devSweepFileSize)
+                Text(scopeTotalSize.text)
                     .font(.system(size: 38, weight: .bold, design: .rounded))
+                if let note = scopeTotalSize.note {
+                    Text(note)
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
                 Text(
                     !hasScanReport
                         ? "点击“开始扫描”查找可清理的开发者缓存和生成物"
@@ -694,12 +741,17 @@ struct ContentView: View {
                 Label("当前页面选择", systemImage: "checkmark.circle")
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(.secondary)
-                Text(selectedCleanupSize.devSweepFileSize)
+                Text(selectedCleanupSize.text)
                     .font(.system(size: 28, weight: .semibold, design: .rounded))
                     .foregroundStyle(.tint)
                 Text("\(scopedSelectedItems.count) 项待清理")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if let note = selectedCleanupSize.note {
+                    Text(note)
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
             }
         }
         .padding(.horizontal, 24)
@@ -959,9 +1011,9 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(scopedSelectedItems.isEmpty
                     ? "选择项目后开始清理"
-                    : "「\(scopeName)」已选 \(scopedSelectedItems.count) 项 · \(selectedCleanupSize.devSweepFileSize)")
+                    : "「\(scopeName)」已选 \(scopedSelectedItems.count) 项 · \(selectedCleanupSize.text)")
                     .font(.subheadline.weight(.medium))
-                Text(bottomBarNotice)
+                Text(selectedCleanupSize.note.map { "\($0)；\(bottomBarNotice)" } ?? bottomBarNotice)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -1395,8 +1447,8 @@ private struct MiniModeView: View {
         store.selectedCleanupItems
     }
 
-    private var cleanupSize: Int64 {
-        cleanupItems.reduce(0) { $0 + $1.size }
+    private var cleanupSize: SizeSummary {
+        SizeSummary.of(cleanupItems)
     }
 
     private var cleanupIncludesNonRecoverable: Bool {
@@ -1531,11 +1583,12 @@ private struct MiniModeView: View {
                         .font(.subheadline.weight(.semibold))
                 }
                 Spacer(minLength: 8)
-                Text(cleanupSize.devSweepFileSize)
+                Text(cleanupSize.text)
                     .font(.title3.monospacedDigit().weight(.semibold))
                     .foregroundStyle(.tint)
                     .lineLimit(1)
                     .minimumScaleFactor(0.8)
+                    .help(cleanupSize.note ?? "")
             }
 
             if !hasScanReport {

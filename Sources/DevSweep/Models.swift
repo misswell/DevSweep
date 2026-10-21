@@ -281,6 +281,124 @@ struct PathWhitelist {
     }
 }
 
+/// 只读发现页的分类。分类只说明识别依据，不构成清理授权。
+enum DiscoveryClassification: String, Hashable, CaseIterable {
+    case knownCache
+    case generatedArtifact
+    case developmentEnvironment
+    case aiModel
+    case systemManaged
+    case unknown
+
+    var title: String {
+        switch self {
+        case .knownCache: return "已知缓存"
+        case .generatedArtifact: return "项目生成物"
+        case .developmentEnvironment: return "开发环境"
+        case .aiModel: return "AI 模型"
+        case .systemManaged: return "系统管理"
+        case .unknown: return "未识别"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .knownCache: return .green
+        case .generatedArtifact: return .orange
+        case .developmentEnvironment: return .blue
+        case .aiModel: return .purple
+        case .systemManaged: return .red
+        case .unknown: return .secondary
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .knownCache: return "shippingbox"
+        case .generatedArtifact: return "hammer"
+        case .developmentEnvironment: return "terminal"
+        case .aiModel: return "brain"
+        case .systemManaged: return "lock.shield"
+        case .unknown: return "questionmark.folder"
+        }
+    }
+}
+
+/// 识别依据的可信程度；`unknown` 表示完全没有证据。
+enum CleanupConfidence: String, Hashable {
+    case verified
+    case inferred
+    case unknown
+
+    var title: String {
+        switch self {
+        case .verified: return "识别明确"
+        case .inferred: return "推断"
+        case .unknown: return "未知"
+        }
+    }
+}
+
+/// 只读发现的单个条目。它没有勾选或清理入口，只能查看、定位和继续下钻。
+struct DiscoveryNode: Identifiable, Hashable {
+    let path: URL
+    let name: String
+    let measurement: StorageMeasurement
+    let classification: DiscoveryClassification
+    let confidence: CleanupConfidence
+    let evidence: [String]
+    let isDirectory: Bool
+    let isHidden: Bool
+    let modifiedAt: Date?
+
+    var id: String { path.standardizedFileURL.path }
+
+    var canNavigate: Bool { isDirectory }
+
+    var sizeText: String {
+        switch measurement.state {
+        case .complete:
+            return measurement.allocatedBytes.devSweepFileSize
+        case .failed:
+            return "无法统计"
+        case .partial, .timedOut:
+            if measurement.allocatedBytes == 0 { return "无法统计" }
+            return "≥ " + measurement.allocatedBytes.devSweepFileSize
+        }
+    }
+}
+
+/// 发现页的扫描根目录。根目录总是显示，即使当前不存在。
+struct DiscoveryRoot: Identifiable, Hashable {
+    let path: URL
+    let exists: Bool
+    let isDirectory: Bool
+
+    var id: String { path.standardizedFileURL.path }
+    var name: String { path.lastPathComponent.isEmpty ? path.path : path.lastPathComponent }
+}
+
+/// 聚合大小。存在统计不完整的条目时只能显示下限，不能当成已确认可回收空间。
+struct SizeSummary: Equatable {
+    let bytes: Int64
+    let partialCount: Int
+
+    var text: String {
+        partialCount > 0 ? "≥ " + bytes.devSweepFileSize : bytes.devSweepFileSize
+    }
+
+    var note: String? {
+        partialCount > 0 ? "含 \(partialCount) 项统计不完整，实际可能更多" : nil
+    }
+
+    static func of(_ items: [CacheItem]) -> SizeSummary {
+        SizeSummary(
+            bytes: items.reduce(0) { $0 + $1.size },
+            partialCount: items.filter { $0.sizeWarning != nil }.count
+        )
+    }
+}
+
 /// 长期保存的用户清理授权。不保存 `CacheItem.id`（UUID 每次扫描都会变化），
 /// 稳定身份是 normalized path；目标被清理后重新生成，Entry 仍然保留。
 struct QuickCleanEntry: Codable, Hashable, Identifiable {
