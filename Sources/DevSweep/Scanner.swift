@@ -221,6 +221,7 @@ struct CacheScanner {
             matchedPaths: uniqueItems.count,
             skippedPaths: collector.skippedPaths,
             permissionFailures: collector.permissionFailures,
+            incompleteMeasurements: uniqueItems.filter { $0.sizeWarning != nil }.count,
             diagnostics: collector.diagnostics,
             duration: Date().timeIntervalSince(startedAt)
         )
@@ -255,62 +256,10 @@ struct CacheScanner {
         return kept
     }
 
+    /// 只需要字节数、不关心统计完整性的调用方使用；扫描列表走
+    /// `DirectoryMeasurementService` 以保留「至少占用」标记。
     static func size(of url: URL) -> Int64 {
-        guard fileManager.fileExists(atPath: url.path) else { return 0 }
-
-        if let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .fileAllocatedSizeKey]),
-           values.isDirectory != true {
-            return Int64(values.fileAllocatedSize ?? 0)
-        }
-
-        // du is faster and more complete for large trees than walking every file
-        // through FileManager. It also reports allocated disk blocks, which matches
-        // what Finder and macOS storage management usually show.
-        if let output = run(executable: "/usr/bin/du", arguments: ["-sk", url.path]),
-           let firstLine = String(data: output.stdout, encoding: .utf8)?
-                .split(whereSeparator: \.isNewline)
-                .first,
-           let kilobytes = firstLine.split(whereSeparator: { $0 == " " || $0 == "\t" }).first,
-           let value = Int64(kilobytes),
-           value > 0 {
-            return value * 1024
-        }
-
-        return enumeratedSize(of: url)
-    }
-
-    /// 一次 `du` 调用测量多个目录。
-    ///
-    /// macOS 的 du 会在同一次调用的参数之间对硬链接去重：cargo 的 `deps` 与
-    /// `incremental` 大量共享 inode，逐个目录单独调用会把同一份磁盘块算两遍。
-    /// 批量测量既更快，也让拆分后的条目大小加起来仍然接近真实占用。
-    static func sizes(of urls: [URL]) -> [String: Int64] {
-        let standardized = urls.map(\.standardizedFileURL)
-        guard !standardized.isEmpty else { return [:] }
-
-        var measured: [String: Int64] = [:]
-        let arguments = ["-sk"] + standardized.map(\.path)
-        if let output = run(executable: "/usr/bin/du", arguments: arguments),
-           let text = String(data: output.stdout, encoding: .utf8) {
-            // du 按参数顺序输出 "<kb>\t<path>"；路径里可能有空格，所以按 tab 切分。
-            let ordered = text.split(whereSeparator: \.isNewline).compactMap { line -> Int64? in
-                guard let sizeField = line.split(separator: "\t", maxSplits: 1).first,
-                      let kilobytes = Int64(sizeField.trimmingCharacters(in: .whitespaces))
-                else { return nil }
-                return kilobytes * 1024
-            }
-            if ordered.count == standardized.count {
-                for (url, size) in zip(standardized, ordered) {
-                    measured[url.path] = size
-                }
-            }
-        }
-
-        // 权限不足等情况下 du 会少输出行，退回逐目录测量，保证不漏项。
-        for url in standardized where measured[url.path] == nil {
-            measured[url.path] = size(of: url)
-        }
-        return measured
+        DirectoryMeasurementService.measure(url).allocatedBytes
     }
 
     private static func fixedItems(
@@ -1371,8 +1320,8 @@ struct CacheScanner {
                 knownIdentifiers.insert(udid)
                 let path = devicesRoot.appendingPathComponent(udid)
                 let reportedSize = (device["dataPathSize"] as? NSNumber)?.int64Value ?? 0
-                let measuredSize = size(of: path)
-                let size = max(measuredSize, reportedSize)
+                let measurement = DirectoryMeasurementService.measure(path)
+                let size = max(measurement.allocatedBytes, reportedSize)
                 guard size >= minimumItemSize else { continue }
                 let state = device["state"] as? String ?? "Unknown"
                 let isAvailable = device["isAvailable"] as? Bool ?? true
@@ -1390,6 +1339,7 @@ struct CacheScanner {
                     name: "\(name) · \(state)",
                     path: path,
                     size: size,
+                    sizeWarning: reportedSize >= measurement.allocatedBytes ? nil : measurement.warning,
                     details: "\(displayRuntime(runtime)) · \(udid)",
                     risk: risk,
                     kind: .simulatorDevice,
@@ -1422,13 +1372,14 @@ struct CacheScanner {
         for child in children {
             let udid = child.lastPathComponent
             guard UUID(uuidString: udid) != nil, !knownIdentifiers.contains(udid) else { continue }
-            let measuredSize = size(of: child)
-            guard measuredSize >= minimumItemSize else { continue }
+            let measurement = DirectoryMeasurementService.measure(child)
+            guard measurement.allocatedBytes >= minimumItemSize else { continue }
             items.append(CacheItem(
                 category: "CoreSimulator",
                 name: "未登记模拟器目录 · \(udid)",
                 path: child,
-                size: measuredSize,
+                size: measurement.allocatedBytes,
+                sizeWarning: measurement.warning,
                 details: child.devSweepDisplayPath,
                 risk: .manual,
                 kind: .simulatorDevice,
@@ -1670,7 +1621,7 @@ struct CacheScanner {
 
         // 一次 du 测完所有候选：macOS du 会在同一次调用的参数之间对硬链接去重。
         // cargo 的 deps 与 incremental 共享大量 inode，逐个测量会把同一份磁盘块算两遍。
-        let measured = sizes(of: candidates.map(\.url))
+        let measured = DirectoryMeasurementService.measure(candidates.map(\.url))
 
         // 构建进行中时 cargo 持有 target/<profile>/.cargo-lock。此时 deps/incremental
         // 正在被写入，删除会破坏构建甚至让 cargo 崩溃，因此整组标为手动处理。
@@ -1690,7 +1641,7 @@ struct CacheScanner {
                 progress: progress,
                 isSelected: isBuilding ? false : nil,
                 statusTitle: isBuilding ? "正在构建" : nil,
-                measuredSize: measured[candidate.url.standardizedFileURL.path]
+                measurement: measured[candidate.url.standardizedFileURL.path]
             ) else { continue }
             items.append(item)
         }
@@ -2312,7 +2263,7 @@ struct CacheScanner {
         identifier: String? = nil,
         toolAction: ToolCleanupAction? = nil,
         statusTitle: String? = nil,
-        measuredSize: Int64? = nil
+        measurement: SizeMeasurement? = nil
     ) -> CacheItem? {
         let standardized = path.standardizedFileURL
         guard fileManager.fileExists(atPath: standardized.path) else { return nil }
@@ -2337,13 +2288,14 @@ struct CacheScanner {
         }
 
         // cargo target 拆分时会用一次 du 批量测量所有子目录，避免硬链接被重复计算。
-        let measuredSize = measuredSize ?? size(of: standardized)
-        guard measuredSize >= minimumItemSize else { return nil }
+        let measured = measurement ?? DirectoryMeasurementService.measure(standardized)
+        guard measured.allocatedBytes >= minimumItemSize else { return nil }
         return CacheItem(
             category: category,
             name: name,
             path: standardized,
-            size: measuredSize,
+            size: measured.allocatedBytes,
+            sizeWarning: measured.warning,
             details: details ?? standardized.devSweepDisplayPath,
             risk: risk,
             kind: kind,
@@ -2447,28 +2399,6 @@ struct CacheScanner {
 
     private static func displayRuntime(_ runtime: String) -> String {
         runtime.replacingOccurrences(of: "com.apple.CoreSimulator.SimRuntime.", with: "")
-    }
-
-    private static func enumeratedSize(of url: URL) -> Int64 {
-        let keys: Set<URLResourceKey> = [
-            .isDirectoryKey,
-            .isSymbolicLinkKey,
-            .fileAllocatedSizeKey,
-            .totalFileAllocatedSizeKey
-        ]
-        guard let enumerator = fileManager.enumerator(
-            at: url,
-            includingPropertiesForKeys: Array(keys),
-            options: []
-        ) else { return 0 }
-
-        var total: Int64 = 0
-        for case let child as URL in enumerator {
-            guard let values = try? child.resourceValues(forKeys: keys),
-                  values.isSymbolicLink != true else { continue }
-            total += Int64(values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0)
-        }
-        return total
     }
 
     fileprivate static func run(executable: String, arguments: [String]) -> ProcessOutput? {

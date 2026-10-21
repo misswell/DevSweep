@@ -799,12 +799,13 @@ struct ContentView: View {
     }
 
     private func scanSummaryCard(_ report: ScanReport) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: report.permissionFailures > 0 ? "exclamationmark.triangle" : "checkmark.seal")
+        let hasIssues = report.permissionFailures > 0 || report.incompleteMeasurements > 0
+        return HStack(spacing: 12) {
+            Image(systemName: hasIssues ? "exclamationmark.triangle" : "checkmark.seal")
                 .font(.title3)
-                .foregroundStyle(report.permissionFailures > 0 ? .orange : .green)
+                .foregroundStyle(hasIssues ? .orange : .green)
                 .frame(width: 32, height: 32)
-                .background((report.permissionFailures > 0 ? Color.orange : Color.green).opacity(0.12))
+                .background((hasIssues ? Color.orange : Color.green).opacity(0.12))
                 .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
             VStack(alignment: .leading, spacing: 3) {
                 Text("扫描范围已确认")
@@ -814,6 +815,11 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                 if report.permissionFailures > 0 {
                     Text("有 \(report.permissionFailures) 个路径无法读取，点击右侧查看原因")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                if report.incompleteMeasurements > 0 {
+                    Text("有 \(report.incompleteMeasurements) 项占用统计不完整，列表中显示的是至少占用")
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
@@ -1731,9 +1737,17 @@ private struct MiniItemRow: View {
                     .help(Text(verbatim: item.path.path))
             }
             Spacer(minLength: 8)
-            Text(item.size.devSweepFileSize)
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
+            HStack(spacing: 3) {
+                if let warning = item.sizeWarning {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                        .help(Text(verbatim: warning))
+                }
+                Text(item.sizeText)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding(.horizontal, 9)
         .padding(.vertical, 7)
@@ -1864,8 +1878,16 @@ private struct CacheItemRow: View {
             }
             Spacer(minLength: 12)
             VStack(alignment: .trailing, spacing: 4) {
-                Text(item.size.devSweepFileSize)
-                    .font(.subheadline.monospacedDigit().weight(.medium))
+                HStack(spacing: 3) {
+                    if let warning = item.sizeWarning {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                            .help(Text(verbatim: warning))
+                    }
+                    Text(item.sizeText)
+                        .font(.subheadline.monospacedDigit().weight(.medium))
+                }
                 Text(itemKindTitle)
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
@@ -2042,6 +2064,10 @@ private struct ScanDetailsView: View {
                 .font(.headline)
             Text("检查 \(report.checkedPaths) 个路径 · 命中 \(report.items.count) 项 · 跳过 \(report.skippedPaths) 个路径 · 耗时 \(String(format: "%.1f", report.duration)) 秒")
                 .foregroundStyle(.secondary)
+            if report.incompleteMeasurements > 0 {
+                Text("其中 \(report.incompleteMeasurements) 项存在无法读取的子树，占用显示为至少值")
+                    .foregroundStyle(.orange)
+            }
             Divider()
             Text(report.diagnostics.isEmpty ? "没有发现权限或工具问题。" : "跳过/异常路径")
                 .font(.headline)

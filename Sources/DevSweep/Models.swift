@@ -155,6 +155,8 @@ struct CacheItem: Identifiable, Hashable {
     let name: String
     let path: URL
     let size: Int64
+    /// 非空表示目录里有无法统计的内容，`size` 只是下限。
+    let sizeWarning: String?
     let details: String
     let risk: RiskLevel
     let kind: CleanupKind
@@ -172,6 +174,7 @@ struct CacheItem: Identifiable, Hashable {
         name: String,
         path: URL,
         size: Int64,
+        sizeWarning: String? = nil,
         details: String = "",
         risk: RiskLevel = .safe,
         kind: CleanupKind = .trash,
@@ -187,6 +190,7 @@ struct CacheItem: Identifiable, Hashable {
         self.name = name
         self.path = path
         self.size = size
+        self.sizeWarning = sizeWarning
         self.details = details
         self.risk = risk
         self.kind = kind
@@ -196,6 +200,10 @@ struct CacheItem: Identifiable, Hashable {
         self.note = note
         self.statusTitle = statusTitle
         self.isSelected = isSelected ?? (risk == .safe && kind == .trash)
+    }
+
+    var sizeText: String {
+        sizeWarning == nil ? size.devSweepFileSize : "≥ " + size.devSweepFileSize
     }
 }
 
@@ -417,6 +425,8 @@ struct ScanReport {
     let matchedPaths: Int
     let skippedPaths: Int
     let permissionFailures: Int
+    /// 命中项里有多少个占用只是下限（存在无法统计的子树）。
+    let incompleteMeasurements: Int
     let diagnostics: [ScanDiagnostic]
     let duration: TimeInterval
 }

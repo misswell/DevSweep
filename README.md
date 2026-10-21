@@ -2,7 +2,7 @@
 
 DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcode、Rust/Tauri、Node、SwiftPM、Cargo、Gradle、Maven、Python、Go、Flutter、VS Code、Cursor 以及 OpenAI Codex、OpenCode、Claude Code、Goose 等 AI agent 开发环境。
 
-当前版本：0.1.46
+当前版本：0.1.47
 
 ## 当前功能
 
@@ -31,6 +31,7 @@ DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcod
 - 提供 `deploy/ios-project-template/`（`scripts/test-ios.sh`、`scripts/ensure-scheme-serial.sh` 与 Agent 规则文本），用于在 iOS 项目内固定单 Simulator 测试：自动探测 workspace/project/scheme，固定 `-parallel-testing-enabled NO`、`-maximum-parallel-testing-workers 1`，只复用已有 Simulator、绝不 `simctl create`，从源头避免并行测试持续制造 XCTest clone。
 - 对 Xcode Archives、iOS DeviceSupport、SourcePackages、XCTest 克隆设备、项目生成物、自定义 `build-*` DerivedData 和版本化 Release 暂存目录标记为“建议确认”或“手动处理”；包含 Release App/归档或安装包的目录不会默认勾选。
 - 扫描过程中显示当前路径、已检查数量、跳过数量和权限异常；扫描完成后可查看实际扫描范围和诊断详情。
+- 目录占用统计会检查 `du` 的退出状态、超时和错误输出：存在无法读取的子树时，列表显示「≥ 至少占用」并标注原因，扫描摘要和详情给出统计不完整项数，不再把部分结果当成精确值；统计超时只保留已测到的部分，不会退回更慢的逐文件遍历；`du` 不可用时回退遍历会按 inode 去重硬链接并记录跳过项。
 - Cargo 已解压源码、Cargo Git、NuGet、Dart/Flutter 依赖目录和自定义 `DENO_DIR` 按 `review` 展示，默认不勾选；近期刚修改的低风险缓存也不会自动勾选。
 - 普通目录清理前会重新检查目标是否仍存在、是否发生 symlink/路径替换、是否落在危险根目录或当前白名单中；检查失败只记录该项失败并继续处理其他项目。
 - GitHub CLI、pnpm 和 uv 优先使用官方清理命令，并在执行前检查工具进程、白名单、缓存根目录和超时；命令型清理不会进入废纸篓，默认不勾选。

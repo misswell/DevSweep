@@ -56,6 +56,7 @@ final class QuickCleanAndStoreRulesTests: XCTestCase {
             matchedPaths: items.count,
             skippedPaths: 0,
             permissionFailures: 0,
+            incompleteMeasurements: 0,
             diagnostics: [],
             duration: 0
         )

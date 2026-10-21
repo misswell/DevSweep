@@ -708,9 +708,9 @@ final class ScannerCoverageTests: XCTestCase {
         try Data(repeating: 0xA5, count: 1_100_000)
             .write(to: second.appendingPathComponent("own.bin"))
 
-        let measured = CacheScanner.sizes(of: [first, second])
-        let firstSize = try XCTUnwrap(measured[first.standardizedFileURL.path])
-        let secondSize = try XCTUnwrap(measured[second.standardizedFileURL.path])
+        let measured = DirectoryMeasurementService.measure([first, second])
+        let firstSize = try XCTUnwrap(measured[first.standardizedFileURL.path]).allocatedBytes
+        let secondSize = try XCTUnwrap(measured[second.standardizedFileURL.path]).allocatedBytes
         let total = firstSize + secondSize
 
         // 两个目录合计约 3.2 MB；若硬链接被重复计算会接近 5.3 MB。
