@@ -2953,19 +2953,38 @@ final class DevSweepStore: ObservableObject {
     }
 
     /// 刷新快照：存在性、FileIdentity、大小都重新读取磁盘，绝不调用完整 CacheScanner。
+    /// 更新安装包升级后会重新绑定到同目录唯一的新版本文件，并持久化新路径。
     func refreshQuickCleanSnapshots() {
         let entries = quickCleanEntries
+        let whitelist = whitelistedPaths
         let home = home
         let inspector = simulatorInspector
         quickCleanRefreshGeneration += 1
         let generation = quickCleanRefreshGeneration
         isRefreshingQuickClean = true
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let snapshots = QuickCleanInspector.snapshots(for: entries, home: home, simulatorInspector: inspector)
+            let resolution = QuickCleanInspector.resolveVersionedEntries(
+                entries, whitelistedPaths: whitelist
+            )
+            let snapshots = QuickCleanInspector.snapshots(
+                for: resolution.entries, home: home,
+                simulatorInspector: inspector, notes: resolution.notes
+            )
             DispatchQueue.main.async {
                 guard let self, generation == self.quickCleanRefreshGeneration else { return }
+                let rebound = zip(entries, resolution.entries).filter { $0.0.path != $0.1.path }
+                if !rebound.isEmpty {
+                    self.quickCleanEntries = QuickCleanRegistry.normalized(resolution.entries)
+                    self.persistQuickCleanEntries()
+                }
                 self.quickCleanSnapshots = snapshots
                 self.isRefreshingQuickClean = false
+                if !rebound.isEmpty {
+                    self.rebuildItems()
+                    self.showTransientNotice(rebound.count == 1
+                        ? "常用清理已匹配更新安装包的新版本"
+                        : "常用清理已匹配 \(rebound.count) 个更新安装包的新版本")
+                }
             }
         }
     }

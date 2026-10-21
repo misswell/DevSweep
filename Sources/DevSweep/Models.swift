@@ -317,6 +317,8 @@ struct QuickCleanSnapshot: Identifiable {
     let size: Int64
     let fileIdentity: FileIdentity?
     var protection: String? = nil
+    /// 版本匹配过程中的提示，例如同一更新目录出现多个新版本安装包。
+    var note: String? = nil
 
     var id: String { entry.id }
     var canClean: Bool { exists && fileIdentity != nil && protection == nil && !entry.isManual }

@@ -1105,7 +1105,7 @@ private struct QuickCleanHeaderCard: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text("常用项目，按类型安全处理")
                     .font(.subheadline.weight(.semibold))
-                Text("一键清理仅处理缓存、Rust 编译输出和更新安装包，可从废纸篓恢复。模拟器逐项确认删除；系统缓存手动处理。")
+                Text("一键清理仅处理缓存、Rust 编译输出和更新安装包，可从废纸篓恢复；更新安装包升级后会自动匹配同一更新目录的新版本。模拟器逐项确认删除；系统缓存手动处理。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -1179,6 +1179,10 @@ private struct QuickCleanEntryRow: View {
                     .help(Text(verbatim: entry.path))
                 if let protection = snapshot?.protection {
                     Text(protection)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else if let note = snapshot?.note {
+                    Text(note)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 } else if entry.isSimulator {

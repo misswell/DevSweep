@@ -210,6 +210,157 @@ final class QuickCleanAndStoreRulesTests: XCTestCase {
         XCTAssertEqual(QuickCleanInspector.executableItems(for: restarted.quickCleanEntries).count, 2)
     }
 
+    // MARK: - 更新安装包版本家族匹配
+
+    private func makeUpdateArchiveEntry(
+        at file: URL, displayName: String = "软件更新安装包", category: String = "应用缓存"
+    ) throws -> QuickCleanEntry {
+        try FileManager.default.createDirectory(
+            at: file.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try Data("installer".utf8).write(to: file)
+        return QuickCleanEntry(
+            path: QuickCleanRegistry.key(for: file),
+            displayName: displayName,
+            category: category,
+            dateAdded: Date(),
+            targetKind: .updateArchive
+        )
+    }
+
+    func testVersionFamilyKeyNormalizesOnlyVersionTokens() {
+        let parent = URL(fileURLWithPath: "/tmp/devsweep-updater/pending")
+        let old = parent.appendingPathComponent("Orca-1.4.230-arm64-mac.zip")
+        let new = parent.appendingPathComponent("Orca-1.4.240-arm64-mac.zip")
+
+        XCTAssertEqual(
+            QuickCleanInspector.versionFamilyKey(for: old),
+            QuickCleanInspector.versionFamilyKey(for: new)
+        )
+        XCTAssertEqual(
+            QuickCleanInspector.versionFamilyKey(for: parent.appendingPathComponent("uuyc_4.43.0_nochannel.pkg")),
+            QuickCleanInspector.versionFamilyKey(for: parent.appendingPathComponent("uuyc_4.44.1_nochannel.pkg"))
+        )
+        XCTAssertNotEqual(
+            QuickCleanInspector.versionFamilyKey(for: old),
+            QuickCleanInspector.versionFamilyKey(for: parent.appendingPathComponent("Orca-1.4.240-x86_64-mac.zip"))
+        )
+        XCTAssertNil(QuickCleanInspector.versionFamilyKey(for: parent.appendingPathComponent("update.zip")))
+    }
+
+    func testVersionedUpdateArchiveRebindsToNewVersionInSameDirectory() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let pending = root.appendingPathComponent("Library/Caches/orca-updater/pending")
+        let old = pending.appendingPathComponent("Orca-1.4.230-arm64-mac.zip")
+        let entry = try makeUpdateArchiveEntry(at: old)
+
+        let new = pending.appendingPathComponent("Orca-1.4.240-arm64-mac.zip")
+        try FileManager.default.removeItem(at: old)
+        try Data("new installer".utf8).write(to: new)
+
+        let resolution = QuickCleanInspector.resolveVersionedEntries([entry])
+        let rebound = try XCTUnwrap(resolution.entries.first)
+        XCTAssertEqual(rebound.path, QuickCleanRegistry.key(for: new))
+        XCTAssertEqual(rebound.displayName, entry.displayName)
+        XCTAssertEqual(rebound.category, entry.category)
+        XCTAssertEqual(rebound.dateAdded, entry.dateAdded)
+        XCTAssertTrue(rebound.isUpdateArchive)
+        XCTAssertNil(resolution.notes[entry.id])
+
+        let snapshot = QuickCleanInspector.snapshot(for: rebound)
+        XCTAssertTrue(snapshot.exists)
+        XCTAssertGreaterThan(snapshot.size, 0)
+        let executable = QuickCleanInspector.executableItems(for: [rebound])
+        XCTAssertEqual(executable.count, 1)
+        XCTAssertEqual(executable.first?.path, new)
+
+        // 已重新绑定的条目保持稳定，不会每次刷新继续漂移。
+        let second = QuickCleanInspector.resolveVersionedEntries(resolution.entries)
+        XCTAssertEqual(second.entries.first?.path, QuickCleanRegistry.key(for: new))
+    }
+
+    func testVersionedUpdateArchiveKeepsExactPathWhileOldFileExists() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let pending = root.appendingPathComponent("Library/Caches/orca-updater/pending")
+        let old = pending.appendingPathComponent("Orca-1.4.230-arm64-mac.zip")
+        let entry = try makeUpdateArchiveEntry(at: old)
+        try Data("new installer".utf8).write(to: pending.appendingPathComponent("Orca-1.4.240-arm64-mac.zip"))
+
+        let resolution = QuickCleanInspector.resolveVersionedEntries([entry])
+
+        XCTAssertEqual(resolution.entries.first?.path, entry.path)
+        XCTAssertTrue(resolution.notes.isEmpty)
+    }
+
+    func testVersionedUpdateArchiveDoesNotGuessBetweenMultipleCandidates() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let pending = root.appendingPathComponent("Library/Caches/orca-updater/pending")
+        let old = pending.appendingPathComponent("Orca-1.4.230-arm64-mac.zip")
+        let entry = try makeUpdateArchiveEntry(at: old)
+        try FileManager.default.removeItem(at: old)
+        try Data("a".utf8).write(to: pending.appendingPathComponent("Orca-1.4.240-arm64-mac.zip"))
+        try Data("b".utf8).write(to: pending.appendingPathComponent("Orca-1.4.250-arm64-mac.zip"))
+
+        let resolution = QuickCleanInspector.resolveVersionedEntries([entry])
+        let note = try XCTUnwrap(resolution.notes[entry.id])
+        XCTAssertEqual(resolution.entries.first?.path, entry.path)
+        XCTAssertTrue(note.contains("2"), note)
+
+        let snapshot = QuickCleanInspector.snapshots(
+            for: resolution.entries, notes: resolution.notes
+        ).first
+        XCTAssertEqual(snapshot?.note, note)
+        XCTAssertFalse(snapshot?.exists ?? true)
+        XCTAssertTrue(QuickCleanInspector.executableItems(for: resolution.entries).isEmpty)
+    }
+
+    func testVersionedUpdateArchiveFamilyRespectsWhitelist() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let pending = root.appendingPathComponent("Library/Caches/orca-updater/pending")
+        let old = pending.appendingPathComponent("Orca-1.4.230-arm64-mac.zip")
+        let entry = try makeUpdateArchiveEntry(at: old)
+        try FileManager.default.removeItem(at: old)
+        let new = pending.appendingPathComponent("Orca-1.4.240-arm64-mac.zip")
+        try Data("new installer".utf8).write(to: new)
+
+        XCTAssertEqual(
+            QuickCleanInspector.resolveVersionedEntries([entry], whitelistedPaths: [pending])
+                .entries.first?.path,
+            entry.path
+        )
+        XCTAssertEqual(
+            QuickCleanInspector.resolveVersionedEntries([entry], whitelistedPaths: [new])
+                .entries.first?.path,
+            entry.path
+        )
+        XCTAssertEqual(
+            QuickCleanInspector.resolveVersionedEntries([entry]).entries.first?.path,
+            QuickCleanRegistry.key(for: new)
+        )
+    }
+
+    func testVersionedUpdateArchiveDoesNotMatchOtherTemplatesOrDirectories() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let pending = root.appendingPathComponent("Library/Caches/orca-updater/pending")
+        let old = pending.appendingPathComponent("Orca-1.4.230-arm64-mac.zip")
+        let entry = try makeUpdateArchiveEntry(at: old)
+        try FileManager.default.removeItem(at: old)
+        try Data("other arch".utf8).write(to: pending.appendingPathComponent("Orca-1.4.240-x86_64-mac.zip"))
+        let otherUpdater = root.appendingPathComponent("Library/Caches/other-updater/pending")
+        try FileManager.default.createDirectory(at: otherUpdater, withIntermediateDirectories: true)
+        try Data("other updater".utf8).write(to: otherUpdater.appendingPathComponent("Orca-1.4.240-arm64-mac.zip"))
+
+        let resolution = QuickCleanInspector.resolveVersionedEntries([entry])
+
+        XCTAssertEqual(resolution.entries.first?.path, entry.path)
+        XCTAssertTrue(resolution.notes.isEmpty)
+    }
+
     func testArchiveAuthorizationRejectsTypeChangesSymlinksAndUnrelatedFiles() throws {
         let store = makeStore()
         let directory = try makeTemporaryDirectory()
