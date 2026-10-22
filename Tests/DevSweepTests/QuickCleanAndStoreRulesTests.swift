@@ -677,4 +677,62 @@ final class QuickCleanAndStoreRulesTests: XCTestCase {
         XCTAssertNotNil(executable.first?.expectedFileIdentity, "expectedFileIdentity 必须是执行前刚刚捕获的")
         XCTAssertEqual(executable.first?.kind, .trash)
     }
+
+    // MARK: - 磁盘发现加入清理
+
+    func testVerifiedDiscoveryCandidateJoinsCleanupButUnknownNodeStaysReadOnly() throws {
+        let store = makeStore()
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try makeAllocatedDirectory(at: directory)
+
+        let candidate = DiscoveryCleanupCandidate(
+            category: "测试工具",
+            name: "测试缓存",
+            risk: .safe,
+            note: "测试用缓存规则"
+        )
+        let verified = discoveryNode(
+            at: directory,
+            classification: .knownCache,
+            confidence: .verified,
+            candidate: candidate
+        )
+        XCTAssertTrue(store.addDiscoveryCleanupCandidate(verified))
+        XCTAssertEqual(store.items.count, 1)
+        XCTAssertEqual(store.items.first?.path.standardizedFileURL, directory.standardizedFileURL)
+        XCTAssertEqual(store.items.first?.kind, .trash)
+        XCTAssertTrue(store.items.first?.isSelected == true, "加入后应勾选，但仍由清理列表确认")
+        XCTAssertNotNil(store.items.first?.expectedFileIdentity)
+
+        let unknown = discoveryNode(
+            at: directory,
+            classification: .unknown,
+            confidence: .unknown,
+            candidate: nil
+        )
+        XCTAssertFalse(store.addDiscoveryCleanupCandidate(unknown))
+        XCTAssertEqual(store.items.count, 1, "未知条目不能加入清理")
+    }
+
+    private func discoveryNode(
+        at url: URL,
+        classification: DiscoveryClassification,
+        confidence: CleanupConfidence,
+        candidate: DiscoveryCleanupCandidate?
+    ) -> DiscoveryNode {
+        DiscoveryNode(
+            path: url,
+            name: url.lastPathComponent,
+            measurement: StorageMeasurement(allocatedBytes: 16),
+            classification: classification,
+            confidence: confidence,
+            evidence: ["测试证据"],
+            isDirectory: true,
+            isHidden: false,
+            modifiedAt: nil,
+            logicalBytes: nil,
+            cleanupCandidate: candidate
+        )
+    }
 }

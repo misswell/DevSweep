@@ -2601,6 +2601,8 @@ final class DevSweepStore: ObservableObject {
     @Published private(set) var statusMessage = "准备扫描"
     @Published private(set) var lastError: String?
     @Published private(set) var lastReport: ScanReport?
+    /// 普通清理成功后的递增标记；发现页据此重新测量受影响的目录。
+    @Published private(set) var cleanupGeneration = 0
     @Published private(set) var scanProgress = ScanProgress()
     @Published private(set) var quickCleanEntries: [QuickCleanEntry] = []
     @Published private(set) var quickCleanSnapshots: [QuickCleanSnapshot] = []
@@ -2612,6 +2614,8 @@ final class DevSweepStore: ObservableObject {
     private var selectionStates: [String: Bool]
     /// Scanner 本次发现的完整候选条目；白名单等用户规则在 rebuildItems() 中套用。
     private var rawScanItems: [CacheItem] = []
+    /// 从磁盘发现页显式加入清理的条目；主扫描未覆盖的路径也要保留到本次清理完成。
+    private var discoveryCleanupItems: [CacheItem] = []
     private let defaults: UserDefaults
     private let home: URL
     private let simulatorInspector: SimulatorCleanupInspecting
@@ -2736,7 +2740,11 @@ final class DevSweepStore: ObservableObject {
     /// 加入/移出白名单都只调用这里，立即生效，不需要重新扫描。
     private func rebuildItems() {
         let whitelist = whitelistedPaths
-        let visibleItems = rawScanItems.filter { !PathWhitelist.contains($0.path, in: whitelist) }
+        var seenPaths = Set<String>()
+        let mergedItems = (rawScanItems + discoveryCleanupItems).filter { item in
+            seenPaths.insert(SelectionMemory.key(for: item.path)).inserted
+        }
+        let visibleItems = mergedItems.filter { !PathWhitelist.contains($0.path, in: whitelist) }
         items = SelectionMemory.restore(visibleItems, from: selectionStates)
     }
 
@@ -2913,6 +2921,71 @@ final class DevSweepStore: ObservableObject {
         return (added, rejected)
     }
 
+    /// 从磁盘发现页把明确识别的缓存/生成物加入本次清理。
+    /// 只改变当前选择集合，不执行删除；清理时仍由 DeletionValidator 重新验证路径、
+    /// 白名单、FileIdentity 和进程/构建状态。
+    @discardableResult
+    func addDiscoveryCleanupCandidate(_ node: DiscoveryNode) -> Bool {
+        guard !isScanning, !isCleaning else {
+            showTransientNotice("扫描或清理进行中，请稍后再加入", icon: "clock")
+            return false
+        }
+        guard let candidate = node.cleanupCandidate else {
+            showTransientNotice("该条目没有明确的清理规则，保持只读", icon: "lock.shield")
+            return false
+        }
+
+        let key = SelectionMemory.key(for: node.path)
+        if let existing = items.first(where: { SelectionMemory.key(for: $0.path) == key }) {
+            guard existing.kind == .trash, CleanupSelection.isBatchSelectable(existing) else {
+                showTransientNotice("该路径当前不能加入批量清理", icon: "exclamationmark.circle.fill")
+                return false
+            }
+            setSelected(ids: [existing.id], selected: true)
+            showTransientNotice("已勾选「\(existing.name)」，确认后再执行清理")
+            return true
+        }
+
+        let item = CacheItem(
+            category: candidate.category,
+            name: candidate.name,
+            path: node.path,
+            size: node.measurement.allocatedBytes,
+            sizeWarning: node.measurement.warning,
+            details: "来自磁盘发现 · \(node.classification.title) · \(node.evidence.joined(separator: " · "))",
+            risk: candidate.risk,
+            kind: .trash,
+            note: candidate.note,
+            isSelected: false
+        )
+        let validationContext = DeletionContext(
+            whitelistedPaths: whitelistedPaths,
+            projectRoots: projectRoots,
+            home: home,
+            allowedPaths: [node.path]
+        )
+        do {
+            try DeletionValidator.validate(item: item, context: validationContext)
+        } catch {
+            showTransientNotice("无法加入清理：\(error.localizedDescription)", icon: "exclamationmark.circle.fill")
+            return false
+        }
+
+        discoveryCleanupItems.removeAll { SelectionMemory.key(for: $0.path) == key }
+        discoveryCleanupItems.append(item)
+        rebuildItems()
+        guard let added = items.first(where: { SelectionMemory.key(for: $0.path) == key }) else {
+            discoveryCleanupItems.removeAll { SelectionMemory.key(for: $0.path) == key }
+            rebuildItems()
+            showTransientNotice("该路径已被白名单保护，未加入清理", icon: "checkmark.shield")
+            return false
+        }
+        setSelected(ids: [added.id], selected: true)
+        statusMessage = "已从磁盘发现加入「\(added.name)」，确认后再执行清理"
+        showTransientNotice("已加入本次清理，需在清理列表确认后才会删除")
+        return true
+    }
+
     func removeFromQuickClean(_ entry: QuickCleanEntry) {
         removeFromQuickClean(paths: [URL(fileURLWithPath: entry.path)])
     }
@@ -3060,6 +3133,8 @@ final class DevSweepStore: ObservableObject {
         guard !report.removed.isEmpty else { return }
         let removedPaths = Set(report.removed.map { QuickCleanRegistry.key(for: $0.path) })
         rawScanItems.removeAll { removedPaths.contains(QuickCleanRegistry.key(for: $0.path)) }
+        discoveryCleanupItems.removeAll { removedPaths.contains(QuickCleanRegistry.key(for: $0.path)) }
+        cleanupGeneration += 1
         rebuildItems()
         refreshQuickCleanSnapshots()
     }
@@ -3099,8 +3174,10 @@ final class DevSweepStore: ObservableObject {
                 guard let self else { return }
                 self.isCleaning = false
                 // 普通清理：被删除的条目从原始扫描结果中消失；常用清理配置则保留。
-                let removedIDs = Set(report.removed.map(\.id))
-                self.rawScanItems.removeAll { removedIDs.contains($0.id) }
+                let removedPaths = Set(report.removed.map { SelectionMemory.key(for: $0.path) })
+                self.rawScanItems.removeAll { removedPaths.contains(SelectionMemory.key(for: $0.path)) }
+                self.discoveryCleanupItems.removeAll { removedPaths.contains(SelectionMemory.key(for: $0.path)) }
+                if !report.removed.isEmpty { self.cleanupGeneration += 1 }
                 self.rebuildItems()
                 for item in report.removed {
                     self.selectionStates.removeValue(forKey: SelectionMemory.key(for: item.path))

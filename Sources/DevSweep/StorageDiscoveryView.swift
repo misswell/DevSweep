@@ -48,6 +48,11 @@ final class StorageDiscoveryStore: ObservableObject {
         (report?.nodes ?? []).filter { !ignoredPaths.contains($0.id) }
     }
 
+    /// 分布图使用未被列表阈值截断的本层条目，保证面积和类型统计不丢项。
+    var graphNodes: [DiscoveryNode] {
+        (report?.allNodes ?? []).filter { !ignoredPaths.contains($0.id) }
+    }
+
     func addCustomRoots(_ urls: [URL]) {
         let existing = Set(customRoots.map(\.standardizedFileURL.path))
         let additions = urls
@@ -154,6 +159,9 @@ final class StorageDiscoveryStore: ObservableObject {
 struct StorageDiscoveryView: View {
     @ObservedObject var store: StorageDiscoveryStore
     let projectRoots: [URL]
+    @ObservedObject var appStore: DevSweepStore
+    @State private var selectedNodeID: String?
+    @State private var searchText = ""
 
     private static let thresholdOptions: [(label: String, megabytes: Int)] = [
         ("显示全部（含小文件）", 0),
@@ -194,6 +202,20 @@ struct StorageDiscoveryView: View {
 
     private var nodes: [DiscoveryNode] { store.visibleNodes }
 
+    private var searchedNodes: [DiscoveryNode] {
+        DiscoverySearch.filter(nodes, query: searchText)
+    }
+
+    private var cleanupLink: (DiscoveryNode) -> DiscoveryCleanupLink {
+        { node in
+            let key = SelectionMemory.key(for: node.path)
+            guard let item = appStore.items.first(where: { SelectionMemory.key(for: $0.path) == key }) else {
+                return .absent
+            }
+            return item.isSelected ? .selected : .present
+        }
+    }
+
     private var thresholdLabel: String {
         Self.thresholdOptions.first { $0.megabytes == store.thresholdMB }?.label
             ?? "\(store.thresholdMB) MB"
@@ -212,28 +234,26 @@ struct StorageDiscoveryView: View {
                 if let activeRoot {
                     breadcrumbCard(report: report, root: activeRoot)
                 }
-                if nodes.isEmpty {
-                    emptyResultCard(report)
-                } else {
-                    VStack(alignment: .leading, spacing: 10) {
-                        HStack {
-                            Text("目录内容")
-                                .font(.headline)
-                            Text("按占用从大到小")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            Text("\(nodes.count) 项")
-                                .font(.caption.weight(.medium))
-                                .foregroundStyle(.secondary)
-                        }
-                        LazyVStack(spacing: 10) {
-                            ForEach(nodes) { node in
-                                nodeRow(node)
+                if !store.graphNodes.isEmpty {
+                    FileDistributionPanel(
+                        nodes: store.graphNodes,
+                        searchText: $searchText,
+                        selectedNodeID: $selectedNodeID,
+                        isScanning: store.isScanning,
+                        onDrillDown: { store.scan(directory: $0) },
+                        onIgnore: { node in
+                            if selectedNodeID == node.id {
+                                selectedNodeID = nil
                             }
+                            store.ignore(node)
+                        },
+                        cleanupLink: cleanupLink,
+                        onAddToCleanup: { node in
+                            _ = appStore.addDiscoveryCleanupCandidate(node)
                         }
-                    }
+                    )
                 }
+                directorySection(report: report)
             } else if !store.isScanning {
                 emptyStateCard
             }
@@ -249,6 +269,83 @@ struct StorageDiscoveryView: View {
         } message: {
             Text(store.lastError ?? "")
         }
+        .onChange(of: store.currentDirectory) { _ in
+            selectedNodeID = nil
+            searchText = ""
+        }
+        .onChange(of: store.report?.scannedAt) { _ in
+            guard let selectedNodeID else { return }
+            let stillPresent = selectedNodeID == TreemapItem.otherID
+                || store.graphNodes.contains { $0.id == selectedNodeID }
+            if !stillPresent {
+                self.selectedNodeID = nil
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func directorySection(report: DiscoveryReport) -> some View {
+        if searchedNodes.isEmpty {
+            if nodes.isEmpty {
+                emptyResultCard(report)
+            } else {
+                searchEmptyCard
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("目录内容")
+                        .font(.headline)
+                    Text(
+                        searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            ? "按占用从大到小"
+                            : "搜索匹配 \(searchedNodes.count) / \(nodes.count) 项"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("\(searchedNodes.count) 项")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                }
+                ScrollViewReader { proxy in
+                    LazyVStack(spacing: 10) {
+                        ForEach(searchedNodes) { node in
+                            nodeRow(node)
+                                .id(node.id)
+                        }
+                    }
+                    .onChange(of: selectedNodeID) { value in
+                        guard let value,
+                              searchedNodes.contains(where: { $0.id == value })
+                        else { return }
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            proxy.scrollTo(value, anchor: .center)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var searchEmptyCard: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 30))
+                .foregroundStyle(.secondary)
+            Text("没有匹配「\(searchText)」的条目")
+                .font(.headline)
+            Text("搜索只过滤当前层的目录列表和分布图，不会改变扫描结果。")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Button("清除搜索") { searchText = "" }
+                .buttonStyle(.bordered)
+        }
+        .frame(maxWidth: .infinity, minHeight: 170)
+        .padding(18)
+        .background(.quaternary.opacity(0.14))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
     private var scopeCard: some View {
@@ -422,6 +519,9 @@ struct StorageDiscoveryView: View {
                 if report.filteredCount > 0 {
                     badge("低于阈值 \(report.filteredCount) 项 · \(report.filteredBytes.devSweepFileSize)")
                 }
+                if store.graphNodes.count > nodes.count {
+                    badge("分布图含本层全部 \(store.graphNodes.count) 项")
+                }
                 if report.symlinkCount > 0 {
                     badge("符号链接 \(report.symlinkCount) 个")
                 }
@@ -551,7 +651,10 @@ struct StorageDiscoveryView: View {
     }
 
     private func nodeRow(_ node: DiscoveryNode) -> some View {
-        HStack(alignment: .top, spacing: 12) {
+        let link = cleanupLink(node)
+        let isSelected = selectedNodeID == node.id
+
+        return HStack(alignment: .top, spacing: 12) {
             Image(systemName: node.isDirectory ? node.classification.symbolName : "doc")
                 .font(.system(size: 17, weight: .medium))
                 .foregroundStyle(node.classification.color)
@@ -578,6 +681,14 @@ struct StorageDiscoveryView: View {
                     }
                     if node.confidence == .inferred {
                         badge("推断")
+                    }
+                    if node.cleanupCandidate != nil {
+                        statusBadge("可加入清理", color: .green)
+                    }
+                    if link == .present {
+                        statusBadge("已加入待选", color: .blue)
+                    } else if link == .selected {
+                        statusBadge("已在清理列表", color: .green)
                     }
                     if let warning = node.measurement.warning {
                         Image(systemName: "exclamationmark.triangle.fill")
@@ -624,6 +735,15 @@ struct StorageDiscoveryView: View {
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                     }
+                    if node.cleanupCandidate != nil, link == .absent {
+                        Button {
+                            _ = appStore.addDiscoveryCleanupCandidate(node)
+                        } label: {
+                            Label("加入清理", systemImage: "plus.circle")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
                     Menu {
                         if node.canNavigate {
                             Button("查看子目录") { store.scan(directory: node.path) }
@@ -632,8 +752,20 @@ struct StorageDiscoveryView: View {
                             NSWorkspace.shared.activateFileViewerSelecting([node.path])
                         }
                         Button("复制路径") { copyPath(node.path) }
+                        if node.cleanupCandidate != nil {
+                            Divider()
+                            Button(link == .selected ? "已在本次清理中" : "加入本次清理") {
+                                _ = appStore.addDiscoveryCleanupCandidate(node)
+                            }
+                            .disabled(link == .selected)
+                        }
                         Divider()
-                        Button("忽略此项") { store.ignore(node) }
+                        Button("忽略此项") {
+                            if selectedNodeID == node.id {
+                                selectedNodeID = nil
+                            }
+                            store.ignore(node)
+                        }
                     } label: {
                         Image(systemName: "ellipsis.circle")
                     }
@@ -643,8 +775,23 @@ struct StorageDiscoveryView: View {
             }
         }
         .padding(14)
-        .background(.quaternary.opacity(0.2))
+        .background(isSelected ? Color.accentColor.opacity(0.14) : Color.secondary.opacity(0.08))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(isSelected ? Color.accentColor.opacity(0.55) : Color.clear, lineWidth: 1.5)
+        }
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) {
+            guard node.canNavigate else { return }
+            selectedNodeID = node.id
+            store.scan(directory: node.path)
+        }
+        .simultaneousGesture(
+            TapGesture(count: 1).onEnded {
+                selectedNodeID = node.id
+            }
+        )
     }
 
     private func emptyResultCard(_ report: DiscoveryReport) -> some View {
@@ -756,9 +903,9 @@ struct StorageDiscoveryView: View {
             Image(systemName: "lock.shield")
                 .foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 3) {
-                Text("只读页面")
+                Text("默认只读，确认后可加入清理")
                     .font(.callout.weight(.medium))
-                Text("这里不提供勾选或清理操作。未知目录需要先被规则或专用清单验证，才会进入对应的清理授权流程；系统管理数据和依赖关系不明的目录保持只读。")
+                Text("未知、系统管理、开发环境和 AI 模型条目始终只读。只有内置缓存规则或项目生成物规则明确识别的条目，才能在详情中显式加入本次清理；加入后不会立即删除，仍需在清理列表确认，并在执行前重新验证路径、白名单和文件身份。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -851,6 +998,16 @@ struct StorageDiscoveryView: View {
             .padding(.horizontal, 7)
             .padding(.vertical, 2)
             .background(.quaternary.opacity(0.5))
+            .clipShape(Capsule())
+    }
+
+    private func statusBadge(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.caption2.weight(.medium))
+            .foregroundStyle(color)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .background(color.opacity(0.12))
             .clipShape(Capsule())
     }
 }

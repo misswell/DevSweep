@@ -262,7 +262,7 @@ struct ContentView: View {
     private var headerSubtitle: String {
         switch destination {
         case .backgroundProcesses: return backgroundProcesses.status
-        case .storageDiscovery: return "只读浏览：发现目录占用，不删除任何内容"
+        case .storageDiscovery: return "浏览空间去向；仅明确识别的缓存可加入本次清理"
         default: return store.statusMessage
         }
     }
@@ -352,6 +352,12 @@ struct ContentView: View {
         .onChange(of: store.lastError) { value in
             showingError = value != nil
         }
+        .onChange(of: store.cleanupGeneration) { _ in
+            // 清理会改变磁盘占用；发现页保留当前目录，重新测量后刷新图表和列表。
+            if storageDiscovery.report != nil && !storageDiscovery.isScanning {
+                storageDiscovery.rescan()
+            }
+        }
         .alert("部分项目未能清理", isPresented: $showingError) {
             Button("知道了") { store.clearError() }
         } message: {
@@ -428,7 +434,7 @@ struct ContentView: View {
                     .tag(SidebarDestination.backgroundProcesses)
                     SidebarRow(
                         title: "磁盘发现",
-                        subtitle: "只读查找未登记的目录占用",
+                        subtitle: "只读发现大目录与文件分布",
                         icon: "externaldrive",
                         size: nil
                     )
@@ -518,10 +524,14 @@ struct ContentView: View {
                     case .backgroundProcesses:
                         BackgroundProcessesView(store: backgroundProcesses)
                     case .storageDiscovery:
-                        StorageDiscoveryView(store: storageDiscovery, projectRoots: store.projectRoots)
+                        StorageDiscoveryView(
+                            store: storageDiscovery,
+                            projectRoots: store.projectRoots,
+                            appStore: store
+                        )
                     }
                 }
-                .frame(maxWidth: 980, alignment: .leading)
+                .frame(maxWidth: destination == .storageDiscovery ? 1_260 : 980, alignment: .leading)
                 .padding(.horizontal, 30)
                 .padding(.top, 26)
                 .padding(.bottom, 26)
@@ -551,7 +561,7 @@ struct ContentView: View {
                 ProgressView()
                     .controlSize(.small)
             } else if destination == .storageDiscovery {
-                Label("只读", systemImage: "lock")
+                Label("默认只读", systemImage: "lock.shield")
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 10)

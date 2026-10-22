@@ -350,10 +350,17 @@ struct DiscoveryNode: Identifiable, Hashable {
     let isDirectory: Bool
     let isHidden: Bool
     let modifiedAt: Date?
+    let logicalBytes: Int64?
+    /// 仅在内置缓存规则或项目生成物规则明确命中时存在；不等于自动清理授权。
+    let cleanupCandidate: DiscoveryCleanupCandidate?
 
     var id: String { path.standardizedFileURL.path }
 
     var canNavigate: Bool { isDirectory }
+
+    var fileType: FileTypeCategory {
+        FileTypeCategory.classify(url: path, isDirectory: isDirectory)
+    }
 
     var sizeText: String {
         switch measurement.state {

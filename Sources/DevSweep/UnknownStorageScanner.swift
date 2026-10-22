@@ -10,7 +10,10 @@ struct DiscoveryScanProgress: Equatable {
 struct DiscoveryReport {
     let directory: URL
     let thresholdBytes: Int64
+    /// 按列表阈值过滤后的条目。
     let nodes: [DiscoveryNode]
+    /// 本层全部可读条目；文件分布图用它保证面积和文件类型总量不被列表阈值截断。
+    let allNodes: [DiscoveryNode]
     let checkedCount: Int
     let hiddenCount: Int
     let filteredCount: Int
@@ -23,10 +26,22 @@ struct DiscoveryReport {
     let scannedAt: Date
 
     var incompleteCount: Int {
-        nodes.filter { !$0.measurement.isComplete }.count
+        allNodes.filter { !$0.measurement.isComplete }.count
     }
 
     var issueCount: Int { issues.count }
+
+    var totalAllocatedBytes: Int64 {
+        allNodes.reduce(0) { $0 + $1.measurement.allocatedBytes }
+    }
+
+    var totalFileTypes: [FileTypeSummary] {
+        FileTypeSummary.direct(nodes: allNodes)
+    }
+
+    var unmeasuredCount: Int {
+        allNodes.filter { $0.measurement.allocatedBytes == 0 }.count
+    }
 }
 
 final class DiscoveryCancellationFlag: @unchecked Sendable {
@@ -98,26 +113,18 @@ enum UnknownStorageScanner {
         }
 
         func finish() -> DiscoveryReport {
-            var nodes: [DiscoveryNode] = []
+            var allNodes: [DiscoveryNode] = []
             var filteredCount = 0
             var filteredBytes: Int64 = 0
 
             for candidate in candidates {
                 guard let measurement = measurements[candidate.url.path] else { continue }
-                let kept = measurement.state != .complete
-                    || thresholdBytes <= 0
-                    || measurement.allocatedBytes >= thresholdBytes
-                guard kept else {
-                    filteredCount += 1
-                    filteredBytes += measurement.allocatedBytes
-                    continue
-                }
                 let classified = classify(
                     url: candidate.url,
                     isDirectory: candidate.isDirectory,
                     knownCacheLocations: knownCacheLocations
                 )
-                nodes.append(DiscoveryNode(
+                allNodes.append(DiscoveryNode(
                     path: candidate.url,
                     name: candidate.url.lastPathComponent,
                     measurement: measurement,
@@ -126,7 +133,9 @@ enum UnknownStorageScanner {
                     evidence: classified.evidence,
                     isDirectory: candidate.isDirectory,
                     isHidden: candidate.isHidden,
-                    modifiedAt: candidate.modifiedAt
+                    modifiedAt: candidate.modifiedAt,
+                    logicalBytes: candidate.logicalBytes,
+                    cleanupCandidate: classified.cleanupCandidate
                 ))
                 if let warning = measurement.warning {
                     recordIssue(
@@ -137,17 +146,29 @@ enum UnknownStorageScanner {
                 }
             }
 
-            nodes.sort { lhs, rhs in
+            allNodes.sort { lhs, rhs in
                 if lhs.measurement.allocatedBytes != rhs.measurement.allocatedBytes {
                     return lhs.measurement.allocatedBytes > rhs.measurement.allocatedBytes
                 }
                 return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
             }
 
+            let nodes = allNodes.filter { node in
+                if node.measurement.state != .complete
+                    || thresholdBytes <= 0
+                    || node.measurement.allocatedBytes >= thresholdBytes {
+                    return true
+                }
+                filteredCount += 1
+                filteredBytes += node.measurement.allocatedBytes
+                return false
+            }
+
             return DiscoveryReport(
                 directory: directory,
                 thresholdBytes: thresholdBytes,
                 nodes: nodes,
+                allNodes: allNodes,
                 checkedCount: checkedCount,
                 hiddenCount: hiddenCount,
                 filteredCount: filteredCount,
@@ -237,7 +258,8 @@ enum UnknownStorageScanner {
                 url: child,
                 isDirectory: isDirectory,
                 isHidden: isHidden,
-                modifiedAt: values?.contentModificationDate
+                modifiedAt: values?.contentModificationDate,
+                logicalBytes: isDirectory ? nil : max(0, Int64(info.st_size))
             ))
         }
 
@@ -279,41 +301,64 @@ enum UnknownStorageScanner {
         let isDirectory: Bool
         let isHidden: Bool
         let modifiedAt: Date?
+        let logicalBytes: Int64?
     }
 
     private static func classify(
         url: URL,
         isDirectory: Bool,
         knownCacheLocations: [KnownCacheLocation]
-    ) -> (classification: DiscoveryClassification, confidence: CleanupConfidence, evidence: [String]) {
+    ) -> (
+        classification: DiscoveryClassification,
+        confidence: CleanupConfidence,
+        evidence: [String],
+        cleanupCandidate: DiscoveryCleanupCandidate?
+    ) {
         if let evidence = systemManagedEvidence(for: url) {
-            return (.systemManaged, .verified, [evidence])
+            return (.systemManaged, .verified, [evidence], nil)
         }
         if let location = exactKnownCache(for: url, in: knownCacheLocations) {
+            let candidate = location.risk == .manual ? nil : DiscoveryCleanupCandidate(
+                category: location.category,
+                name: location.name,
+                risk: location.risk,
+                note: location.note
+            )
             return (.knownCache, .verified, [
                 "内置缓存规则：\(location.category) · \(location.name)",
                 location.note
-            ])
+            ], candidate)
         }
         if isDirectory, let model = aiModelEvidence(for: url) {
-            return (.aiModel, model.confidence, [model.evidence])
+            return (.aiModel, model.confidence, [model.evidence], nil)
         }
         if let environment = developmentEnvironmentEvidence(for: url, isDirectory: isDirectory) {
-            return (.developmentEnvironment, environment.confidence, [environment.evidence])
+            return (.developmentEnvironment, environment.confidence, [environment.evidence], nil)
         }
         if let evidence = knownCacheAncestorEvidence(for: url, in: knownCacheLocations) {
-            return (.knownCache, .inferred, [evidence])
+            return (.knownCache, .inferred, [evidence], nil)
         }
         if let special = specialContentEvidence(for: url) {
-            return (.unknown, .unknown, [special, unknownEvidence])
+            return (.unknown, .unknown, [special, unknownEvidence], nil)
         }
         if isDirectory, let rule = CacheScanner.generatedRule(for: url) {
+            let candidate = rule.risk == .manual ? nil : DiscoveryCleanupCandidate(
+                category: rule.category,
+                name: url.lastPathComponent,
+                risk: rule.risk,
+                note: rule.note
+            )
             if rule.category == "其他开发缓存" {
-                return (.knownCache, .inferred, ["包含有效 CACHEDIR.TAG，软件声明其内容可作为缓存重建"])
+                return (
+                    .knownCache,
+                    .inferred,
+                    ["包含有效 CACHEDIR.TAG，软件声明其内容可作为缓存重建"],
+                    candidate
+                )
             }
-            return (.generatedArtifact, .inferred, ["命中 \(rule.category) 生成物特征", rule.note])
+            return (.generatedArtifact, .inferred, ["命中 \(rule.category) 生成物特征", rule.note], candidate)
         }
-        return (.unknown, .unknown, [unknownEvidence])
+        return (.unknown, .unknown, [unknownEvidence], nil)
     }
 
     private static func systemManagedEvidence(for url: URL) -> String? {

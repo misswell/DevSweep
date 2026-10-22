@@ -223,6 +223,100 @@ final class UnknownStorageScannerTests: XCTestCase {
         XCTAssertTrue(report.nodes.isEmpty)
     }
 
+    func testAllNodesKeepBelowThresholdEntriesForDistribution() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? fileManager.removeItem(at: root) }
+
+        try writeFile(root.appendingPathComponent("large.bin"), megabytes: 2)
+        try writeFile(root.appendingPathComponent("small.txt"), bytes: 128)
+
+        let report = UnknownStorageScanner.scan(
+            directory: root,
+            thresholdBytes: 1_048_576,
+            knownCacheLocations: []
+        )
+
+        XCTAssertEqual(report.nodes.map(\.name), ["large.bin"])
+        XCTAssertEqual(Set(report.allNodes.map(\.name)), ["large.bin", "small.txt"])
+        XCTAssertEqual(report.filteredCount, 1)
+        XCTAssertGreaterThan(report.totalAllocatedBytes, report.nodes[0].measurement.allocatedBytes)
+    }
+
+    func testExactKnownCacheExposesCleanupCandidateButUnknownDoesNot() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? fileManager.removeItem(at: root) }
+
+        let knownCache = root.appendingPathComponent("custom-cache")
+        try makeDirectory(knownCache)
+        try writeFile(knownCache.appendingPathComponent("blob.bin"), megabytes: 2)
+        let unknown = root.appendingPathComponent("mystery")
+        try makeDirectory(unknown)
+        try writeFile(unknown.appendingPathComponent("payload.bin"), megabytes: 2)
+
+        let safeLocation = KnownCacheLocation(
+            url: knownCache,
+            category: "测试工具",
+            name: "测试缓存",
+            risk: .review,
+            note: "测试用缓存规则"
+        )
+        let report = UnknownStorageScanner.scan(
+            directory: root,
+            thresholdBytes: 0,
+            knownCacheLocations: [safeLocation]
+        )
+
+        let knownNode = try XCTUnwrap(report.nodes.first { $0.name == "custom-cache" })
+        XCTAssertEqual(knownNode.cleanupCandidate?.category, "测试工具")
+        XCTAssertEqual(knownNode.cleanupCandidate?.risk, .review)
+        let unknownNode = try XCTUnwrap(report.nodes.first { $0.name == "mystery" })
+        XCTAssertNil(unknownNode.cleanupCandidate)
+
+        let manualLocation = KnownCacheLocation(
+            url: knownCache,
+            category: "测试工具",
+            name: "手动缓存",
+            risk: .manual,
+            note: "只能手动处理"
+        )
+        let manualReport = UnknownStorageScanner.scan(
+            directory: root,
+            thresholdBytes: 0,
+            knownCacheLocations: [manualLocation]
+        )
+        XCTAssertNil(manualReport.nodes.first { $0.name == "custom-cache" }?.cleanupCandidate)
+    }
+
+    func testFileMetadataDrivesTypesAndLogicalSize() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? fileManager.removeItem(at: root) }
+
+        try writeFile(root.appendingPathComponent("photo.png"), bytes: 2_048)
+        try writeFile(root.appendingPathComponent("main.swift"), bytes: 1_024)
+        try makeDirectory(root.appendingPathComponent("nested"))
+
+        let report = UnknownStorageScanner.scan(
+            directory: root,
+            thresholdBytes: 0,
+            knownCacheLocations: []
+        )
+
+        let photo = try XCTUnwrap(report.allNodes.first { $0.name == "photo.png" })
+        XCTAssertEqual(photo.fileType, .image)
+        XCTAssertEqual(photo.logicalBytes, 2_048)
+        XCTAssertFalse(photo.isDirectory)
+
+        let source = try XCTUnwrap(report.allNodes.first { $0.name == "main.swift" })
+        XCTAssertEqual(source.fileType, .source)
+
+        let folder = try XCTUnwrap(report.allNodes.first { $0.name == "nested" })
+        XCTAssertEqual(folder.fileType, .folder)
+        XCTAssertNil(folder.logicalBytes)
+
+        let summary = report.totalFileTypes
+        XCTAssertEqual(summary.reduce(Int64(0)) { $0 + $1.allocatedBytes }, report.totalAllocatedBytes)
+    }
+
     func testInventoryKeepsMissingRootsAndDeduplicates() throws {
         let existing = try makeTemporaryDirectory()
         defer { try? fileManager.removeItem(at: existing) }
