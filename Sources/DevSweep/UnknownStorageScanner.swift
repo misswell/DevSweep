@@ -38,10 +38,6 @@ struct DiscoveryReport {
     var totalFileTypes: [FileTypeSummary] {
         FileTypeSummary.direct(nodes: allNodes)
     }
-
-    var unmeasuredCount: Int {
-        allNodes.filter { $0.measurement.allocatedBytes == 0 }.count
-    }
 }
 
 final class DiscoveryCancellationFlag: @unchecked Sendable {
