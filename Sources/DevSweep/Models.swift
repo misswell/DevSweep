@@ -447,15 +447,48 @@ struct QuickCleanEntry: Codable, Hashable, Identifiable {
 struct QuickCleanSnapshot: Identifiable, Equatable {
     let entry: QuickCleanEntry
     let exists: Bool
-    let size: Int64
+    /// 完整的测量结果；`size` 只是它的便捷视图，容量可信度始终以这里的状态为准。
+    let measurement: StorageMeasurement
     let fileIdentity: FileIdentity?
     var protection: String? = nil
-    /// 版本匹配过程中的提示，例如同一更新目录出现多个新版本安装包；
-    /// 占用没能量完时这里是「至少占用」说明。
+    /// 版本匹配过程中的提示，例如同一更新目录出现多个新版本安装包。
+    /// 容量是否只是下限必须看 `measurement.state`，不能从 `note` 推断。
     var note: String? = nil
+
+    var size: Int64 { measurement.allocatedBytes }
 
     var id: String { entry.id }
     var canClean: Bool { exists && fileIdentity != nil && protection == nil && !entry.isManual }
+    var isSizeComplete: Bool { measurement.isComplete }
+}
+
+/// 一组容量数字的汇总状态，避免把「未知」和「精确的 0 B」混为一谈。
+enum CapacityState: Equatable {
+    case complete
+    case lowerBound
+    case unknown
+}
+
+struct CapacitySummary: Equatable {
+    let knownBytes: Int64
+    let totalCount: Int
+    let completeCount: Int
+    let partialCount: Int
+    let unmeasuredCount: Int
+
+    static let empty = CapacitySummary(
+        knownBytes: 0, totalCount: 0, completeCount: 0, partialCount: 0, unmeasuredCount: 0
+    )
+
+    var state: CapacityState {
+        if totalCount == 0 { return .complete }
+        if partialCount == 0 && unmeasuredCount == 0 { return .complete }
+        if knownBytes == 0 && completeCount == 0 { return .unknown }
+        return .lowerBound
+    }
+
+    var isLowerBound: Bool { state == .lowerBound }
+    var isUnknown: Bool { state == .unknown }
 }
 
 /// 常用清理列表的排序方式。

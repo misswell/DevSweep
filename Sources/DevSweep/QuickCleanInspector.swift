@@ -149,10 +149,14 @@ enum QuickCleanInspector {
         snapshots(for: [entry]).first!
     }
 
-    /// 一次刷新的磁盘预算：目录占用按 16 个路径交给同一次 `du`，
-    /// 单个文件走属性读取，不起进程。
-    private static let measurementChunkSize = 16
-    private static let measurementTimeout: TimeInterval = 60
+    /// 目录集合统一交给一次 `du`，整个集合共享硬链接去重；
+    /// 这个常量只控制界面增量发布的批量大小。
+    private static let publishBatchSize = 16
+
+    /// 大集合允许更长的总预算，但仍保留超时上限，避免一次刷新无限占用。
+    private static func measurementTimeout(for directoryCount: Int) -> TimeInterval {
+        min(300, max(60, Double(directoryCount)))
+    }
 
     private static func automaticSnapshot(
         for entry: QuickCleanEntry,
@@ -162,7 +166,7 @@ enum QuickCleanInspector {
         QuickCleanSnapshot(
             entry: entry,
             exists: true,
-            size: measurement.allocatedBytes,
+            measurement: measurement,
             fileIdentity: identity,
             note: measurement.warning
         )
@@ -172,7 +176,13 @@ enum QuickCleanInspector {
     private static func invalidAutomaticSnapshot(
         for entry: QuickCleanEntry, note: String? = nil
     ) -> QuickCleanSnapshot {
-        QuickCleanSnapshot(entry: entry, exists: false, size: 0, fileIdentity: nil, note: note)
+        QuickCleanSnapshot(
+            entry: entry, exists: false,
+            measurement: StorageMeasurement(
+                allocatedBytes: 0, state: .failed, failureReason: note ?? "路径不存在"
+            ),
+            fileIdentity: nil, note: note
+        )
     }
 
     private static func fileMeasurement(for url: URL) -> StorageMeasurement {
@@ -198,7 +208,8 @@ enum QuickCleanInspector {
         for entry: QuickCleanEntry,
         home: URL,
         devices: [SimulatorCleanupDevice],
-        activityProtection: String?
+        activityProtection: String?,
+        measurement: StorageMeasurement?
     ) -> QuickCleanSnapshot {
         let url = URL(fileURLWithPath: entry.path)
         let identity = FileIdentity.capture(url)
@@ -221,8 +232,15 @@ enum QuickCleanInspector {
         } else {
             protection = activityProtection ?? SimulatorCleanupError.missing.localizedDescription
         }
+        let fallback = StorageMeasurement(
+            allocatedBytes: 0,
+            state: exists ? .failed : .complete,
+            failureReason: exists ? "无法统计该条目占用" : nil
+        )
         return QuickCleanSnapshot(
-            entry: entry, exists: exists, size: exists ? CacheScanner.size(of: url) : 0,
+            entry: entry,
+            exists: exists,
+            measurement: exists ? (measurement ?? fallback) : StorageMeasurement(allocatedBytes: 0),
             fileIdentity: entry.isSimulator && exists ? identity : nil,
             protection: protection
         )
@@ -230,15 +248,15 @@ enum QuickCleanInspector {
 
     /// 刷新磁盘快照：存在性、FileIdentity、大小全部重新读取，绝不调用完整 CacheScanner。
     ///
-    /// 目录占用合并成少量 `du` 调用，并按批次通过 `onProgress` 交给界面：上百个常用
-    /// 条目过去要串行起上百个进程、跑完才一次性发布，页面只能全程显示「检查中…」
-    /// 并禁用清理按钮。模拟器状态需要 `simctl`，放在文件快照之后，不拖慢可清理项。
-    /// 同一次 `du` 会在参数之间对硬链接去重，因此各行相加等于真正可回收的总量。
+    /// 目录占用交给同一次 `du`，整个集合共享硬链接去重；读取到每个目录时立即产生
+    /// 增量快照，`onProgress` 只收到本次新增或更新的条目，不再重复发送历史结果。
+    /// 模拟器状态需要 `simctl`，放在文件快照之后，不拖慢可清理项。
     static func snapshots(
         for entries: [QuickCleanEntry],
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         simulatorInspector: SimulatorCleanupInspecting = SimulatorCleanupExecutor(),
         notes: [String: String] = [:],
+        isCancelled: () -> Bool = { false },
         onProgress: (([QuickCleanSnapshot]) -> Void)? = nil
     ) -> [QuickCleanSnapshot] {
         // 按索引而不是按 id 收集：结果必须与传入条目一一对应、顺序一致。
@@ -246,6 +264,7 @@ enum QuickCleanInspector {
         var directorySlots: [(index: Int, entry: QuickCleanEntry, url: URL, identity: FileIdentity)] = []
 
         for (index, entry) in entries.enumerated() where entry.isAutomatic {
+            if isCancelled() { break }
             guard let identity = validatedIdentity(for: entry) else {
                 slots[index] = invalidAutomaticSnapshot(for: entry, note: notes[entry.id])
                 continue
@@ -260,56 +279,114 @@ enum QuickCleanInspector {
             }
         }
 
-        for start in stride(from: 0, to: directorySlots.count, by: measurementChunkSize) {
-            let chunk = Array(directorySlots[start..<min(start + measurementChunkSize, directorySlots.count)])
-            let measurements = StorageMeasurementService.measure(
-                chunk.map(\.url), timeout: measurementTimeout
-            )
-            for item in chunk {
-                // 校验后目录可能刚好消失；du 对它没有输出，按失败的 0 占用处理。
-                let fallback = StorageMeasurement(allocatedBytes: 0, state: .failed)
-                slots[item.index] = automaticSnapshot(
-                    for: item.entry,
-                    identity: item.identity,
-                    measurement: measurements[item.entry.id] ?? fallback
-                )
-            }
-            onProgress?(slots.compactMap { $0 })
+        // 文件与失效路径不依赖 du，先让界面看到它们。
+        let initial = slots.compactMap { $0 }
+        if !initial.isEmpty { onProgress?(initial) }
+
+        // 同一路径可能被收藏多次，回调时所有对应行一起更新。
+        var rowsByPath: [String: [(index: Int, entry: QuickCleanEntry, identity: FileIdentity)]] = [:]
+        for item in directorySlots {
+            rowsByPath[item.url.path, default: []].append((item.index, item.entry, item.identity))
         }
-        // 没有目录时上面的循环不会发布；文件与失效条目也要立刻可见。
-        if directorySlots.isEmpty {
-            onProgress?(slots.compactMap { $0 })
+
+        var pendingPublish: [QuickCleanSnapshot] = []
+        func publish(_ snapshot: QuickCleanSnapshot) {
+            pendingPublish.append(snapshot)
+            if pendingPublish.count >= publishBatchSize {
+                onProgress?(pendingPublish)
+                pendingPublish.removeAll(keepingCapacity: true)
+            }
+        }
+
+        let measurements = StorageMeasurementService.measureAll(
+            directorySlots.map(\.url),
+            timeout: measurementTimeout(for: directorySlots.count),
+            isCancelled: isCancelled,
+            onMeasurement: { path, measurement in
+                for item in rowsByPath[path] ?? [] {
+                    let snapshot = automaticSnapshot(
+                        for: item.entry, identity: item.identity, measurement: measurement
+                    )
+                    slots[item.index] = snapshot
+                    publish(snapshot)
+                }
+            }
+        )
+        if !pendingPublish.isEmpty { onProgress?(pendingPublish) }
+
+        // 最终校准：du 的错误归属只在进程结束后才能确定。
+        for item in directorySlots {
+            guard let measurement = measurements[item.url.path] else { continue }
+            slots[item.index] = automaticSnapshot(
+                for: item.entry, identity: item.identity, measurement: measurement
+            )
         }
 
         let guarded = entries.enumerated().filter { !$0.element.isAutomatic }
-        guard !guarded.isEmpty else { return slots.compactMap { $0 } }
+        guard !guarded.isEmpty, !isCancelled() else { return slots.compactMap { $0 } }
         let guardedEntries = guarded.map(\.element)
         let state = simulatorState(for: guardedEntries, inspector: simulatorInspector)
+        if isCancelled() { return slots.compactMap { $0 } }
+
+        // 身份、UDID 和活动状态仍逐设备核验；容量只对通过核验的目标批量测量。
+        var guardedURLs: [URL] = []
         for item in guarded {
+            let url = URL(fileURLWithPath: item.element.path)
+            if item.element.isManual || FileIdentity.capture(url)?.kind == .directory {
+                guardedURLs.append(url)
+            }
+        }
+        let guardedMeasurements = StorageMeasurementService.measure(
+            guardedURLs, timeout: measurementTimeout(for: guardedURLs.count)
+        )
+        for item in guarded {
+            let url = URL(fileURLWithPath: item.element.path)
             slots[item.offset] = guardedSnapshot(
                 for: item.element, home: home,
-                devices: state.devices, activityProtection: state.protection
+                devices: state.devices, activityProtection: state.protection,
+                measurement: guardedMeasurements[url.path]
             )
         }
+        if !guarded.isEmpty { onProgress?(slots.compactMap { $0 }) }
         return slots.compactMap { $0 }
     }
 
     /// 为一键清理重新生成执行用的 CacheItem。expectedFileIdentity 必须是执行前
     /// 刚刚捕获的，绝不能复用旧扫描结果；只接受授权类型的目录或安装包，
-    /// 符号链接和已消失的路径会被排除。删除仍然走 CacheCleaner + DeletionValidator。
+    /// 符号链接和已消失的路径会被排除。
+    ///
+    /// 安全核验先逐项完成，容量再统一批量读取：测量失败不影响已通过核验的目标清理，
+    /// 但会把下限状态带进报告。删除仍然走 CacheCleaner + DeletionValidator。
     static func executableItems(for entries: [QuickCleanEntry]) -> [CacheItem] {
-        entries.compactMap { entry in
+        var validated: [(entry: QuickCleanEntry, url: URL, identity: FileIdentity)] = []
+        for entry in entries {
             let url = URL(fileURLWithPath: entry.path)
-            guard let identity = validatedIdentity(for: entry) else { return nil }
+            guard let identity = validatedIdentity(for: entry) else { continue }
+            validated.append((entry, url, identity))
+        }
+        guard !validated.isEmpty else { return [] }
+
+        let directoryURLs = validated
+            .filter { $0.identity.kind == .directory }
+            .map(\.url)
+        let directoryMeasurements = StorageMeasurementService.measure(
+            directoryURLs, timeout: measurementTimeout(for: directoryURLs.count)
+        )
+
+        return validated.map { item in
+            let measurement = item.identity.kind == .directory
+                ? directoryMeasurements[item.url.path]
+                : fileMeasurement(for: item.url)
             return CacheItem(
-                category: entry.category,
-                name: entry.displayName,
-                path: url,
-                size: CacheScanner.size(of: url),
-                details: url.devSweepDisplayPath,
+                category: item.entry.category,
+                name: item.entry.displayName,
+                path: item.url,
+                size: measurement?.allocatedBytes ?? 0,
+                sizeWarning: measurement?.warning,
+                details: item.url.devSweepDisplayPath,
                 risk: .safe,
                 kind: .trash,
-                expectedFileIdentity: identity,
+                expectedFileIdentity: item.identity,
                 note: "常用清理"
             )
         }

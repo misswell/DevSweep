@@ -415,7 +415,8 @@ struct ContentView: View {
                         title: "常用清理",
                         subtitle: "\(store.quickCleanEntries.count) 个常用项目 · 按类型清理",
                         icon: "bolt.fill",
-                        size: store.quickCleanSize
+                        size: store.quickCleanSize,
+                        sizeIsLowerBound: store.quickCleanSizeIsLowerBound
                     )
                     .tag(SidebarDestination.quickClean)
                     SidebarRow(
@@ -1106,7 +1107,7 @@ private struct QuickCleanPageView: View {
         VStack(alignment: .leading, spacing: 18) {
             QuickCleanHeaderCard(
                 cleanableCount: store.cleanableQuickCleanSnapshots.count,
-                cleanableSize: store.quickCleanSize,
+                sizeSummary: store.quickCleanSizeSummary,
                 isCleaning: store.isCleaning,
                 isRefreshing: store.isRefreshingQuickClean,
                 sort: Binding(
@@ -1162,7 +1163,7 @@ private struct QuickCleanPageView: View {
 
 private struct QuickCleanHeaderCard: View {
     let cleanableCount: Int
-    let cleanableSize: Int64
+    let sizeSummary: CapacitySummary
     let isCleaning: Bool
     let isRefreshing: Bool
     @Binding var sort: QuickCleanSort
@@ -1190,9 +1191,10 @@ private struct QuickCleanHeaderCard: View {
                     Text("可一键清理")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
-                    Text("\(cleanableCount) 项 · \(cleanableSize.devSweepFileSize)")
+                    Text("\(cleanableCount) 项 · \(sizeText)")
                         .font(.subheadline.monospacedDigit().weight(.semibold))
                         .foregroundStyle(.tint)
+                        .help(helpText)
                 }
                 Button {
                     onCleanAll()
@@ -1225,6 +1227,16 @@ private struct QuickCleanHeaderCard: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                if incompleteCount > 0 {
+                    Label(
+                        sizeSummary.state == .unknown
+                            ? "\(incompleteCount) 项无法统计，合计未知"
+                            : "\(incompleteCount) 项占用未完整统计，合计为下限",
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                }
                 Spacer()
             }
         }
@@ -1234,6 +1246,26 @@ private struct QuickCleanHeaderCard: View {
         .overlay {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .stroke(Color.primary.opacity(0.08))
+        }
+    }
+
+    private var incompleteCount: Int { sizeSummary.partialCount + sizeSummary.unmeasuredCount }
+
+    private var sizeText: String {
+        switch sizeSummary.state {
+        case .complete: return sizeSummary.knownBytes.devSweepFileSize
+        case .lowerBound: return "≥ " + sizeSummary.knownBytes.devSweepFileSize
+        case .unknown: return "占用未知"
+        }
+    }
+
+    private var helpText: String {
+        switch sizeSummary.state {
+        case .complete: return "按已分配磁盘块统计"
+        case .lowerBound:
+            return "有 \(incompleteCount) 项占用未完整测量，合计只是下限"
+        case .unknown:
+            return "没有任何条目完成容量测量，无法给出可信合计"
         }
     }
 }
@@ -1357,7 +1389,8 @@ private struct QuickCleanEntryRow: View {
     private var statusText: String {
         guard let snapshot else { return "检查中…" }
         if entry.isSimulator && !snapshot.exists { return "设备已失效" }
-        return snapshot.exists ? snapshot.size.devSweepFileSize : "当前无内容"
+        guard snapshot.exists else { return "当前无内容" }
+        return (snapshot.isSizeComplete ? "" : "≥ ") + snapshot.size.devSweepFileSize
     }
 }
 
@@ -1889,6 +1922,7 @@ private struct SidebarRow: View {
     let subtitle: String
     let icon: String
     let size: Int64?
+    var sizeIsLowerBound: Bool = false
 
     var body: some View {
         HStack(spacing: 10) {
@@ -1904,7 +1938,7 @@ private struct SidebarRow: View {
             }
             Spacer(minLength: 0)
             if let size {
-                Text(size.devSweepFileSize)
+                Text((sizeIsLowerBound ? "≥ " : "") + size.devSweepFileSize)
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }

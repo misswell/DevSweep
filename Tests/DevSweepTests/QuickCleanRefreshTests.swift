@@ -179,6 +179,32 @@ final class QuickCleanRefreshTests: XCTestCase {
         XCTAssertLessThan(batched, solo, "分批测量会让共享的磁盘块被重复计入")
     }
 
+    /// 旧实现每 16 个目录起一次 du；共享硬链接跨过这个边界时必须仍然只计一次。
+    func testHardlinksAcrossFormerBatchBoundaryAreCountedOnce() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var entries: [QuickCleanEntry] = []
+        var urls: [URL] = []
+        for index in 0..<17 {
+            let directory = root.appendingPathComponent("cache-\(index)")
+            try makeAllocatedDirectory(at: directory, bytes: 20_000 + index * 100)
+            urls.append(directory)
+            entries.append(directoryEntry(directory, name: "cache-\(index)"))
+        }
+        let shared = urls[0].appendingPathComponent("payload.bin")
+        try FileManager.default.linkItem(
+            at: shared, to: urls[16].appendingPathComponent("shared-copy.bin")
+        )
+
+        let batched = QuickCleanInspector.snapshots(for: entries).reduce(0) { $0 + $1.size }
+        let solo = urls.reduce(Int64(0)) {
+            $0 + StorageMeasurementService.measure($1).allocatedBytes
+        }
+
+        XCTAssertGreaterThan(batched, 0)
+        XCTAssertLessThan(batched, solo, "第 1 个和第 17 个目录的共享硬链接不能累计两次")
+    }
+
     /// 收藏的路径消失时只影响那一行：同批次的其他目录仍拿到精确占用。
     func testMissingEntryOnlyAffectsItsOwnRow() throws {
         let root = try makeTemporaryDirectory()
@@ -230,7 +256,73 @@ final class QuickCleanRefreshTests: XCTestCase {
         XCTAssertGreaterThan(snapshot.size, 0, "读不到的子目录不该把整行清零")
         let note = try XCTUnwrap(snapshot.note)
         XCTAssertTrue(note.contains("可能更大"), note)
+        XCTAssertFalse(snapshot.isSizeComplete)
+        XCTAssertEqual(snapshot.measurement.state, .partial)
         XCTAssertTrue(snapshot.canClean, "占用只是下限不影响清理授权，删除仍走逐次核验")
+
+        let executable = QuickCleanInspector.executableItems(for: [directoryEntry(root)])
+        XCTAssertEqual(executable.count, 1, "容量测量不完整不能阻止安全核验通过的目标清理")
+        XCTAssertNotNil(executable.first?.sizeWarning)
+        XCTAssertGreaterThan(executable.first?.size ?? 0, 0)
+    }
+
+    /// 汇总容量必须读取测量状态，不能把不完整测量当成精确值。
+    func testStoreSummaryMarksIncompleteMeasurementsAsLowerBound() throws {
+        try XCTSkipIf(geteuid() == 0, "root 不受目录权限限制，测不到读取失败")
+        let home = try makeTemporaryDirectory()
+        let root = home.appendingPathComponent("Library/Caches/mixed")
+        let sealed = root.appendingPathComponent("sealed")
+        try makeAllocatedDirectory(at: root, bytes: 64_000)
+        try makeAllocatedDirectory(at: sealed, bytes: 64_000)
+        defer {
+            chmod(sealed.path, 0o755)
+            try? FileManager.default.removeItem(at: home)
+        }
+        chmod(sealed.path, 0o000)
+
+        let store = makeStore(home: home, inspector: Inspector())
+        XCTAssertEqual(store.addToQuickClean([makeDirectoryItem(root, name: "mixed")]).added, 1)
+        XCTAssertTrue(waitUntil {
+            !store.isRefreshingQuickClean && store.quickCleanRows.first?.snapshot != nil
+        })
+
+        let summary = store.quickCleanSizeSummary
+        XCTAssertEqual(summary.totalCount, 1)
+        XCTAssertEqual(summary.partialCount, 1)
+        XCTAssertEqual(summary.state, .lowerBound)
+        XCTAssertGreaterThan(summary.knownBytes, 0)
+        XCTAssertTrue(store.quickCleanSizeIsLowerBound)
+    }
+
+    // MARK: - 规模基准
+
+    /// 100 / 1,000 / 5,000 个收藏目录都只应启动一次 du，且刷新时间保持线性可控。
+    func testQuickCleanScaleUsesOneDuProcess() throws {
+        let home = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let root = home.appendingPathComponent("Library/Caches/scale")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        for count in [100, 1_000, 5_000] {
+            var entries: [QuickCleanEntry] = []
+            entries.reserveCapacity(count)
+            for index in 0..<count {
+                let directory = root.appendingPathComponent("cache-\(count)-\(index)")
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                entries.append(directoryEntry(directory, name: "cache-\(index)"))
+            }
+
+            StorageMeasurementService.resetDuInvocationCount()
+            let startedAt = Date()
+            let snapshots = QuickCleanInspector.snapshots(for: entries)
+            let elapsed = Date().timeIntervalSince(startedAt)
+            print("DevSweep quick clean \(count) dirs: \(String(format: "%.3f", elapsed))s, du=\(StorageMeasurementService.duInvocationCount)")
+
+            XCTAssertEqual(snapshots.count, count)
+            XCTAssertLessThanOrEqual(StorageMeasurementService.duInvocationCount, 1,
+                                     "\(count) 个目录不能退化成逐项或分批起 du")
+            XCTAssertLessThan(elapsed, 60, "\(count) 个目录的刷新不应退化到逐项起进程")
+        }
     }
 
     // MARK: - 发布顺序
@@ -319,6 +411,49 @@ final class QuickCleanRefreshTests: XCTestCase {
     }
 
     // MARK: - 进入页面的节流
+
+    /// 多次强制刷新不能叠加任务；旧任务退出后只启动一轮最新测量。
+    func testForcedRefreshesCoalesceAndLatestMeasurementWins() throws {
+        let home = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let inspector = Inspector()
+        inspector.hold()
+        defer { inspector.release() }
+        let store = makeStore(home: home, inspector: inspector)
+        let cache = home.appendingPathComponent("Library/Caches/pkg")
+        try makeAllocatedDirectory(at: cache, bytes: 64_000)
+        let udid = UUID().uuidString
+        let device = try simulatorDirectory(in: home, udid: udid)
+        inspector.listedDevices = [
+            SimulatorCleanupDevice(udid: udid, name: "iPhone", state: "Shutdown",
+                                   dataPath: device.appendingPathComponent("data").path)
+        ]
+
+        XCTAssertEqual(store.addToQuickClean([
+            makeDirectoryItem(cache, name: "pkg"),
+            makeSimulatorItem(device, udid: udid)
+        ]).added, 2)
+        XCTAssertTrue(waitUntil {
+            store.quickCleanRows.contains { $0.entry.displayName == "pkg" && $0.snapshot != nil }
+                && store.isRefreshingQuickClean
+        })
+        XCTAssertEqual(inspector.calls, 1, "前提：第一轮已经进入模拟器查询")
+
+        // 第一轮测到的是旧容量；随后扩容并连续请求强制刷新。
+        try FileManager.default.removeItem(at: cache)
+        try makeAllocatedDirectory(at: cache, bytes: 1_000_000)
+        for _ in 0..<5 { store.refreshQuickCleanSnapshots(force: true) }
+        XCTAssertEqual(inspector.calls, 1, "刷新进行中只登记一次待执行请求")
+
+        inspector.release()
+        XCTAssertTrue(waitUntil { !store.isRefreshingQuickClean })
+        XCTAssertEqual(inspector.calls, 2, "五次强制刷新只合并成第二轮")
+        let snapshot = try XCTUnwrap(
+            store.quickCleanRows.first { $0.entry.displayName == "pkg" }?.snapshot
+        )
+        XCTAssertGreaterThan(snapshot.size, 500_000, "最新一轮结果不能被旧任务覆盖")
+        XCTAssertTrue(store.quickCleanRows.allSatisfy { $0.snapshot != nil })
+    }
 
     /// 反复切换侧边栏不该每次都重新遍历上百棵真实目录树。
     func testEnteringPageAgainWithinThrottleSkipsRemeasurement() throws {

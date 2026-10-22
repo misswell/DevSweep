@@ -34,6 +34,57 @@ final class FileDistributionTests: XCTestCase {
         XCTAssertEqual(grouped.items.count, 1)
         XCTAssertEqual(grouped.emptyCount, 1)
         XCTAssertEqual(grouped.unmeasuredCount, 2)
+        XCTAssertEqual(grouped.incompleteCount, 2)
+        XCTAssertTrue(grouped.isLowerBound, "0 B 的超时或失败项同样让总量变成下限")
+        XCTAssertFalse(grouped.totalIsUnknown, "仍有一项精确测量的 2 KB")
+    }
+
+    /// 0 B 的超时项不绘制，但必须让合计和警示一起降级为下限。
+    func testZeroByteTimeoutMakesTotalALowerBound() {
+        let nodes = [
+            node(path: "/tmp/exact-a", bytes: 6_000),
+            node(path: "/tmp/exact-b", bytes: 4_000),
+            node(path: "/tmp/timeout", bytes: 0, state: .timedOut)
+        ]
+        let grouped = TreemapGrouping.grouped(nodes: nodes, maxVisible: 10)
+
+        XCTAssertEqual(grouped.totalBytes, 10_000)
+        XCTAssertEqual(grouped.unmeasuredCount, 1)
+        XCTAssertEqual(grouped.incompleteCount, 1)
+        XCTAssertEqual(grouped.lowerBoundCount, 0, "没有可绘制的下限图块")
+        XCTAssertTrue(grouped.isLowerBound, "合计不能继续声称精确")
+        XCTAssertFalse(grouped.totalIsUnknown)
+    }
+
+    /// 全部条目都无法测量时，0 B 不是有效合计。
+    func testAllUnmeasuredEntriesReportUnknownTotal() {
+        let nodes = [
+            node(path: "/tmp/failed", bytes: 0, state: .failed),
+            node(path: "/tmp/timeout", bytes: 0, state: .timedOut),
+            node(path: "/tmp/partial", bytes: 0, state: .partial)
+        ]
+        let grouped = TreemapGrouping.grouped(nodes: nodes, maxVisible: 10)
+
+        XCTAssertTrue(grouped.items.isEmpty)
+        XCTAssertEqual(grouped.unmeasuredCount, 3)
+        XCTAssertEqual(grouped.incompleteCount, 3)
+        XCTAssertTrue(grouped.isLowerBound)
+        XCTAssertTrue(grouped.totalIsUnknown)
+        XCTAssertEqual(grouped.totalBytes, 0)
+    }
+
+    /// 只有完整测量到的 0 B 是精确值，不能误报成未知。
+    func testAllEmptyButCompleteEntriesKeepKnownZeroTotal() {
+        let nodes = [
+            node(path: "/tmp/empty-a", bytes: 0),
+            node(path: "/tmp/empty-b", bytes: 0)
+        ]
+        let grouped = TreemapGrouping.grouped(nodes: nodes, maxVisible: 10)
+
+        XCTAssertTrue(grouped.items.isEmpty)
+        XCTAssertFalse(grouped.isLowerBound)
+        XCTAssertFalse(grouped.totalIsUnknown)
+        XCTAssertEqual(grouped.emptyCount, 2)
     }
 
     func testGroupingMarksLowerBoundTilesAndTotals() {
@@ -55,7 +106,7 @@ final class FileDistributionTests: XCTestCase {
             node(
                 path: "/tmp/item-\(index)",
                 bytes: Int64(index + 1) * 100,
-                state: index == 0 ? .partial : .complete
+                state: index < 2 ? .partial : .complete
             )
         }
         let grouped = TreemapGrouping.grouped(nodes: nodes, maxVisible: 6)
@@ -63,9 +114,11 @@ final class FileDistributionTests: XCTestCase {
         XCTAssertEqual(grouped.items.count, 6)
         let other = try XCTUnwrap(grouped.items.first(where: \.isOther))
         XCTAssertEqual(other.memberCount, 15)
-        // 最小项测量不完整，被合进「其他」：图块本身必须标成下限。
+        // 两个最小项测量不完整，被合进同一个「其他」图块：
+        // 可见下限图块只有 1 个，底层不完整条目仍是 2 个。
         XCTAssertEqual(other.isLowerBound, true)
         XCTAssertEqual(grouped.lowerBoundCount, 1)
+        XCTAssertEqual(grouped.incompleteCount, 2)
         XCTAssertTrue(grouped.isLowerBound)
         XCTAssertFalse(grouped.drawnIDs.contains("/tmp/item-0"))
         XCTAssertEqual(grouped.totalBytes, nodes.reduce(Int64(0)) { $0 + $1.measurement.allocatedBytes })
@@ -327,6 +380,30 @@ final class FileDistributionTests: XCTestCase {
         XCTAssertEqual(summary[0].lowerBoundCount, 1)
         XCTAssertTrue(summary[0].isLowerBound)
         XCTAssertEqual(summary[0].allocatedBytes, 5_000)
+    }
+
+    func testCapacitySummaryDistinguishesUnknownLowerBoundAndComplete() {
+        XCTAssertEqual(
+            CapacitySummary(knownBytes: 0, totalCount: 2, completeCount: 0,
+                            partialCount: 1, unmeasuredCount: 1).state,
+            .unknown
+        )
+        XCTAssertEqual(
+            CapacitySummary(knownBytes: 4_000, totalCount: 2, completeCount: 1,
+                            partialCount: 0, unmeasuredCount: 1).state,
+            .lowerBound
+        )
+        XCTAssertEqual(
+            CapacitySummary(knownBytes: 4_000, totalCount: 2, completeCount: 1,
+                            partialCount: 1, unmeasuredCount: 0).state,
+            .lowerBound
+        )
+        XCTAssertEqual(
+            CapacitySummary(knownBytes: 0, totalCount: 2, completeCount: 2,
+                            partialCount: 0, unmeasuredCount: 0).state,
+            .complete
+        )
+        XCTAssertEqual(CapacitySummary.empty.state, .complete)
     }
 
     func testSearchMatchesNameAndPathAndKeepsSnapshotOrder() {

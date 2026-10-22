@@ -31,6 +31,11 @@ struct DiscoveryReport {
 
     var issueCount: Int { issues.count }
 
+    /// 扫描时的过滤条件标识，参与图表缓存键，避免阈值变化后误用旧节点。
+    var filterSignature: String {
+        "\(thresholdBytes)|\(hiddenCount)|\(filteredCount)|\(filteredBytes)"
+    }
+
     var totalAllocatedBytes: Int64 {
         allNodes.reduce(0) { $0 + $1.measurement.allocatedBytes }
     }
@@ -67,8 +72,6 @@ final class DiscoveryCancellationFlag: @unchecked Sendable {
 /// 不跟随符号链接、不跨越卷、不删除任何内容；父目录只作为导航节点，
 /// 不会和子目录一起参与回收空间计算。
 enum UnknownStorageScanner {
-    static let measurementChunkSize = 16
-    private static let measurementTimeout: TimeInterval = 30
     private static let unknownEvidence = "未命中内置缓存规则、模型/环境标记或项目生成物特征；分类前不会进入清理流程"
     private static let systemManagedPrefixes = [
         "/System", "/Library", "/usr", "/bin", "/sbin", "/private", "/Applications"
@@ -90,7 +93,7 @@ enum UnknownStorageScanner {
         thresholdBytes: Int64,
         knownCacheLocations: [KnownCacheLocation] = CacheScanner.knownCacheLocations(),
         isCancelled: () -> Bool = { false },
-        progress: (DiscoveryScanProgress) -> Void = { _ in }
+        progress: @escaping (DiscoveryScanProgress) -> Void = { _ in }
     ) -> DiscoveryReport {
         let startedAt = Date()
         let directory = directory.standardizedFileURL
@@ -268,25 +271,33 @@ enum UnknownStorageScanner {
         }
 
         let directories = candidates.filter(\.isDirectory).map(\.url)
-        var measuredDirectories = 0
-        for start in stride(from: 0, to: directories.count, by: measurementChunkSize) {
+        if !directories.isEmpty {
+            progress(DiscoveryScanProgress(
+                phase: "正在测量目录占用（0 / \(directories.count)）",
+                currentPath: directory.devSweepDisplayPath,
+                checkedCount: checkedCount
+            ))
+            var measuredDirectories = 0
+            let measured = StorageMeasurementService.measureAll(
+                directories,
+                timeout: min(300, max(30, Double(directories.count))),
+                isCancelled: isCancelled,
+                onMeasurement: { path, _ in
+                    measuredDirectories += 1
+                    guard measuredDirectories % 32 == 0
+                            || measuredDirectories == directories.count else { return }
+                    progress(DiscoveryScanProgress(
+                        phase: "正在测量目录占用（\(measuredDirectories) / \(directories.count)）",
+                        currentPath: URL(fileURLWithPath: path).devSweepDisplayPath,
+                        checkedCount: checkedCount
+                    ))
+                }
+            )
+            measurements.merge(measured) { _, latest in latest }
             if isCancelled() {
                 cancelled = true
                 return finish()
             }
-            let end = min(start + measurementChunkSize, directories.count)
-            let chunk = Array(directories[start..<end])
-            progress(DiscoveryScanProgress(
-                phase: "正在测量目录占用（\(measuredDirectories) / \(directories.count)）",
-                currentPath: (chunk.first ?? directory).devSweepDisplayPath,
-                checkedCount: checkedCount
-            ))
-            let chunkMeasurements = StorageMeasurementService.measure(
-                chunk,
-                timeout: measurementTimeout
-            )
-            measurements.merge(chunkMeasurements) { _, latest in latest }
-            measuredDirectories += chunk.count
         }
 
         return finish()

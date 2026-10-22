@@ -25,12 +25,19 @@ struct FileTypeRollup: Hashable {
         summaries.reduce(0) { $0 + $1.logicalBytes }
     }
 
-    /// 未扫完、或有读不到的条目时，合计只能当作下限。
-    var isLowerBound: Bool { !isComplete || unreadableCount > 0 }
+    /// 未扫完、有读不到的条目、或跳过了跨卷内容时，合计只能当作下限。
+    var isLowerBound: Bool { !isComplete || unreadableCount > 0 || crossVolumeCount > 0 }
+
+    var state: CapacityState {
+        if isComplete { return .complete }
+        if totalBytes == 0 && fileCount == 0 && packageCount == 0 { return .unknown }
+        return .lowerBound
+    }
 
     var note: String {
         if limitReached { return "已达条目上限，实际占用可能更大" }
         if unreadableCount > 0 { return "有 \(unreadableCount) 个条目无法读取，实际占用可能更大" }
+        if crossVolumeCount > 0 { return "有 \(crossVolumeCount) 个跨卷条目未进入，当前只统计根目录所在卷" }
         if !isComplete { return "统计已中断，当前为已扫描部分的下限" }
         return "覆盖子树内全部常规文件"
     }
@@ -45,7 +52,6 @@ struct FileTypeRollup: Hashable {
 enum FileTypeRollupScanner {
     static let defaultEntryLimit = 300_000
     static let defaultPackageLimit = 2_000
-    private static let packageChunkSize = 128
 
     struct Progress: Equatable {
         let phase: String
@@ -66,21 +72,38 @@ enum FileTypeRollupScanner {
         var stats: [FileTypeCategory: (bytes: Int64, logical: Int64, count: Int, lowerBound: Int)] = [:]
         var fileCount = 0
         var directoryCount = 0
+        var packageCount = 0
+        var packageCountByCategory: [FileTypeCategory: Int] = [:]
         var symlinkCount = 0
         var crossVolumeCount = 0
         var unreadableCount = 0
         var scannedEntries = 0
         var limitReached = false
         var cancelled = false
-        var packages: [(url: URL, category: FileTypeCategory)] = []
+        // 当前正在遍历的顶层包目录。嵌套包不再单独计数，内部文件归入顶层包类型。
+        var activePackages: [(path: String, category: FileTypeCategory)] = []
 
-        func add(_ category: FileTypeCategory, bytes: Int64, logical: Int64, lowerBound: Bool) {
+        func add(
+            _ category: FileTypeCategory,
+            bytes: Int64,
+            logical: Int64,
+            lowerBound: Bool,
+            countsAsItem: Bool
+        ) {
             var entry = stats[category] ?? (0, 0, 0, 0)
             entry.0 += bytes
             entry.1 += logical
-            entry.2 += 1
+            if countsAsItem { entry.2 += 1 }
             if lowerBound { entry.3 += 1 }
             stats[category] = entry
+        }
+
+        /// 深度优先枚举离开包目录后，后续兄弟路径不再属于该包。
+        func trimPackages(for path: String) {
+            while let last = activePackages.last,
+                  !(path == last.path || path.hasPrefix(last.path + "/")) {
+                activePackages.removeLast()
+            }
         }
 
         var rootInfo = stat()
@@ -133,13 +156,14 @@ enum FileTypeRollupScanner {
                 cancelled = true
                 break
             }
-            if scannedEntries >= entryLimit || packages.count >= packageLimit {
+            if scannedEntries >= entryLimit {
                 limitReached = true
                 break
             }
             scannedEntries += 1
 
             let path = url.standardizedFileURL.path
+            trimPackages(for: path)
             var info = stat()
             guard lstat(path, &info) == 0 else {
                 unreadableCount += 1
@@ -159,12 +183,20 @@ enum FileTypeRollupScanner {
             if fileType == S_IFDIR {
                 let category = FileTypeCategory.classify(url: url, isDirectory: true)
                 if category == .folder {
-                    directoryCount += 1
+                    if activePackages.isEmpty { directoryCount += 1 }
                     continue
                 }
-                // 包目录整体按一次 du 统计，不再下降。
-                packages.append((url, category))
-                enumerator.skipDescendants()
+                // 顶层包目录单独计数，但继续下降：包内文件也要参与全局硬链接去重。
+                if activePackages.isEmpty {
+                    guard packageCount < packageLimit else {
+                        limitReached = true
+                        break
+                    }
+                    packageCount += 1
+                    packageCountByCategory[category, default: 0] += 1
+                    activePackages.append((path, category))
+                }
+                // 嵌套包不再算一个新包，内部文件继续归入顶层包类型。
                 continue
             }
             guard fileType == S_IFREG else { continue }
@@ -174,52 +206,33 @@ enum FileTypeRollupScanner {
 
             let allocated = Int64(info.st_blocks) * 512
             let logical = max(0, Int64(info.st_size))
-            add(FileTypeCategory.classify(url: url, isDirectory: false), bytes: allocated, logical: logical, lowerBound: false)
-            fileCount += 1
+            if let package = activePackages.last {
+                // 包内部文件按整个包的类型归类，不增加包数量或普通文件数。
+                add(package.category, bytes: allocated, logical: logical,
+                    lowerBound: false, countsAsItem: false)
+            } else {
+                add(FileTypeCategory.classify(url: url, isDirectory: false),
+                    bytes: allocated, logical: logical, lowerBound: false, countsAsItem: true)
+                fileCount += 1
+            }
 
             if scannedEntries % 4_096 == 0 {
                 progress(Progress(
-                    phase: "正在递归统计文件类型",
+                    phase: activePackages.isEmpty ? "正在递归统计文件类型" : "正在统计包目录内容",
                     currentPath: url.deletingLastPathComponent().devSweepDisplayPath,
                     scannedEntries: scannedEntries
                 ))
             }
         }
 
-        // 包目录用批量 du 统计；一次进程测多个路径，避免为每个 .app 起一个进程。
-        var packageFailures = 0
-        if !cancelled, !packages.isEmpty {
-            for start in stride(from: 0, to: packages.count, by: packageChunkSize) {
-                if isCancelled() {
-                    cancelled = true
-                    break
-                }
-                let chunk = packages[start..<min(start + packageChunkSize, packages.count)]
-                progress(Progress(
-                    phase: "正在统计包目录占用",
-                    currentPath: chunk.first!.url.deletingLastPathComponent().devSweepDisplayPath,
-                    scannedEntries: scannedEntries
-                ))
-                let measurements = StorageMeasurementService.measure(chunk.map(\.url))
-                for package in chunk {
-                    guard let measurement = measurements[package.url.standardizedFileURL.path] else {
-                        packageFailures += 1
-                        continue
-                    }
-                    if measurement.state != .complete {
-                        packageFailures += 1
-                    }
-                    add(package.category, bytes: measurement.allocatedBytes, logical: 0, lowerBound: measurement.state != .complete)
-                }
-            }
-        }
-
-        let summaries = stats.map { category, entry in
-            FileTypeSummary(
+        let categories = Set(stats.keys).union(packageCountByCategory.keys)
+        let summaries = categories.map { category in
+            let entry = stats[category] ?? (0, 0, 0, 0)
+            return FileTypeSummary(
                 category: category,
                 allocatedBytes: entry.bytes,
                 logicalBytes: entry.logical,
-                itemCount: entry.count,
+                itemCount: entry.count + (packageCountByCategory[category] ?? 0),
                 lowerBoundCount: entry.lowerBound
             )
         }
@@ -232,12 +245,12 @@ enum FileTypeRollupScanner {
             summaries: summaries,
             fileCount: fileCount,
             directoryCount: directoryCount,
-            packageCount: packages.count,
+            packageCount: packageCount,
             symlinkCount: symlinkCount,
             crossVolumeCount: crossVolumeCount,
-            unreadableCount: unreadableCount + packageFailures,
+            unreadableCount: unreadableCount,
             scannedEntries: scannedEntries,
-            isComplete: !cancelled && !limitReached && unreadableCount == 0 && packageFailures == 0,
+            isComplete: !cancelled && !limitReached && unreadableCount == 0 && crossVolumeCount == 0,
             limitReached: limitReached,
             duration: Date().timeIntervalSince(startedAt)
         )

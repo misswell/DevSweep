@@ -2588,6 +2588,66 @@ struct CacheCleaner {
     }
 }
 
+/// 一次常用清理刷新的生命周期。generation 防止旧结果覆盖新结果，
+/// cancelled 让旧任务在测量/遍历之间主动退出，而不是继续做重复 I/O。
+final class QuickCleanRefreshContext: @unchecked Sendable {
+    let generation: Int
+    let totalCount: Int
+    private let lock = NSLock()
+    private var cancelled = false
+    private var completedCount = 0
+    private var phase = "准备刷新"
+    private var finished = false
+
+    init(generation: Int, totalCount: Int) {
+        self.generation = generation
+        self.totalCount = totalCount
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    var progress: (phase: String, completed: Int, total: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (phase, completedCount, totalCount)
+    }
+
+    func advance(_ count: Int = 1) {
+        guard count > 0 else { return }
+        lock.lock()
+        completedCount = min(totalCount, completedCount + count)
+        lock.unlock()
+    }
+
+    func setPhase(_ value: String) {
+        lock.lock()
+        phase = value
+        lock.unlock()
+    }
+
+    func finish() {
+        lock.lock()
+        finished = true
+        lock.unlock()
+    }
+
+    var isFinished: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return finished
+    }
+}
+
 @MainActor
 final class DevSweepStore: ObservableObject {
     private static let projectRootsKey = "DevSweep.projectRoots"
@@ -2624,6 +2684,10 @@ final class DevSweepStore: ObservableObject {
     private let simulatorExecutor: SimulatorCleanupExecuting
     private var transientNoticeTask: Task<Void, Never>?
     private var quickCleanRefreshGeneration = 0
+    private var quickCleanRefreshContext: QuickCleanRefreshContext?
+    /// 刷新进行中收到的请求合并成一次，等当前任务退出后再启动，
+    /// 避免多次强制刷新同时遍历同一批目录。
+    private var quickCleanRefreshQueued = false
     /// 最近一次量到的磁盘状态；刷新时逐条覆盖，页面因此不会退回「检查中…」。
     private var quickCleanSnapshotByID: [String: QuickCleanSnapshot] = [:]
     private var lastQuickCleanRefresh: Date?
@@ -2704,9 +2768,35 @@ final class DevSweepStore: ObservableObject {
         quickCleanSnapshotByID.values.filter { $0.entry.isAutomatic && $0.canClean }
     }
 
-    var quickCleanSize: Int64 {
-        cleanableQuickCleanSnapshots.reduce(0) { $0 + $1.size }
+    var quickCleanSizeSummary: CapacitySummary {
+        var knownBytes: Int64 = 0
+        var completeCount = 0
+        var partialCount = 0
+        var unmeasuredCount = 0
+        let snapshots = cleanableQuickCleanSnapshots
+        for snapshot in snapshots {
+            knownBytes += snapshot.size
+            switch snapshot.measurement.state {
+            case .complete: completeCount += 1
+            case .partial, .timedOut: partialCount += 1
+            case .failed: unmeasuredCount += 1
+            }
+        }
+        return CapacitySummary(
+            knownBytes: knownBytes,
+            totalCount: snapshots.count,
+            completeCount: completeCount,
+            partialCount: partialCount,
+            unmeasuredCount: unmeasuredCount
+        )
     }
+
+    var quickCleanSize: Int64 { quickCleanSizeSummary.knownBytes }
+    var quickCleanIncompleteSizeCount: Int {
+        let summary = quickCleanSizeSummary
+        return summary.partialCount + summary.unmeasuredCount
+    }
+    var quickCleanSizeIsLowerBound: Bool { quickCleanSizeSummary.state != .complete }
 
     func setQuickCleanSort(_ sort: QuickCleanSort) {
         guard sort != quickCleanSort else { return }
@@ -3080,71 +3170,114 @@ final class DevSweepStore: ObservableObject {
         guard force || lastQuickCleanRefresh == nil
                 || Date().timeIntervalSince(lastQuickCleanRefresh!) > Self.quickCleanRefreshInterval
                 || quickCleanRows.isEmpty else { return }
+
+        // 当前刷新还没退出：登记一次请求并取消旧任务。旧任务退出后会启动新的 generation，
+        // 因此强制刷新不会叠加出多个并发遍历和多个 du 进程。
+        if isRefreshingQuickClean, quickCleanRefreshContext != nil {
+            quickCleanRefreshQueued = true
+            quickCleanRefreshContext?.cancel()
+            return
+        }
+
+        startQuickCleanRefresh()
+    }
+
+    private func startQuickCleanRefresh() {
         let entries = quickCleanEntries
         let whitelist = whitelistedPaths
         let home = self.home
         let inspector = simulatorInspector
+        quickCleanRefreshContext?.cancel()
         quickCleanRefreshGeneration += 1
         let generation = quickCleanRefreshGeneration
+        let context = QuickCleanRefreshContext(generation: generation, totalCount: entries.count)
+        quickCleanRefreshContext = context
         isRefreshingQuickClean = true
         guard !entries.isEmpty else {
             quickCleanSnapshotByID = [:]
             rebuildQuickCleanRows()
-            finishQuickCleanRefresh(generation: generation)
+            quickCleanRefreshDidComplete(context)
             return
         }
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard !context.isCancelled else {
+                self?.quickCleanRefreshDidComplete(context)
+                return
+            }
+            context.setPhase("正在匹配更新安装包")
             let resolution = QuickCleanInspector.resolveVersionedEntries(
                 entries, whitelistedPaths: whitelist
             )
+            guard !context.isCancelled else {
+                self?.quickCleanRefreshDidComplete(context)
+                return
+            }
             let rebound = zip(entries, resolution.entries).filter { $0.0.path != $0.1.path }
             // 文件与目录状态先发布；模拟器行需要 simctl（登记几十台设备时是秒级），
             // 排在它后面，不拖慢可清理项。
+            context.setPhase("正在核对磁盘占用")
             let snapshots = QuickCleanInspector.snapshots(
                 for: resolution.entries, home: home,
                 simulatorInspector: inspector, notes: resolution.notes,
+                isCancelled: { context.isCancelled },
                 onProgress: { partial in
-                    self?.publishQuickCleanSnapshots(partial, generation: generation)
+                    context.advance(partial.count)
+                    self?.publishQuickCleanSnapshots(partial, context: context)
                 }
             )
-            self?.publishQuickCleanSnapshots(snapshots, generation: generation)
+            guard !context.isCancelled else {
+                self?.quickCleanRefreshDidComplete(context)
+                return
+            }
+            self?.publishQuickCleanSnapshots(snapshots, context: context)
             if !rebound.isEmpty {
                 self?.applyQuickCleanRebound(
-                    resolution.entries, reboundCount: rebound.count, generation: generation
+                    resolution.entries, reboundCount: rebound.count, context: context
                 )
             }
-            self?.finishQuickCleanRefresh(generation: generation)
+            self?.quickCleanRefreshDidComplete(context)
+        }
+    }
+
+    private func quickCleanRefreshDidComplete(_ context: QuickCleanRefreshContext) {
+        DispatchQueue.main.async {
+            guard context.generation == self.quickCleanRefreshGeneration else { return }
+            context.finish()
+            if self.quickCleanRefreshContext === context {
+                self.quickCleanRefreshContext = nil
+            }
+            if self.quickCleanRefreshQueued {
+                self.quickCleanRefreshQueued = false
+                self.startQuickCleanRefresh()
+            } else {
+                self.lastQuickCleanRefresh = Date()
+                self.isRefreshingQuickClean = false
+            }
         }
     }
 
     private func publishQuickCleanSnapshots(
-        _ snapshots: [QuickCleanSnapshot], generation: Int
+        _ snapshots: [QuickCleanSnapshot], context: QuickCleanRefreshContext
     ) {
         DispatchQueue.main.async {
-            guard generation == self.quickCleanRefreshGeneration else { return }
+            guard context.generation == self.quickCleanRefreshGeneration,
+                  !context.isCancelled else { return }
             self.mergeQuickCleanSnapshots(snapshots)
         }
     }
 
     private func applyQuickCleanRebound(
-        _ entries: [QuickCleanEntry], reboundCount: Int, generation: Int
+        _ entries: [QuickCleanEntry], reboundCount: Int, context: QuickCleanRefreshContext
     ) {
         DispatchQueue.main.async {
-            guard generation == self.quickCleanRefreshGeneration else { return }
+            guard context.generation == self.quickCleanRefreshGeneration,
+                  !context.isCancelled else { return }
             self.replaceQuickCleanEntries(QuickCleanRegistry.normalized(entries), persist: true)
             self.rebuildItems()
             self.showTransientNotice(reboundCount == 1
                 ? "常用清理已匹配更新安装包的新版本"
                 : "常用清理已匹配 \(reboundCount) 个更新安装包的新版本")
-        }
-    }
-
-    private func finishQuickCleanRefresh(generation: Int) {
-        DispatchQueue.main.async {
-            guard generation == self.quickCleanRefreshGeneration else { return }
-            self.lastQuickCleanRefresh = Date()
-            self.isRefreshingQuickClean = false
         }
     }
 
@@ -3225,11 +3358,14 @@ final class DevSweepStore: ObservableObject {
                 self.applyQuickCleanCleanupResult(report)
                 if report.failures.isEmpty {
                     let removedSize = report.removed.reduce(0) { $0 + $1.size }
+                    let incompleteSize = report.removed.filter { $0.sizeWarning != nil }.count
+                    let sizeText = (incompleteSize > 0 ? "≥ " : "") + removedSize.devSweepFileSize
+                        + (incompleteSize > 0 ? "（\(incompleteSize) 项未完整测量）" : "")
                     self.statusMessage = report.removed.isEmpty
                         ? "没有需要清理的常用项目"
-                        : "已清理 \(report.removed.count) 个常用项目，共 \(removedSize.devSweepFileSize)，文件可从废纸篓恢复"
+                        : "已把 \(report.removed.count) 个常用项目移入废纸篓，统计占用 \(sizeText)，文件可恢复"
                     if !report.removed.isEmpty {
-                        self.showTransientNotice("已清理 \(report.removed.count) 项，共 \(removedSize.devSweepFileSize)")
+                        self.showTransientNotice("已移入废纸篓 \(report.removed.count) 项，统计占用 \(sizeText)")
                     }
                 } else {
                     let details = report.failures.map { "\($0.0.name)：\($0.1)" }.joined(separator: "\n")

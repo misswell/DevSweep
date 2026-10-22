@@ -44,6 +44,25 @@ enum StorageMeasurementService {
     private static let duURL = URL(fileURLWithPath: "/usr/bin/du")
     static let defaultTimeout: TimeInterval = 30
 
+    private static let metricsLock = NSLock()
+    private static var duInvocationCountValue = 0
+    /// 测量服务启动的 du 进程数；用于验证批量路径不会再逐项起进程。
+    static var duInvocationCount: Int {
+        metricsLock.lock()
+        defer { metricsLock.unlock() }
+        return duInvocationCountValue
+    }
+    static func resetDuInvocationCount() {
+        metricsLock.lock()
+        duInvocationCountValue = 0
+        metricsLock.unlock()
+    }
+    private static func recordDuInvocation() {
+        metricsLock.lock()
+        duInvocationCountValue += 1
+        metricsLock.unlock()
+    }
+
     static func measure(_ url: URL, timeout: TimeInterval = defaultTimeout) -> StorageMeasurement {
         let standardized = url.standardizedFileURL
         guard FileManager.default.fileExists(atPath: standardized.path) else {
@@ -57,6 +76,7 @@ enum StorageMeasurementService {
             ))?.fileAllocatedSize)
         }
 
+        recordDuInvocation()
         guard let result = ProcessRunner.run(
             executable: duURL,
             arguments: ["-sk", standardized.path],
@@ -98,6 +118,19 @@ enum StorageMeasurementService {
 
     /// 一次 `du` 调用测量多个目录。macOS 的 du 会在同一次调用的参数之间对硬链接去重。
     static func measure(_ urls: [URL], timeout: TimeInterval = defaultTimeout) -> [String: StorageMeasurement] {
+        measureAll(urls, timeout: timeout)
+    }
+
+    /// 目录集合的统一测量入口：只要有参数预算，就只起一个 `du` 进程，
+    /// 让整个集合共享硬链接去重状态，而不是拆成互不相干的批次。
+    /// `onMeasurement` 在读取到每个目录的输出时立即回调，便于界面增量发布；
+    /// 进程结束后返回的字典才是经过错误归属校正的最终结果。
+    static func measureAll(
+        _ urls: [URL],
+        timeout: TimeInterval = defaultTimeout,
+        isCancelled: () -> Bool = { false },
+        onMeasurement: ((String, StorageMeasurement) -> Void)? = nil
+    ) -> [String: StorageMeasurement] {
         let standardized = urls.map(\.standardizedFileURL)
         guard !standardized.isEmpty else { return [:] }
 
@@ -116,19 +149,182 @@ enum StorageMeasurementService {
         }
         guard !pending.isEmpty else { return measurements }
 
-        let result = ProcessRunner.run(
-            executable: duURL,
-            arguments: ["-sk"] + pending.map(\.path),
-            timeout: timeout
-        )
-
-        if let result {
-            measurements.merge(interpretBatch(result, paths: pending.map(\.path))) { _, latest in latest }
-            if result.timedOut { return measurements }
+        let paths = pending.map(\.path)
+        guard fitsArgumentBudget(paths), !isCancelled() else {
+            // 参数超长或已取消：退回共享 inode 集合的枚举，仍然保证一次遍历内的全局去重。
+            let enumerated = measureByEnumeration(pending, isCancelled: isCancelled)
+            for (path, measurement) in enumerated {
+                measurements[path] = measurement
+                onMeasurement?(path, measurement)
+            }
+            return measurements
         }
 
-        for url in pending where measurements[url.path] == nil {
-            measurements[url.path] = measure(url, timeout: timeout)
+        guard let streamed = runDu(paths, timeout: timeout, isCancelled: isCancelled,
+                                   onMeasurement: onMeasurement) else {
+            let enumerated = measureByEnumeration(pending, isCancelled: isCancelled)
+            measurements.merge(enumerated) { _, latest in latest }
+            return measurements
+        }
+        measurements.merge(streamed) { _, latest in latest }
+        return measurements
+    }
+
+    /// 单次 `du` 进程，一边读取输出一边回调每个目录的结果。
+    private static func runDu(
+        _ paths: [String],
+        timeout: TimeInterval,
+        isCancelled: () -> Bool,
+        onMeasurement: ((String, StorageMeasurement) -> Void)?
+    ) -> [String: StorageMeasurement]? {
+        recordDuInvocation()
+        let task = Process()
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        task.executableURL = duURL
+        task.arguments = ["-sk"] + paths
+        task.standardInput = FileHandle.nullDevice
+        task.standardOutput = outputPipe
+        task.standardError = errorPipe
+
+        guard (try? task.run()) != nil else {
+            outputPipe.fileHandleForReading.closeFile()
+            errorPipe.fileHandleForReading.closeFile()
+            return nil
+        }
+
+        let lock = NSLock()
+        var parsed: [String: Int64] = [:]
+        var stderrData = Data()
+        let readGroup = DispatchGroup()
+
+        readGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            var buffer = Data()
+            let handle = outputPipe.fileHandleForReading
+            while true {
+                guard let chunk = try? handle.read(upToCount: 64 * 1024), !chunk.isEmpty else { break }
+                buffer.append(chunk)
+                while let newline = buffer.firstIndex(of: 0x0A) {
+                    let line = buffer[buffer.startIndex..<newline]
+                    buffer.removeSubrange(buffer.startIndex...newline)
+                    guard let (path, bytes) = parseDuLine(line) else { continue }
+                    lock.lock()
+                    parsed[path] = bytes
+                    lock.unlock()
+                    onMeasurement?(path, StorageMeasurement(allocatedBytes: bytes))
+                }
+            }
+            if let (path, bytes) = parseDuLine(buffer) {
+                lock.lock()
+                parsed[path] = bytes
+                lock.unlock()
+                onMeasurement?(path, StorageMeasurement(allocatedBytes: bytes))
+            }
+            readGroup.leave()
+        }
+
+        readGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            lock.lock()
+            stderrData = data
+            lock.unlock()
+            readGroup.leave()
+        }
+
+        let deadline = Date().addingTimeInterval(max(timeout, 0))
+        var cancelled = false
+        var timedOut = false
+        while task.isRunning && Date() < deadline {
+            if isCancelled() {
+                cancelled = true
+                break
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        if task.isRunning {
+            timedOut = !cancelled
+            task.terminate()
+            let terminationDeadline = Date().addingTimeInterval(0.25)
+            while task.isRunning && Date() < terminationDeadline {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+            }
+            if task.isRunning {
+                kill(task.processIdentifier, SIGKILL)
+            }
+        }
+        task.waitUntilExit()
+        readGroup.wait()
+
+        lock.lock()
+        let parsedSnapshot = parsed
+        let stderrSnapshot = stderrData
+        lock.unlock()
+
+        let result = ProcessResult(
+            status: task.terminationStatus,
+            stdout: Data(),
+            stderr: stderrSnapshot,
+            timedOut: timedOut || cancelled
+        )
+        let errors = attributeErrors(result, to: paths)
+        var measurements: [String: StorageMeasurement] = [:]
+        for path in paths {
+            if let bytes = parsedSnapshot[path] {
+                if cancelled {
+                    measurements[path] = StorageMeasurement(
+                        allocatedBytes: bytes, state: .timedOut,
+                        skippedCount: errors.counts[path] ?? 0,
+                        failureReason: "本次刷新已取消"
+                    )
+                } else {
+                    measurements[path] = interpret(
+                        bytes: bytes,
+                        timedOut: timedOut,
+                        errorCount: errors.counts[path] ?? 0,
+                        hasUnattributedError: errors.hasUnattributed
+                    )
+                }
+            } else if timedOut || cancelled {
+                measurements[path] = StorageMeasurement(
+                    allocatedBytes: 0, state: .timedOut,
+                    failureReason: cancelled ? "本次刷新已取消" : "统计超时，未完成全部目录"
+                )
+            } else {
+                measurements[path] = StorageMeasurement(
+                    allocatedBytes: 0, state: .failed,
+                    failureReason: "路径已变化或无法统计"
+                )
+            }
+        }
+        return measurements
+    }
+
+    /// 参数总量必须同时满足字节预算和进程框架的 4096 个 argv 硬上限，
+    /// 并为环境变量和内部参数留出余量。
+    private static func fitsArgumentBudget(_ paths: [String]) -> Bool {
+        let argumentMax = Int(sysconf(_SC_ARG_MAX))
+        guard argumentMax > 0, paths.count <= 4_000 else { return false }
+        let byteCount = paths.reduce(0) { $0 + $1.utf8.count + 1 }
+        return byteCount + 64 * 1024 < argumentMax
+    }
+
+    /// 一次枚举多个目录，共享同一个 inode 集合，避免跨目录硬链接被重复累计。
+    private static func measureByEnumeration(
+        _ urls: [URL],
+        isCancelled: () -> Bool
+    ) -> [String: StorageMeasurement] {
+        var seenInodes = Set<InodeKey>()
+        var measurements: [String: StorageMeasurement] = [:]
+        for url in urls {
+            if isCancelled() {
+                measurements[url.path] = StorageMeasurement(
+                    allocatedBytes: 0, state: .timedOut, failureReason: "本次刷新已取消"
+                )
+                continue
+            }
+            measurements[url.path] = measureByEnumeration(url, seenInodes: &seenInodes, isCancelled: isCancelled)
         }
         return measurements
     }
@@ -265,15 +461,21 @@ enum StorageMeasurementService {
     }
 
     /// `du -sk` 每行是 "<kilobytes>\t<path>"，路径里可能有空格，所以按第一个 tab 切分。
+    private static func parseDuLine(_ data: Data) -> (path: String, bytes: Int64)? {
+        let line = String(decoding: data, as: UTF8.self)
+        guard let tab = line.firstIndex(of: "\t") else { return nil }
+        let sizeField = line[..<tab].trimmingCharacters(in: .whitespaces)
+        let path = String(line[line.index(after: tab)...])
+        guard !path.isEmpty, let kilobytes = Int64(sizeField) else { return nil }
+        return (path, kilobytes * 1024)
+    }
+
     private static func parseDuOutput(_ data: Data) -> [String: Int64] {
         guard let text = String(data: data, encoding: .utf8) else { return [:] }
         var parsed: [String: Int64] = [:]
         for line in text.split(whereSeparator: \.isNewline) {
-            guard let tab = line.firstIndex(of: "\t") else { continue }
-            let sizeField = line[..<tab].trimmingCharacters(in: .whitespaces)
-            let path = String(line[line.index(after: tab)...])
-            guard !path.isEmpty, let kilobytes = Int64(sizeField) else { continue }
-            parsed[path] = kilobytes * 1024
+            guard let entry = parseDuLine(Data(line.utf8)) else { continue }
+            parsed[entry.path] = entry.bytes
         }
         return parsed
     }
@@ -281,9 +483,19 @@ enum StorageMeasurementService {
     /// du 不可用或输出无法解析时的回退。硬链接按 (device, inode) 去重，
     /// 避免同一份磁盘块被多个目录重复累加。
     static func measureByEnumeration(_ url: URL) -> StorageMeasurement {
-        var skippedCount = 0
         var seenInodes = Set<InodeKey>()
+        return measureByEnumeration(url, seenInodes: &seenInodes, isCancelled: { false })
+    }
+
+    /// 多个目录共享同一个 `seenInodes`，跨目录的硬链接也只计一次。
+    private static func measureByEnumeration(
+        _ url: URL,
+        seenInodes: inout Set<InodeKey>,
+        isCancelled: () -> Bool
+    ) -> StorageMeasurement {
+        var skippedCount = 0
         var total: Int64 = 0
+        var cancelled = false
 
         func accumulate(_ path: String) -> Bool {
             var info = stat()
@@ -312,12 +524,24 @@ enum StorageMeasurementService {
             }
         ) {
             for case let child as URL in enumerator {
+                if isCancelled() {
+                    cancelled = true
+                    break
+                }
                 _ = accumulate(child.path)
             }
         } else {
             skippedCount += 1
         }
 
+        if cancelled {
+            return StorageMeasurement(
+                allocatedBytes: total,
+                state: .timedOut,
+                skippedCount: skippedCount,
+                failureReason: "本次刷新已取消"
+            )
+        }
         if skippedCount > 0 {
             return StorageMeasurement(
                 allocatedBytes: total,

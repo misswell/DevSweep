@@ -266,9 +266,13 @@ struct TreemapGrouping: Hashable {
     let emptyCount: Int
     /// 已绘制但只是占用下限的图块数。
     let lowerBoundCount: Int
+    /// 本层全部测量不完整（partial / timedOut / failed）的条目数，包含无法绘制的 0 B 项。
+    let incompleteCount: Int
     /// 本层（含搜索筛选后）条目的分配大小合计；含下限项时它本身也是下限。
     let totalBytes: Int64
     let isLowerBound: Bool
+    /// 本层没有任何可用测量：总量连下限都无从谈起，不能显示成精确的 0 B。
+    let totalIsUnknown: Bool
     /// 已绘制单项图块的 ID，用于判断选中项是否落在「其他」分组里。
     let drawnIDs: Set<String>
 
@@ -282,12 +286,20 @@ struct TreemapGrouping: Hashable {
         var drawable: [Int] = []
         var emptyCount = 0
         var unmeasuredCount = 0
+        var incompleteCount = 0
+        var hasCompleteNode = false
         var totalBytes: Int64 = 0
         var lowerBoundNodeCount = 0
         for index in nodes.indices {
             let node = nodes[index]
+            let isComplete = node.measurement.state == .complete
+            if isComplete {
+                hasCompleteNode = true
+            } else {
+                incompleteCount += 1
+            }
             guard node.measurement.allocatedBytes > 0 else {
-                if node.measurement.state == .complete {
+                if isComplete {
                     emptyCount += 1
                 } else {
                     unmeasuredCount += 1
@@ -298,7 +310,7 @@ struct TreemapGrouping: Hashable {
                 unmeasuredCount += 1
                 continue
             }
-            if node.measurement.state != .complete { lowerBoundNodeCount += 1 }
+            if !isComplete { lowerBoundNodeCount += 1 }
             totalBytes += node.measurement.allocatedBytes
             drawable.append(index)
         }
@@ -315,8 +327,10 @@ struct TreemapGrouping: Hashable {
                 unmeasuredCount: unmeasuredCount,
                 emptyCount: emptyCount,
                 lowerBoundCount: items.filter(\.isLowerBound).count,
+                incompleteCount: incompleteCount,
                 totalBytes: totalBytes,
-                isLowerBound: lowerBoundNodeCount > 0,
+                isLowerBound: incompleteCount > 0,
+                totalIsUnknown: !nodes.isEmpty && !hasCompleteNode && totalBytes == 0,
                 drawnIDs: Set(items.filter { !$0.isOther }.map(\.id))
             )
         }

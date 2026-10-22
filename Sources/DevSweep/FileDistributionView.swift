@@ -125,7 +125,7 @@ struct FileDistributionPanel: View {
 
             if grouping.isLowerBound {
                 Label(
-                    "含 \(grouping.lowerBoundCount) 项统计不完整，面积与角度只是已测量下限，不代表真实占比",
+                    "含 \(grouping.incompleteCount) 项统计不完整，面积与角度只是已测量下限，不代表真实占比",
                     systemImage: "exclamationmark.triangle.fill"
                 )
                 .font(.caption)
@@ -161,7 +161,9 @@ struct FileDistributionPanel: View {
     }
 
     private var totalText: some View {
-        Text("\(snapshot.matchedCount) 项 · \(grouping.isLowerBound ? "≥ " : "")\(grouping.totalBytes.devSweepFileSize)")
+        Text(grouping.totalIsUnknown
+             ? "\(snapshot.matchedCount) 项 · 无法确定总占用"
+             : "\(snapshot.matchedCount) 项 · \(grouping.isLowerBound ? "≥ " : "")\(grouping.totalBytes.devSweepFileSize)")
             .font(.caption)
             .foregroundStyle(grouping.isLowerBound ? Color.orange : Color.secondary)
             .monospacedDigit()
@@ -272,7 +274,11 @@ struct FileDistributionPanel: View {
                 .font(.system(size: 28))
                 .foregroundStyle(.secondary)
             Text(DiscoverySearch.trimmedQuery(searchText).isEmpty
-                 ? "本层没有可绘制的占用数据"
+                 ? (grouping.totalIsUnknown
+                    ? "本层项目均无法统计占用"
+                    : (grouping.emptyCount > 0 && grouping.unmeasuredCount == 0
+                       ? "本层项目均无占用（0 B）"
+                       : "本层没有可绘制的占用数据"))
                  : "没有匹配搜索的条目")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -295,7 +301,7 @@ struct FileDistributionPanel: View {
                 if let rollupNote = rollup?.note, typeScope == .recursive {
                     Text(rollupNote)
                         .font(.caption)
-                        .foregroundStyle(rollup?.isLowerBound == true ? Color.orange : Color.secondary)
+                        .foregroundStyle(rollup?.state == .complete ? Color.secondary : Color.orange)
                         .lineLimit(1)
                 }
                 Spacer()
@@ -800,7 +806,9 @@ private struct DistributionDetailPanel: View {
                 .font(.caption)
             LabeledContent(
                 "分配大小",
-                value: (grouping.isLowerBound ? "≥ " : "") + grouping.totalBytes.devSweepFileSize
+                value: grouping.totalIsUnknown
+                    ? "无法确定"
+                    : (grouping.isLowerBound ? "≥ " : "") + grouping.totalBytes.devSweepFileSize
             )
             .font(.caption)
             if grouping.emptyCount > 0 {

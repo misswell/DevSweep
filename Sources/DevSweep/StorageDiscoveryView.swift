@@ -87,13 +87,15 @@ final class StorageDiscoveryStore: ObservableObject {
     }
 
     /// 标识「同一份扫描结果 + 同一组忽略项」，用作派生数据的缓存键。
+    /// 忽略集合必须按完整内容比较：只记录元素个数时，一次同时增删会错误命中旧缓存。
     var graphKey: String {
         guard let report else { return "none" }
         return [
             report.directory.standardizedFileURL.path,
             String(report.scannedAt.timeIntervalSince1970),
+            report.filterSignature,
             String(report.allNodes.count),
-            String(ignoredPaths.count)
+            ignoredPaths.sorted().joined(separator: ",")
         ].joined(separator: "|")
     }
 

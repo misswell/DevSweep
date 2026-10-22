@@ -81,6 +81,44 @@ final class FileTypeRollupTests: XCTestCase {
         XCTAssertTrue(rollup.isComplete)
     }
 
+    /// 包目录内部文件与外部硬链接必须共用同一份 inode 去重。
+    func testRollupDeduplicatesHardLinkBetweenPackageAndOutside() throws {
+        let root = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: root) }
+        let inside = root.appendingPathComponent("Foo.app/Contents/data.bin")
+        try write(300_000, to: inside)
+        try fileManager.linkItem(at: inside, to: root.appendingPathComponent("outside.bin"))
+
+        let rollup = FileTypeRollupScanner.scan(root: root)
+
+        XCTAssertEqual(rollup.packageCount, 1)
+        XCTAssertGreaterThan(rollup.totalBytes, 250_000)
+        XCTAssertLessThan(rollup.totalBytes, 500_000, "同一份磁盘块不能按包内、包外各计一次")
+        XCTAssertTrue(rollup.isComplete)
+        XCTAssertEqual(rollup.state, .complete)
+    }
+
+    /// 取消和跨卷都必须反映在汇总状态里，不能只改提示文字。
+    func testRollupStateMatchesCompleteness() {
+        let emptyCancelled = FileTypeRollup(
+            summaries: [], fileCount: 0, directoryCount: 0, packageCount: 0,
+            symlinkCount: 0, crossVolumeCount: 0, unreadableCount: 0,
+            scannedEntries: 0, isComplete: false, limitReached: false, duration: 0
+        )
+        XCTAssertEqual(emptyCancelled.state, .unknown)
+        XCTAssertTrue(emptyCancelled.isLowerBound)
+
+        let crossVolume = FileTypeRollup(
+            summaries: [FileTypeSummary(category: .source, allocatedBytes: 1_000, itemCount: 1)],
+            fileCount: 1, directoryCount: 0, packageCount: 0,
+            symlinkCount: 0, crossVolumeCount: 2, unreadableCount: 0,
+            scannedEntries: 1, isComplete: false, limitReached: false, duration: 0
+        )
+        XCTAssertEqual(crossVolume.state, .lowerBound)
+        XCTAssertTrue(crossVolume.isLowerBound)
+        XCTAssertTrue(crossVolume.note.contains("跨卷"), crossVolume.note)
+    }
+
     func testRollupMarksUnfinishedScanAsLowerBound() throws {
         let root = try temporaryDirectory()
         defer { try? fileManager.removeItem(at: root) }
