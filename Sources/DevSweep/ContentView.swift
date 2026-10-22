@@ -1107,26 +1107,31 @@ private struct QuickCleanPageView: View {
             QuickCleanHeaderCard(
                 cleanableCount: store.cleanableQuickCleanSnapshots.count,
                 cleanableSize: store.quickCleanSize,
-                isBusy: store.isCleaning || store.isScanning || store.isRefreshingQuickClean,
+                isCleaning: store.isCleaning,
+                isRefreshing: store.isRefreshingQuickClean,
+                sort: Binding(
+                    get: { store.quickCleanSort },
+                    set: { store.setQuickCleanSort($0) }
+                ),
                 onCleanAll: { store.cleanAllQuickClean() },
-                onRefresh: { store.refreshQuickCleanSnapshots() }
+                onRefresh: { store.refreshQuickCleanSnapshots(force: true) }
             )
 
             if store.quickCleanEntries.isEmpty {
                 QuickCleanEmptyView()
             } else {
-                VStack(spacing: 10) {
-                    ForEach(store.quickCleanEntries) { entry in
+                // 常用条目动辄上百个：必须懒加载，且不能要求先完成普通扫描。
+                LazyVStack(spacing: 10) {
+                    ForEach(store.quickCleanRows) { row in
                         QuickCleanEntryRow(
-                            entry: entry,
-                            snapshot: store.quickCleanSnapshots.first { $0.id == entry.id },
+                            row: row,
                             onClean: {
-                                if entry.isSimulator {
-                                    pendingSimulator = entry
-                                    pendingIdentity = store.quickCleanSnapshots.first { $0.id == entry.id }?.fileIdentity
+                                if row.entry.isSimulator {
+                                    pendingSimulator = row.entry
+                                    pendingIdentity = row.snapshot?.fileIdentity
                                     showingSimulatorConfirmation = pendingIdentity != nil
                                 } else {
-                                    store.cleanQuickClean([entry])
+                                    store.cleanQuickClean([row.entry])
                                 }
                             }
                         )
@@ -1158,47 +1163,70 @@ private struct QuickCleanPageView: View {
 private struct QuickCleanHeaderCard: View {
     let cleanableCount: Int
     let cleanableSize: Int64
-    let isBusy: Bool
+    let isCleaning: Bool
+    let isRefreshing: Bool
+    @Binding var sort: QuickCleanSort
     let onCleanAll: () -> Void
     let onRefresh: () -> Void
 
     var body: some View {
-        HStack(spacing: 14) {
-            Image(systemName: "bolt.fill")
-                .font(.title3)
-                .foregroundStyle(.tint)
-                .frame(width: 34, height: 34)
-                .background(Color.accentColor.opacity(0.12))
-                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
-            VStack(alignment: .leading, spacing: 3) {
-                Text("常用项目，按类型安全处理")
-                    .font(.subheadline.weight(.semibold))
-                Text("一键清理仅处理缓存、Rust 编译输出和更新安装包，可从废纸篓恢复；更新安装包升级后会自动匹配同一更新目录的新版本。模拟器逐项确认删除；系统缓存手动处理。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer(minLength: 12)
-            VStack(alignment: .trailing, spacing: 2) {
-                Text("可一键清理")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Text("\(cleanableCount) 项 · \(cleanableSize.devSweepFileSize)")
-                    .font(.subheadline.monospacedDigit().weight(.semibold))
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 14) {
+                Image(systemName: "bolt.fill")
+                    .font(.title3)
                     .foregroundStyle(.tint)
+                    .frame(width: 34, height: 34)
+                    .background(Color.accentColor.opacity(0.12))
+                    .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("常用项目，按类型安全处理")
+                        .font(.subheadline.weight(.semibold))
+                    Text("一键清理仅处理缓存、Rust 编译输出和更新安装包，可从废纸篓恢复；更新安装包升级后会自动匹配同一更新目录的新版本。模拟器逐项确认删除；系统缓存手动处理。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 12)
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text("可一键清理")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Text("\(cleanableCount) 项 · \(cleanableSize.devSweepFileSize)")
+                        .font(.subheadline.monospacedDigit().weight(.semibold))
+                        .foregroundStyle(.tint)
+                }
+                Button {
+                    onCleanAll()
+                } label: {
+                    Label("一键清理缓存", systemImage: "bolt.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                // 刷新只是核对磁盘占用；清理自己会重新核验，不必等刷新完。
+                .disabled(cleanableCount == 0 || isCleaning)
+                .help("仅清理长期授权的普通缓存和更新安装包，不处理模拟器设备或手动项目")
+                Button(action: onRefresh) {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .disabled(isRefreshing)
+                .help("重新核对常用项目的磁盘占用和模拟器状态")
             }
-            Button {
-                onCleanAll()
-            } label: {
-                Label("一键清理缓存", systemImage: "bolt.fill")
+            HStack(spacing: 8) {
+                Picker("排序", selection: $sort) {
+                    ForEach(QuickCleanSort.allCases) { option in
+                        Text(option.title).tag(option)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .fixedSize()
+                if isRefreshing {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("正在核对磁盘占用…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(cleanableCount == 0 || isBusy)
-            .help("仅清理长期授权的普通缓存和更新安装包，不处理模拟器设备或手动项目")
-            Button(action: onRefresh) {
-                Image(systemName: "arrow.clockwise")
-            }
-            .disabled(isBusy)
-            .help("刷新常用项目和模拟器状态")
         }
         .padding(16)
         .background(.background)
@@ -1212,9 +1240,11 @@ private struct QuickCleanHeaderCard: View {
 
 private struct QuickCleanEntryRow: View {
     @EnvironmentObject private var store: DevSweepStore
-    let entry: QuickCleanEntry
-    let snapshot: QuickCleanSnapshot?
+    let row: QuickCleanRow
     let onClean: () -> Void
+
+    private var entry: QuickCleanEntry { row.entry }
+    private var snapshot: QuickCleanSnapshot? { row.snapshot }
 
     private var pathURL: URL {
         URL(fileURLWithPath: entry.path)
@@ -1320,7 +1350,8 @@ private struct QuickCleanEntryRow: View {
 
     private var canClean: Bool {
         guard let snapshot, snapshot.canClean else { return false }
-        return !store.isScanning && !store.isCleaning && !store.isRefreshingQuickClean
+        // 只看是否真的正在删除；核对磁盘占用和普通扫描都不该锁住常用清理。
+        return !store.isCleaning
     }
 
     private var statusText: String {

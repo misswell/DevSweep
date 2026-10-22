@@ -444,17 +444,41 @@ struct QuickCleanEntry: Codable, Hashable, Identifiable {
 }
 
 /// 某一时刻磁盘上的实际状态，与长期保存的 `QuickCleanEntry` 分开维护。
-struct QuickCleanSnapshot: Identifiable {
+struct QuickCleanSnapshot: Identifiable, Equatable {
     let entry: QuickCleanEntry
     let exists: Bool
     let size: Int64
     let fileIdentity: FileIdentity?
     var protection: String? = nil
-    /// 版本匹配过程中的提示，例如同一更新目录出现多个新版本安装包。
+    /// 版本匹配过程中的提示，例如同一更新目录出现多个新版本安装包；
+    /// 占用没能量完时这里是「至少占用」说明。
     var note: String? = nil
 
     var id: String { entry.id }
     var canClean: Bool { exists && fileIdentity != nil && protection == nil && !entry.isManual }
+}
+
+/// 常用清理列表的排序方式。
+enum QuickCleanSort: String, CaseIterable, Codable, Identifiable {
+    case size
+    case dateAdded
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .size: return "按占用大小"
+        case .dateAdded: return "按加入时间"
+        }
+    }
+}
+
+/// 一行常用清理：长期授权条目加上它当前的磁盘状态；状态为空表示还没量过。
+struct QuickCleanRow: Identifiable, Equatable {
+    let entry: QuickCleanEntry
+    let snapshot: QuickCleanSnapshot?
+
+    var id: String { entry.id }
 }
 
 enum QuickCleanRegistry {

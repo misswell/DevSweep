@@ -149,65 +149,149 @@ enum QuickCleanInspector {
         snapshots(for: [entry]).first!
     }
 
+    /// 一次刷新的磁盘预算：目录占用按 16 个路径交给同一次 `du`，
+    /// 单个文件走属性读取，不起进程。
+    private static let measurementChunkSize = 16
+    private static let measurementTimeout: TimeInterval = 60
+
     private static func automaticSnapshot(
-        for entry: QuickCleanEntry, note: String? = nil
+        for entry: QuickCleanEntry,
+        identity: FileIdentity,
+        measurement: StorageMeasurement
     ) -> QuickCleanSnapshot {
-        let url = URL(fileURLWithPath: entry.path)
-        let identity = validatedIdentity(for: entry)
-        guard let identity else {
-            // 不存在、符号链接或授权类型不匹配的目标均不可清理。
-            return QuickCleanSnapshot(entry: entry, exists: false, size: 0, fileIdentity: nil, note: note)
-        }
-        let size = CacheScanner.size(of: url)
-        return QuickCleanSnapshot(entry: entry, exists: true, size: size, fileIdentity: identity)
+        QuickCleanSnapshot(
+            entry: entry,
+            exists: true,
+            size: measurement.allocatedBytes,
+            fileIdentity: identity,
+            note: measurement.warning
+        )
     }
 
+    /// 不存在、符号链接或授权类型不匹配的目标一律不可清理。
+    private static func invalidAutomaticSnapshot(
+        for entry: QuickCleanEntry, note: String? = nil
+    ) -> QuickCleanSnapshot {
+        QuickCleanSnapshot(entry: entry, exists: false, size: 0, fileIdentity: nil, note: note)
+    }
+
+    private static func fileMeasurement(for url: URL) -> StorageMeasurement {
+        StorageMeasurementService.measureFile(
+            url, allocatedSize: (try? url.resourceValues(forKeys: [.fileAllocatedSizeKey]))?.fileAllocatedSize
+        )
+    }
+
+    private static func simulatorState(
+        for entries: [QuickCleanEntry],
+        inspector: SimulatorCleanupInspecting
+    ) -> (devices: [SimulatorCleanupDevice], protection: String?) {
+        guard entries.contains(where: \.isSimulator) else { return ([], nil) }
+        // One targeted simctl/ps lookup, never a whole-machine cache scan.
+        do {
+            return (try inspector.devices(), try inspector.activityProtection())
+        } catch {
+            return ([], error.localizedDescription)
+        }
+    }
+
+    private static func guardedSnapshot(
+        for entry: QuickCleanEntry,
+        home: URL,
+        devices: [SimulatorCleanupDevice],
+        activityProtection: String?
+    ) -> QuickCleanSnapshot {
+        let url = URL(fileURLWithPath: entry.path)
+        let identity = FileIdentity.capture(url)
+        let exists = identity?.kind == .directory
+        var protection: String?
+        if entry.isManual {
+            protection = "请先退出 Xcode 和所有模拟器，再按管理员权限手动处理"
+        } else if !SimulatorCleanupExecutor.matches(path: url, udid: entry.identifier, home: home)
+                    || url.resolvingSymlinksInPath().path != url.standardizedFileURL.path {
+            protection = SimulatorCleanupError.invalidTarget.localizedDescription
+        } else if let device = devices.first(where: { $0.udid == entry.identifier }) {
+            if device.state != "Shutdown" {
+                protection = SimulatorCleanupError.active.localizedDescription
+            } else if let dataPath = device.dataPath,
+                      URL(fileURLWithPath: dataPath).standardizedFileURL.path != url.appendingPathComponent("data").standardizedFileURL.path {
+                protection = SimulatorCleanupError.invalidTarget.localizedDescription
+            } else {
+                protection = activityProtection
+            }
+        } else {
+            protection = activityProtection ?? SimulatorCleanupError.missing.localizedDescription
+        }
+        return QuickCleanSnapshot(
+            entry: entry, exists: exists, size: exists ? CacheScanner.size(of: url) : 0,
+            fileIdentity: entry.isSimulator && exists ? identity : nil,
+            protection: protection
+        )
+    }
+
+    /// 刷新磁盘快照：存在性、FileIdentity、大小全部重新读取，绝不调用完整 CacheScanner。
+    ///
+    /// 目录占用合并成少量 `du` 调用，并按批次通过 `onProgress` 交给界面：上百个常用
+    /// 条目过去要串行起上百个进程、跑完才一次性发布，页面只能全程显示「检查中…」
+    /// 并禁用清理按钮。模拟器状态需要 `simctl`，放在文件快照之后，不拖慢可清理项。
+    /// 同一次 `du` 会在参数之间对硬链接去重，因此各行相加等于真正可回收的总量。
     static func snapshots(
         for entries: [QuickCleanEntry],
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         simulatorInspector: SimulatorCleanupInspecting = SimulatorCleanupExecutor(),
-        notes: [String: String] = [:]
+        notes: [String: String] = [:],
+        onProgress: (([QuickCleanSnapshot]) -> Void)? = nil
     ) -> [QuickCleanSnapshot] {
-        // One targeted simctl/ps lookup, never a whole-machine cache scan.
-        var devices: [SimulatorCleanupDevice] = []
-        var activityProtection: String?
-        if entries.contains(where: \.isSimulator) {
-            do {
-                devices = try simulatorInspector.devices()
-                activityProtection = try simulatorInspector.activityProtection()
-            } catch { activityProtection = error.localizedDescription }
-        }
-        return entries.map { entry in
-            guard !entry.isAutomatic else {
-                return automaticSnapshot(for: entry, note: notes[entry.id])
+        // 按索引而不是按 id 收集：结果必须与传入条目一一对应、顺序一致。
+        var slots = [QuickCleanSnapshot?](repeating: nil, count: entries.count)
+        var directorySlots: [(index: Int, entry: QuickCleanEntry, url: URL, identity: FileIdentity)] = []
+
+        for (index, entry) in entries.enumerated() where entry.isAutomatic {
+            guard let identity = validatedIdentity(for: entry) else {
+                slots[index] = invalidAutomaticSnapshot(for: entry, note: notes[entry.id])
+                continue
             }
             let url = URL(fileURLWithPath: entry.path)
-            let identity = FileIdentity.capture(url)
-            let exists = identity?.kind == .directory
-            var protection: String?
-            if entry.isManual {
-                protection = "请先退出 Xcode 和所有模拟器，再按管理员权限手动处理"
-            } else if !SimulatorCleanupExecutor.matches(path: url, udid: entry.identifier, home: home)
-                        || url.resolvingSymlinksInPath().path != url.standardizedFileURL.path {
-                protection = SimulatorCleanupError.invalidTarget.localizedDescription
-            } else if let device = devices.first(where: { $0.udid == entry.identifier }) {
-                if device.state != "Shutdown" {
-                    protection = SimulatorCleanupError.active.localizedDescription
-                } else if let dataPath = device.dataPath,
-                          URL(fileURLWithPath: dataPath).standardizedFileURL.path != url.appendingPathComponent("data").standardizedFileURL.path {
-                    protection = SimulatorCleanupError.invalidTarget.localizedDescription
-                } else {
-                    protection = activityProtection
-                }
+            if identity.kind == .regular {
+                slots[index] = automaticSnapshot(
+                    for: entry, identity: identity, measurement: fileMeasurement(for: url)
+                )
             } else {
-                protection = activityProtection ?? SimulatorCleanupError.missing.localizedDescription
+                directorySlots.append((index, entry, url, identity))
             }
-            return QuickCleanSnapshot(
-                entry: entry, exists: exists, size: exists ? CacheScanner.size(of: url) : 0,
-                fileIdentity: entry.isSimulator && exists ? identity : nil,
-                protection: protection
+        }
+
+        for start in stride(from: 0, to: directorySlots.count, by: measurementChunkSize) {
+            let chunk = Array(directorySlots[start..<min(start + measurementChunkSize, directorySlots.count)])
+            let measurements = StorageMeasurementService.measure(
+                chunk.map(\.url), timeout: measurementTimeout
+            )
+            for item in chunk {
+                // 校验后目录可能刚好消失；du 对它没有输出，按失败的 0 占用处理。
+                let fallback = StorageMeasurement(allocatedBytes: 0, state: .failed)
+                slots[item.index] = automaticSnapshot(
+                    for: item.entry,
+                    identity: item.identity,
+                    measurement: measurements[item.entry.id] ?? fallback
+                )
+            }
+            onProgress?(slots.compactMap { $0 })
+        }
+        // 没有目录时上面的循环不会发布；文件与失效条目也要立刻可见。
+        if directorySlots.isEmpty {
+            onProgress?(slots.compactMap { $0 })
+        }
+
+        let guarded = entries.enumerated().filter { !$0.element.isAutomatic }
+        guard !guarded.isEmpty else { return slots.compactMap { $0 } }
+        let guardedEntries = guarded.map(\.element)
+        let state = simulatorState(for: guardedEntries, inspector: simulatorInspector)
+        for item in guarded {
+            slots[item.offset] = guardedSnapshot(
+                for: item.element, home: home,
+                devices: state.devices, activityProtection: state.protection
             )
         }
+        return slots.compactMap { $0 }
     }
 
     /// 为一键清理重新生成执行用的 CacheItem。expectedFileIdentity 必须是执行前

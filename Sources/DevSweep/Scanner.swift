@@ -2594,6 +2594,7 @@ final class DevSweepStore: ObservableObject {
     private static let selectionStatesKey = "DevSweep.selectionStates"
     private static let whitelistedPathsKey = "DevSweep.whitelistedPaths"
     private static let quickCleanEntriesKey = "DevSweep.quickCleanEntries"
+    private static let quickCleanSortKey = "DevSweep.quickCleanSort"
 
     @Published private(set) var items: [CacheItem] = []
     @Published private(set) var isScanning = false
@@ -2605,8 +2606,9 @@ final class DevSweepStore: ObservableObject {
     @Published private(set) var cleanupGeneration = 0
     @Published private(set) var scanProgress = ScanProgress()
     @Published private(set) var quickCleanEntries: [QuickCleanEntry] = []
-    @Published private(set) var quickCleanSnapshots: [QuickCleanSnapshot] = []
+    @Published private(set) var quickCleanRows: [QuickCleanRow] = []
     @Published private(set) var isRefreshingQuickClean = false
+    @Published private(set) var quickCleanSort: QuickCleanSort
     @Published private(set) var transientNotice: TransientNotice?
     @Published var projectRoots: [URL]
     @Published private(set) var whitelistedPaths: [URL]
@@ -2622,6 +2624,16 @@ final class DevSweepStore: ObservableObject {
     private let simulatorExecutor: SimulatorCleanupExecuting
     private var transientNoticeTask: Task<Void, Never>?
     private var quickCleanRefreshGeneration = 0
+    /// 最近一次量到的磁盘状态；刷新时逐条覆盖，页面因此不会退回「检查中…」。
+    private var quickCleanSnapshotByID: [String: QuickCleanSnapshot] = [:]
+    private var lastQuickCleanRefresh: Date?
+    /// 扫描进行中由常用清理删掉的路径。扫描在自己的遍历里不认识这次删除，
+    /// 结果套用时需要把这些还带着旧状态的条目剔除。
+    private var pathsCleanedDuringScan: Set<String> = []
+
+    /// 页面进入时的刷新节流：上百个条目重新量一次要遍历真实目录树，
+    /// 反复切换侧边栏不应该每次都付这个代价。
+    static let quickCleanRefreshInterval: TimeInterval = 15
 
     init(
         defaults: UserDefaults = .standard,
@@ -2653,6 +2665,13 @@ final class DevSweepStore: ObservableObject {
            let savedEntries = try? JSONDecoder().decode([QuickCleanEntry].self, from: data) {
             quickCleanEntries = QuickCleanRegistry.normalized(savedEntries)
         }
+        if let saved = defaults.string(forKey: Self.quickCleanSortKey),
+           let sort = QuickCleanSort(rawValue: saved) {
+            quickCleanSort = sort
+        } else {
+            quickCleanSort = .size
+        }
+        rebuildQuickCleanRows()
     }
 
     var categories: [String] {
@@ -2682,17 +2701,66 @@ final class DevSweepStore: ObservableObject {
 
     /// 常用清理中当前真实存在、可一键清理的条目。
     var cleanableQuickCleanSnapshots: [QuickCleanSnapshot] {
-        quickCleanSnapshots.filter { $0.entry.isAutomatic && $0.canClean }
+        quickCleanSnapshotByID.values.filter { $0.entry.isAutomatic && $0.canClean }
     }
 
     var quickCleanSize: Int64 {
         cleanableQuickCleanSnapshots.reduce(0) { $0 + $1.size }
     }
 
+    func setQuickCleanSort(_ sort: QuickCleanSort) {
+        guard sort != quickCleanSort else { return }
+        quickCleanSort = sort
+        defaults.set(sort.rawValue, forKey: Self.quickCleanSortKey)
+        rebuildQuickCleanRows()
+    }
+
+    /// 条目顺序完全由排序方式决定，不再依赖 QuickCleanRegistry 的路径长度顺序。
+    /// 没量过的行排在最后，避免刷新途中整列表反复跳动。
+    private func rebuildQuickCleanRows() {
+        let snapshotByID = quickCleanSnapshotByID
+        let rows = quickCleanEntries.map {
+            QuickCleanRow(entry: $0, snapshot: snapshotByID[$0.id])
+        }
+        switch quickCleanSort {
+        case .dateAdded:
+            quickCleanRows = rows.sorted {
+                if $0.entry.dateAdded != $1.entry.dateAdded { return $0.entry.dateAdded > $1.entry.dateAdded }
+                return $0.id < $1.id
+            }
+        case .size:
+            quickCleanRows = rows.sorted {
+                let lhs = $0.snapshot?.size ?? -1
+                let rhs = $1.snapshot?.size ?? -1
+                if lhs != rhs { return lhs > rhs }
+                if $0.entry.dateAdded != $1.entry.dateAdded { return $0.entry.dateAdded > $1.entry.dateAdded }
+                return $0.id < $1.id
+            }
+        }
+    }
+
+    private func mergeQuickCleanSnapshots(_ snapshots: [QuickCleanSnapshot]) {
+        guard !snapshots.isEmpty else { return }
+        for snapshot in snapshots {
+            quickCleanSnapshotByID[snapshot.id] = snapshot
+        }
+        rebuildQuickCleanRows()
+    }
+
+    /// 条目集合变化是唯一需要清理陈旧快照的地方：路径重新绑定后旧 id 不会再出现。
+    private func replaceQuickCleanEntries(_ entries: [QuickCleanEntry], persist: Bool) {
+        quickCleanEntries = entries
+        let valid = Set(entries.map(\.id))
+        quickCleanSnapshotByID = quickCleanSnapshotByID.filter { valid.contains($0.key) }
+        if persist { persistQuickCleanEntries() }
+        rebuildQuickCleanRows()
+    }
+
     func scan() {
         guard !isScanning, !isCleaning else { return }
         isScanning = true
         lastError = nil
+        pathsCleanedDuringScan = []
         // 重新扫描期间保留上一次的结果，避免界面闪空；新报告完成后一次性替换。
         scanProgress = ScanProgress(phase: "准备扫描")
         statusMessage = rawScanItems.isEmpty ? "正在扫描开发者缓存…" : "重新扫描中…"
@@ -2721,7 +2789,11 @@ final class DevSweepStore: ObservableObject {
 
     /// 安装一次新的扫描结果并按用户规则重建列表；也是测试注入原始结果的入口。
     func applyScanResult(_ report: ScanReport) {
-        rawScanItems = report.items
+        let cleanedDuringScan = pathsCleanedDuringScan
+        pathsCleanedDuringScan = []
+        rawScanItems = report.items.filter {
+            !cleanedDuringScan.contains(QuickCleanRegistry.key(for: $0.path))
+        }
         lastReport = report
         rebuildItems()
         scanProgress = ScanProgress(
@@ -2732,7 +2804,7 @@ final class DevSweepStore: ObservableObject {
             permissionFailures: report.permissionFailures
         )
         if !quickCleanEntries.isEmpty {
-            refreshQuickCleanSnapshots()
+            refreshQuickCleanSnapshots(force: true)
         }
     }
 
@@ -2836,13 +2908,12 @@ final class DevSweepStore: ObservableObject {
             }
         }
         if hadConflicts {
-            quickCleanEntries = QuickCleanRegistry.normalized(quickCleanEntries.filter { entry in
+            replaceQuickCleanEntries(QuickCleanRegistry.normalized(quickCleanEntries.filter { entry in
                 !conflictKeys.contains { conflict in
                     entry.id == conflict || conflict.hasPrefix(entry.id + "/") || entry.id.hasPrefix(conflict + "/")
                 }
-            })
-            persistQuickCleanEntries()
-            refreshQuickCleanSnapshots()
+            }), persist: true)
+            refreshQuickCleanSnapshots(force: true)
         }
 
         rebuildItems()
@@ -2908,9 +2979,10 @@ final class DevSweepStore: ObservableObject {
             showTransientNotice("没有可加入常用清理的项目", icon: "exclamationmark.circle.fill")
             return (0, rejected)
         }
-        quickCleanEntries = QuickCleanRegistry.normalized(quickCleanEntries + newEntries)
-        persistQuickCleanEntries()
-        refreshQuickCleanSnapshots()
+        replaceQuickCleanEntries(
+            QuickCleanRegistry.normalized(quickCleanEntries + newEntries), persist: true
+        )
+        refreshQuickCleanSnapshots(force: true)
 
         let added = newEntries.count
         if rejected > 0 {
@@ -2993,46 +3065,86 @@ final class DevSweepStore: ObservableObject {
     func removeFromQuickClean(paths: [URL]) {
         guard !paths.isEmpty, !isScanning, !isCleaning else { return }
         let keys = Set(paths.map { QuickCleanRegistry.key(for: $0) })
-        quickCleanEntries.removeAll { keys.contains($0.id) }
-        persistQuickCleanEntries()
-        refreshQuickCleanSnapshots()
+        replaceQuickCleanEntries(
+            quickCleanEntries.filter { !keys.contains($0.id) }, persist: true
+        )
+        refreshQuickCleanSnapshots(force: true)
         showTransientNotice("已移出常用清理")
     }
 
     /// 刷新快照：存在性、FileIdentity、大小都重新读取磁盘，绝不调用完整 CacheScanner。
     /// 更新安装包升级后会重新绑定到同目录唯一的新版本文件，并持久化新路径。
-    func refreshQuickCleanSnapshots() {
+    /// 非强制刷新带节流：常用条目上百个，重新遍历一次真实目录树不该成为
+    /// 每次切换侧边栏的固定代价。
+    func refreshQuickCleanSnapshots(force: Bool = false) {
+        guard force || lastQuickCleanRefresh == nil
+                || Date().timeIntervalSince(lastQuickCleanRefresh!) > Self.quickCleanRefreshInterval
+                || quickCleanRows.isEmpty else { return }
         let entries = quickCleanEntries
         let whitelist = whitelistedPaths
-        let home = home
+        let home = self.home
         let inspector = simulatorInspector
         quickCleanRefreshGeneration += 1
         let generation = quickCleanRefreshGeneration
         isRefreshingQuickClean = true
+        guard !entries.isEmpty else {
+            quickCleanSnapshotByID = [:]
+            rebuildQuickCleanRows()
+            finishQuickCleanRefresh(generation: generation)
+            return
+        }
+
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let resolution = QuickCleanInspector.resolveVersionedEntries(
                 entries, whitelistedPaths: whitelist
             )
+            let rebound = zip(entries, resolution.entries).filter { $0.0.path != $0.1.path }
+            // 文件与目录状态先发布；模拟器行需要 simctl（登记几十台设备时是秒级），
+            // 排在它后面，不拖慢可清理项。
             let snapshots = QuickCleanInspector.snapshots(
                 for: resolution.entries, home: home,
-                simulatorInspector: inspector, notes: resolution.notes
+                simulatorInspector: inspector, notes: resolution.notes,
+                onProgress: { partial in
+                    self?.publishQuickCleanSnapshots(partial, generation: generation)
+                }
             )
-            DispatchQueue.main.async {
-                guard let self, generation == self.quickCleanRefreshGeneration else { return }
-                let rebound = zip(entries, resolution.entries).filter { $0.0.path != $0.1.path }
-                if !rebound.isEmpty {
-                    self.quickCleanEntries = QuickCleanRegistry.normalized(resolution.entries)
-                    self.persistQuickCleanEntries()
-                }
-                self.quickCleanSnapshots = snapshots
-                self.isRefreshingQuickClean = false
-                if !rebound.isEmpty {
-                    self.rebuildItems()
-                    self.showTransientNotice(rebound.count == 1
-                        ? "常用清理已匹配更新安装包的新版本"
-                        : "常用清理已匹配 \(rebound.count) 个更新安装包的新版本")
-                }
+            self?.publishQuickCleanSnapshots(snapshots, generation: generation)
+            if !rebound.isEmpty {
+                self?.applyQuickCleanRebound(
+                    resolution.entries, reboundCount: rebound.count, generation: generation
+                )
             }
+            self?.finishQuickCleanRefresh(generation: generation)
+        }
+    }
+
+    private func publishQuickCleanSnapshots(
+        _ snapshots: [QuickCleanSnapshot], generation: Int
+    ) {
+        DispatchQueue.main.async {
+            guard generation == self.quickCleanRefreshGeneration else { return }
+            self.mergeQuickCleanSnapshots(snapshots)
+        }
+    }
+
+    private func applyQuickCleanRebound(
+        _ entries: [QuickCleanEntry], reboundCount: Int, generation: Int
+    ) {
+        DispatchQueue.main.async {
+            guard generation == self.quickCleanRefreshGeneration else { return }
+            self.replaceQuickCleanEntries(QuickCleanRegistry.normalized(entries), persist: true)
+            self.rebuildItems()
+            self.showTransientNotice(reboundCount == 1
+                ? "常用清理已匹配更新安装包的新版本"
+                : "常用清理已匹配 \(reboundCount) 个更新安装包的新版本")
+        }
+    }
+
+    private func finishQuickCleanRefresh(generation: Int) {
+        DispatchQueue.main.async {
+            guard generation == self.quickCleanRefreshGeneration else { return }
+            self.lastQuickCleanRefresh = Date()
+            self.isRefreshingQuickClean = false
         }
     }
 
@@ -3049,7 +3161,7 @@ final class DevSweepStore: ObservableObject {
     /// Called only by the per-device confirmation dialog. Identity comes from
     /// the snapshot shown before the dialog, never from a fresh replacement path.
     func deleteQuickCleanSimulator(_ entry: QuickCleanEntry, expectedIdentity: FileIdentity) {
-        guard !isScanning, !isCleaning, entry.isSimulator,
+        guard !isCleaning, entry.isSimulator,
               quickCleanEntries.contains(entry),
               SimulatorCleanupExecutor.matches(path: URL(fileURLWithPath: entry.path), udid: entry.identifier, home: home)
         else { return }
@@ -3059,7 +3171,7 @@ final class DevSweepStore: ObservableObject {
         let path = URL(fileURLWithPath: entry.path)
         let item = CacheItem(
             category: entry.category, name: entry.displayName, path: path,
-            size: quickCleanSnapshots.first(where: { $0.id == entry.id })?.size ?? 0,
+            size: quickCleanSnapshotByID[entry.id]?.size ?? 0,
             risk: .review, kind: .simulatorDevice, identifier: entry.identifier,
             expectedFileIdentity: expectedIdentity
         )
@@ -3073,7 +3185,7 @@ final class DevSweepStore: ObservableObject {
                 guard let self else { return }
                 self.isCleaning = false
                 self.applyQuickCleanCleanupResult(report)
-                if report.removed.isEmpty { self.refreshQuickCleanSnapshots() }
+                if report.removed.isEmpty { self.refreshQuickCleanSnapshots(force: true) }
                 if let failure = report.failures.first {
                     self.lastError = failure.1
                     self.statusMessage = "模拟器未删除：\(failure.1)"
@@ -3087,7 +3199,8 @@ final class DevSweepStore: ObservableObject {
 
     private func cleanQuickCleanEntries(_ entries: [QuickCleanEntry]) {
         let targets = QuickCleanRegistry.normalized(entries.filter { $0.isAutomatic && quickCleanEntries.contains($0) })
-        guard !targets.isEmpty, !isScanning, !isCleaning else { return }
+        // 常用清理自带磁盘核验，不依赖普通扫描的结果，因此普通扫描进行中也可以执行。
+        guard !targets.isEmpty, !isCleaning else { return }
         isCleaning = true
         lastError = nil
         statusMessage = "正在把常用项目移入废纸篓…"
@@ -3132,11 +3245,14 @@ final class DevSweepStore: ObservableObject {
     func applyQuickCleanCleanupResult(_ report: CleanupReport) {
         guard !report.removed.isEmpty else { return }
         let removedPaths = Set(report.removed.map { QuickCleanRegistry.key(for: $0.path) })
+        if isScanning {
+            pathsCleanedDuringScan.formUnion(removedPaths)
+        }
         rawScanItems.removeAll { removedPaths.contains(QuickCleanRegistry.key(for: $0.path)) }
         discoveryCleanupItems.removeAll { removedPaths.contains(QuickCleanRegistry.key(for: $0.path)) }
         cleanupGeneration += 1
         rebuildItems()
-        refreshQuickCleanSnapshots()
+        refreshQuickCleanSnapshots(force: true)
     }
 
     private func showTransientNotice(_ text: String, icon: String = "checkmark.circle.fill") {
@@ -3185,7 +3301,7 @@ final class DevSweepStore: ObservableObject {
                 if !report.removed.isEmpty {
                     self.persistSelectionStates()
                     if !self.quickCleanEntries.isEmpty {
-                        self.refreshQuickCleanSnapshots()
+                        self.refreshQuickCleanSnapshots(force: true)
                     }
                     let removedSize = report.removed.reduce(0) { $0 + $1.size }
                     self.showTransientNotice("已清理 \(report.removed.count) 项，共 \(removedSize.devSweepFileSize)")
