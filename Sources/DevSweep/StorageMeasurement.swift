@@ -31,9 +31,12 @@ struct StorageMeasurement: Hashable {
     var isComplete: Bool { state == .complete }
 
     var warning: String? {
-        guard state != .complete else { return nil }
-        if let failureReason { return failureReason }
-        return state == .timedOut ? "统计超时，实际占用可能更大" : "部分目录无法读取，实际占用可能更大"
+        switch state {
+        case .complete: return nil
+        case .failed: return failureReason ?? "无法统计该条目占用"
+        case .timedOut: return failureReason ?? "统计超时，实际占用可能更大"
+        case .partial: return failureReason ?? "部分目录无法读取，实际占用可能更大"
+        }
     }
 }
 
@@ -49,8 +52,9 @@ enum StorageMeasurementService {
 
         if let values = try? standardized.resourceValues(forKeys: [.isDirectoryKey]),
            values.isDirectory != true {
-            let allocated = (try? standardized.resourceValues(forKeys: [.fileAllocatedSizeKey]))?.fileAllocatedSize
-            return StorageMeasurement(allocatedBytes: Int64(allocated ?? 0))
+            return measureFile(standardized, allocatedSize: (try? standardized.resourceValues(
+                forKeys: [.fileAllocatedSizeKey]
+            ))?.fileAllocatedSize)
         }
 
         guard let result = ProcessRunner.run(
@@ -73,6 +77,23 @@ enum StorageMeasurementService {
             )
         }
         return measureByEnumeration(standardized)
+    }
+
+    /// 单个文件（非目录）的占用。缺少 `fileAllocatedSize` 属性时退回 `lstat` 的块数，
+    /// 两者都拿不到才算失败：把读不到的占用记成 0 B 会让图表静默丢项。
+    static func measureFile(_ url: URL, allocatedSize: Int?) -> StorageMeasurement {
+        if let allocatedSize, allocatedSize >= 0 {
+            return StorageMeasurement(allocatedBytes: Int64(allocatedSize))
+        }
+        var info = stat()
+        if lstat(url.path, &info) == 0 {
+            return StorageMeasurement(allocatedBytes: Int64(info.st_blocks) * 512)
+        }
+        return StorageMeasurement(
+            allocatedBytes: 0,
+            state: .failed,
+            failureReason: "无法读取文件占用信息"
+        )
     }
 
     /// 一次 `du` 调用测量多个目录。macOS 的 du 会在同一次调用的参数之间对硬链接去重。
@@ -102,23 +123,8 @@ enum StorageMeasurementService {
         )
 
         if let result {
-            // 按路径而不是按输出顺序对齐：某个参数在测量前消失时，
-            // du 只会为其余路径输出行，按顺序 zip 会把大小配错目录。
-            let parsed = parseDuOutput(result.stdout)
-            for url in pending {
-                guard let bytes = parsed[url.path] else { continue }
-                measurements[url.path] = interpret(bytes: bytes, result: result)
-            }
-            if result.timedOut {
-                for url in pending where measurements[url.path] == nil {
-                    measurements[url.path] = StorageMeasurement(
-                        allocatedBytes: 0,
-                        state: .timedOut,
-                        failureReason: "统计超时，未完成全部目录"
-                    )
-                }
-                return measurements
-            }
+            measurements.merge(interpretBatch(result, paths: pending.map(\.path))) { _, latest in latest }
+            if result.timedOut { return measurements }
         }
 
         for url in pending where measurements[url.path] == nil {
@@ -127,49 +133,135 @@ enum StorageMeasurementService {
         return measurements
     }
 
+    /// 把一次批量 `du -sk` 的输出生成各被测目录的测量值。
+    /// 按路径而不是按输出顺序对齐：某个参数在测量前消失时，du 只会为其余路径输出行，
+    /// 按顺序 zip 会把大小配错目录。没有输出的目录不出现在结果里（超时除外），
+    /// 由调用方决定是否逐项回退。
+    static func interpretBatch(_ result: ProcessResult, paths: [String]) -> [String: StorageMeasurement] {
+        let parsed = parseDuOutput(result.stdout)
+        let errors = attributeErrors(result, to: paths)
+        var measurements: [String: StorageMeasurement] = [:]
+        for path in paths {
+            guard let bytes = parsed[path] else { continue }
+            measurements[path] = interpret(
+                bytes: bytes,
+                timedOut: result.timedOut,
+                errorCount: errors.counts[path] ?? 0,
+                hasUnattributedError: errors.hasUnattributed
+            )
+        }
+        if result.timedOut {
+            for path in paths where measurements[path] == nil {
+                measurements[path] = StorageMeasurement(
+                    allocatedBytes: 0,
+                    state: .timedOut,
+                    failureReason: "统计超时，未完成全部目录"
+                )
+            }
+        }
+        return measurements
+    }
+
     /// 把一次 `du -sk <dir>` 的输出解释为测量值；stdout 无法解析时返回 nil，
     /// 由调用方决定是否退回逐文件枚举。
     static func interpretSingle(_ result: ProcessResult) -> StorageMeasurement? {
-        guard let bytes = parseDuOutput(result.stdout).values.first else { return nil }
-        return interpret(bytes: bytes, result: result)
+        let parsed = parseDuOutput(result.stdout)
+        guard let entry = parsed.first else { return nil }
+        let errors = attributeErrors(result, to: [entry.key])
+        return interpret(
+            bytes: entry.value,
+            timedOut: result.timedOut,
+            errorCount: errors.counts[entry.key] ?? 0,
+            hasUnattributedError: errors.hasUnattributed
+        )
     }
 
-    private static func interpret(bytes: Int64, result: ProcessResult) -> StorageMeasurement {
-        if result.timedOut {
+    /// 把 `du` 的错误输出归属到具体被测目录。归属不到任何目录的错误只能保守地
+    /// 降级全部结果；能定位到某个子条目的错误不应该污染同批次的其他目录。
+    private static func attributeErrors(
+        _ result: ProcessResult,
+        to paths: [String]
+    ) -> (counts: [String: Int], hasUnattributed: Bool) {
+        let lines = stderrLines(result.stderr)
+        guard !lines.isEmpty || result.status != 0 else {
+            return ([:], false)
+        }
+        guard !lines.isEmpty else {
+            // 非零退出但没有任何错误文本，无法判断影响范围。
+            return ([:], true)
+        }
+
+        var counts: [String: Int] = [:]
+        var unattributed = 0
+        for line in lines {
+            guard let errorPath = errorPath(from: line),
+                  let owner = paths.first(where: { isPath(errorPath, insideOrEqual: $0) })
+            else {
+                unattributed += 1
+                continue
+            }
+            counts[owner, default: 0] += 1
+        }
+        return (counts, unattributed > 0)
+    }
+
+    private static func isPath(_ candidate: String, insideOrEqual container: String) -> Bool {
+        candidate == container || candidate.hasPrefix(container + "/")
+    }
+
+    private static func stderrLines(_ data: Data) -> [String] {
+        guard let text = String(data: data, encoding: .utf8) else { return [] }
+        return text
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
+    /// du 的错误行形如 `du: /some/path: Permission denied`。路径本身可能含冒号，
+    /// 所以取最后一个 `: ` 之前的部分作为候选路径。
+    private static func errorPath(from line: String) -> String? {
+        guard line.hasPrefix("du:") else { return nil }
+        var body = String(line.dropFirst(3))
+        if body.hasPrefix(" ") { body.removeFirst() }
+        guard let separator = body.range(of: ": ", options: .backwards) else {
+            return body.isEmpty ? nil : body
+        }
+        let candidate = String(body[..<separator.lowerBound])
+        return candidate.isEmpty ? nil : candidate
+    }
+
+    private static func interpret(
+        bytes: Int64,
+        timedOut: Bool,
+        errorCount: Int,
+        hasUnattributedError: Bool
+    ) -> StorageMeasurement {
+        if timedOut {
             return StorageMeasurement(
                 allocatedBytes: bytes,
                 state: .timedOut,
+                skippedCount: errorCount,
                 failureReason: "统计超时，未完成全部目录"
             )
         }
-        if result.status != 0 {
+        if errorCount > 0 {
             return StorageMeasurement(
                 allocatedBytes: bytes,
                 state: .partial,
-                failureReason: failureReason(for: result)
+                skippedCount: errorCount,
+                failureReason: "有 \(errorCount) 个条目无法读取，实际占用可能更大"
             )
         }
-        if !result.stderr.isEmpty {
-            // du 在 status 0 下仍可能报告个别路径警告；保守地按不完整处理。
+        if hasUnattributedError {
+            // 出错但无法定位归属，保守按下限展示。
             return StorageMeasurement(
                 allocatedBytes: bytes,
                 state: .partial,
-                failureReason: failureReason(for: result)
+                failureReason: "未能确认统计覆盖全部条目，实际占用可能更大"
             )
         }
+        // 错误已归属到同批次的其他目录，且本目录有完整输出：本目录仍是精确值。
         return StorageMeasurement(allocatedBytes: bytes)
-    }
-
-    private static func failureReason(for result: ProcessResult) -> String {
-        let text = String(data: result.stderr, encoding: .utf8) ?? ""
-        let errorLines = text
-            .split(whereSeparator: \.isNewline)
-            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-            .count
-        if errorLines > 0 {
-            return "有 \(errorLines) 个条目无法读取，实际占用可能更大"
-        }
-        return "未能完成占用统计，实际占用可能更大"
     }
 
     /// `du -sk` 每行是 "<kilobytes>\t<path>"，路径里可能有空格，所以按第一个 tab 切分。

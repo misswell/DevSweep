@@ -715,6 +715,32 @@ final class QuickCleanAndStoreRulesTests: XCTestCase {
         XCTAssertEqual(store.items.count, 1, "未知条目不能加入清理")
     }
 
+    /// 从图表加入清理项同样受白名单保护：白名单优先于任何清理授权。
+    func testWhitelistedDiscoveryPathCannotJoinCleanupFromChart() throws {
+        let store = makeStore()
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try makeAllocatedDirectory(at: directory)
+        let item = makeCacheItem(name: "protected", path: directory)
+        store.addToWhitelist([item])
+
+        let candidate = DiscoveryCleanupCandidate(
+            category: "测试工具",
+            name: "测试缓存",
+            risk: .safe,
+            note: "测试用缓存规则"
+        )
+        let verified = discoveryNode(
+            at: directory,
+            classification: .knownCache,
+            confidence: .verified,
+            candidate: candidate
+        )
+
+        XCTAssertFalse(store.addDiscoveryCleanupCandidate(verified), "白名单路径不能从图表加入清理")
+        XCTAssertTrue(store.items.isEmpty)
+    }
+
     private func discoveryNode(
         at url: URL,
         classification: DiscoveryClassification,

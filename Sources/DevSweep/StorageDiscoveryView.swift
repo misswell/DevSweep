@@ -25,10 +25,36 @@ final class StorageDiscoveryStore: ObservableObject {
     @Published private(set) var phase = "准备扫描"
     @Published private(set) var checkedCount = 0
     @Published private(set) var lastError: String?
+    /// 图表、类型统计和列表共用的搜索条件。
+    @Published var searchText = "" {
+        didSet {
+            guard searchText != oldValue else { return }
+            rebuildGraphSnapshot()
+        }
+    }
+    /// 分布图快照。只在扫描结果、忽略项或搜索条件变化时重建，
+    /// 选中与悬停这类视图状态不会触发整层目录重新排序。
+    @Published private(set) var graphSnapshot = DistributionSnapshot(nodes: [], query: "")
+    /// 多层环形图的祖先层，从靠近圆心向外排列，不含当前层。
+    @Published private(set) var graphLevels: [SunburstLevel] = []
+    @Published var graphTypeScope: FileTypeScope = .direct {
+        didSet {
+            guard graphTypeScope != oldValue else { return }
+            graphTypeScope == .recursive ? runRollup() : clearRollup()
+        }
+    }
+    @Published private(set) var rollup: FileTypeRollup?
+    @Published private(set) var isRollupRunning = false
+    @Published private(set) var rollupPhase: String?
 
     private let defaults: UserDefaults
     private var activeFlag: DiscoveryCancellationFlag?
     private var scanGeneration = 0
+    private var graphNodesCache: (key: String, nodes: [DiscoveryNode])?
+    private var activeRollupFlag: DiscoveryCancellationFlag?
+    private var rollupGeneration = 0
+    /// 环形图最多保留的祖先圈数，再多只会让每圈窄到无法阅读。
+    private static let maxGraphLevels = 2
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -48,9 +74,31 @@ final class StorageDiscoveryStore: ObservableObject {
         (report?.nodes ?? []).filter { !ignoredPaths.contains($0.id) }
     }
 
-    /// 分布图使用未被列表阈值截断的本层条目，保证面积和类型统计不丢项。
+    /// 分布图使用的本层条目（未被列表阈值截断）。结果按扫描代次缓存，
+    /// 一次视图构建里多处读取不会重复过滤和拷贝。
     var graphNodes: [DiscoveryNode] {
-        (report?.allNodes ?? []).filter { !ignoredPaths.contains($0.id) }
+        let key = graphKey
+        if let graphNodesCache, graphNodesCache.key == key {
+            return graphNodesCache.nodes
+        }
+        let nodes = (report?.allNodes ?? []).filter { !ignoredPaths.contains($0.id) }
+        graphNodesCache = (key, nodes)
+        return nodes
+    }
+
+    /// 标识「同一份扫描结果 + 同一组忽略项」，用作派生数据的缓存键。
+    var graphKey: String {
+        guard let report else { return "none" }
+        return [
+            report.directory.standardizedFileURL.path,
+            String(report.scannedAt.timeIntervalSince1970),
+            String(report.allNodes.count),
+            String(ignoredPaths.count)
+        ].joined(separator: "|")
+    }
+
+    func rebuildGraphSnapshot() {
+        graphSnapshot = DistributionSnapshot(nodes: graphNodes, query: searchText)
     }
 
     func addCustomRoots(_ urls: [URL]) {
@@ -82,9 +130,12 @@ final class StorageDiscoveryStore: ObservableObject {
         let flag = DiscoveryCancellationFlag()
         activeFlag = flag
 
+        updateGraphLevels(for: directory)
+        clearRollup()
         currentDirectory = directory
         if report?.directory.standardizedFileURL.path != directory.path {
             report = nil
+            rebuildGraphSnapshot()
         }
         isScanning = true
         lastError = nil
@@ -114,6 +165,11 @@ final class StorageDiscoveryStore: ObservableObject {
                 self.isScanning = false
                 self.activeFlag = nil
                 self.phase = result.wasCancelled ? "已取消" : "扫描完成"
+                self.rebuildGraphSnapshot()
+                if self.graphTypeScope == .recursive {
+                    // 递归统计比单层扫描贵得多，等本层测完再开始，避免两路 I/O 抢磁盘。
+                    self.runRollup()
+                }
                 // 扫描期间调整了阈值时，用新阈值重扫一次，避免界面停留在旧过滤结果。
                 if !result.wasCancelled && result.thresholdBytes != self.thresholdBytes {
                     self.rescan()
@@ -133,6 +189,82 @@ final class StorageDiscoveryStore: ObservableObject {
         activeFlag?.cancel()
     }
 
+    /// 下钻时把离开的层压成环形图的一圈；回跳到祖先或跳到别的目录时按层截断，
+    /// 保证内圈角度与当前层来自同一份测量，不存在父子重复累计。
+    private func updateGraphLevels(for directory: URL) {
+        let target = directory.standardizedFileURL.path
+        guard let current = currentDirectory?.standardizedFileURL.path else {
+            graphLevels = []
+            return
+        }
+        if target == current { return }
+        // 第 index 圈是「展开 target 时离开的那一层」，回跳到 target 时它仍是直接祖先，
+        // 因此保留到 index（含），只丢弃比 target 更深的圈。
+        if let index = graphLevels.firstIndex(where: { $0.enteredID == target }) {
+            graphLevels = Array(graphLevels.prefix(index + 1))
+            return
+        }
+        guard report?.directory.standardizedFileURL.path == current,
+              directory.deletingLastPathComponent().standardizedFileURL.path == current
+        else {
+            graphLevels = []
+            return
+        }
+        // 祖先圈用未经搜索过滤的本层分组，搜索条件不改变层级结构。
+        let items = TreemapGrouping.grouped(nodes: graphNodes).items
+        graphLevels = Array((graphLevels + [SunburstLevel(items: items, enteredID: target)])
+            .suffix(Self.maxGraphLevels))
+    }
+
+    /// 递归文件类型统计。代价明显高于单层扫描，可取消且有条目上限。
+    func runRollup() {
+        guard let directory = currentDirectory else {
+            rollup = nil
+            return
+        }
+        rollupGeneration += 1
+        let generation = rollupGeneration
+        activeRollupFlag?.cancel()
+        let flag = DiscoveryCancellationFlag()
+        activeRollupFlag = flag
+        isRollupRunning = true
+        rollup = nil
+        rollupPhase = "正在准备递归统计"
+
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let result = FileTypeRollupScanner.scan(
+                root: directory,
+                isCancelled: { flag.isCancelled },
+                progress: { progress in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.rollupGeneration == generation else { return }
+                        self.rollupPhase = "\(progress.phase)（已扫描 \(progress.scannedEntries) 项）"
+                    }
+                }
+            )
+            Task { @MainActor [weak self] in
+                guard let self, self.rollupGeneration == generation else { return }
+                self.rollup = result
+                self.isRollupRunning = false
+                self.rollupPhase = nil
+                self.activeRollupFlag = nil
+            }
+        }
+    }
+
+    func cancelRollup() {
+        rollupGeneration += 1
+        activeRollupFlag?.cancel()
+        activeRollupFlag = nil
+        isRollupRunning = false
+        rollupPhase = nil
+    }
+
+    private func clearRollup() {
+        cancelRollup()
+        rollup = nil
+    }
+
     func clearError() {
         lastError = nil
     }
@@ -140,11 +272,13 @@ final class StorageDiscoveryStore: ObservableObject {
     func ignore(_ node: DiscoveryNode) {
         ignoredPaths.insert(node.id)
         persistIgnoredPaths()
+        rebuildGraphSnapshot()
     }
 
     func restoreIgnoredPath(_ path: String) {
         ignoredPaths.remove(path)
         persistIgnoredPaths()
+        rebuildGraphSnapshot()
     }
 
     private func persistCustomRoots() {
@@ -161,7 +295,12 @@ struct StorageDiscoveryView: View {
     let projectRoots: [URL]
     @ObservedObject var appStore: DevSweepStore
     @State private var selectedNodeID: String?
-    @State private var searchText = ""
+
+    /// 搜索条件存在 store 里，图表快照才能在条件变化时同步重建。
+    private var searchText: String {
+        get { store.searchText }
+        nonmutating set { store.searchText = newValue }
+    }
 
     private static let thresholdOptions: [(label: String, megabytes: Int)] = [
         ("显示全部（含小文件）", 0),
@@ -237,8 +376,14 @@ struct StorageDiscoveryView: View {
                 if !store.graphNodes.isEmpty {
                     FileDistributionPanel(
                         nodes: store.graphNodes,
-                        searchText: $searchText,
+                        snapshot: store.graphSnapshot,
+                        searchText: $store.searchText,
                         selectedNodeID: $selectedNodeID,
+                        typeScope: $store.graphTypeScope,
+                        ancestorLevels: store.graphLevels,
+                        rollup: store.rollup,
+                        isRollupRunning: store.isRollupRunning,
+                        rollupPhase: store.rollupPhase,
                         isScanning: store.isScanning,
                         onDrillDown: { store.scan(directory: $0) },
                         onIgnore: { node in
@@ -247,6 +392,8 @@ struct StorageDiscoveryView: View {
                             }
                             store.ignore(node)
                         },
+                        onRunRollup: { store.runRollup() },
+                        onCancelRollup: { store.cancelRollup() },
                         cleanupLink: cleanupLink,
                         onAddToCleanup: { node in
                             _ = appStore.addDiscoveryCleanupCandidate(node)

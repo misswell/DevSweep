@@ -103,6 +103,110 @@ final class StorageMeasurementTests: XCTestCase {
         XCTAssertEqual(missingMeasurement.failureReason, "路径不存在")
     }
 
+    /// 一次批量 du 里只有一个目录出错时，不能把同批次其他目录一起降级。
+    func testBatchAttributesErrorsToTheirOwnDirectory() throws {
+        let result = ProcessResult(
+            status: 1,
+            stdout: Data("1024\t/tmp/a\n2048\t/tmp/b\n".utf8),
+            stderr: Data("du: /tmp/a/sub/locked: Permission denied\n".utf8),
+            timedOut: false
+        )
+
+        let measurements = StorageMeasurementService.interpretBatch(result, paths: ["/tmp/a", "/tmp/b"])
+        let first = try XCTUnwrap(measurements["/tmp/a"])
+        let second = try XCTUnwrap(measurements["/tmp/b"])
+        XCTAssertEqual(first.state, .partial)
+        XCTAssertEqual(first.skippedCount, 1)
+        XCTAssertEqual(second.state, .complete)
+        XCTAssertNil(second.warning)
+        XCTAssertEqual(second.allocatedBytes, 2_097_152)
+    }
+
+    func testBatchStaysConservativeWhenErrorCannotBeAttributed() {
+        let result = ProcessResult(
+            status: 1,
+            stdout: Data("1024\t/tmp/a\n2048\t/tmp/b\n".utf8),
+            stderr: Data("du: /Volumes/other/broken: Input/output error\n".utf8),
+            timedOut: false
+        )
+
+        let measurements = StorageMeasurementService.interpretBatch(result, paths: ["/tmp/a", "/tmp/b"])
+        XCTAssertEqual(measurements.count, 2)
+        for measurement in measurements.values {
+            XCTAssertEqual(measurement.state, .partial)
+            XCTAssertEqual(measurement.failureReason, "未能确认统计覆盖全部条目，实际占用可能更大")
+        }
+    }
+
+    func testBatchMarksEveryPendingDirectoryWhenDuTimesOut() {
+        let result = ProcessResult(
+            status: 0,
+            stdout: Data("1024\t/tmp/a\n".utf8),
+            stderr: Data(),
+            timedOut: true
+        )
+
+        let measurements = StorageMeasurementService.interpretBatch(result, paths: ["/tmp/a", "/tmp/b"])
+        XCTAssertEqual(measurements["/tmp/a"]?.state, .timedOut)
+        XCTAssertEqual(measurements["/tmp/a"]?.allocatedBytes, 1_048_576)
+        XCTAssertEqual(measurements["/tmp/b"]?.state, .timedOut)
+        XCTAssertEqual(measurements["/tmp/b"]?.allocatedBytes, 0)
+    }
+
+    /// 读不到 `fileAllocatedSize` 时退回 `lstat` 的块数，不能静默记成 0 B。
+    func testFileMeasurementFallsBackToBlockCount() throws {
+        let root = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: root) }
+        let file = root.appendingPathComponent("data.bin")
+        try Data(repeating: 0xA5, count: 300_000).write(to: file)
+
+        let measurement = StorageMeasurementService.measureFile(file, allocatedSize: nil)
+        XCTAssertEqual(measurement.state, .complete)
+        XCTAssertGreaterThan(measurement.allocatedBytes, 250_000)
+        XCTAssertEqual(measurement.allocatedBytes % 512, 0)
+    }
+
+    /// 0 B 且测量完整是有效结果，不能当成统计失败。
+    func testFileMeasurementKeepsZeroByteFileAsComplete() throws {
+        let root = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: root) }
+        let file = root.appendingPathComponent("empty.bin")
+        try Data().write(to: file)
+
+        let explicit = StorageMeasurementService.measureFile(file, allocatedSize: 0)
+        XCTAssertEqual(explicit.state, .complete)
+        XCTAssertEqual(explicit.allocatedBytes, 0)
+
+        let measured = StorageMeasurementService.measure(file)
+        XCTAssertEqual(measured.state, .complete)
+        XCTAssertEqual(measured.allocatedBytes, 0)
+    }
+
+    /// 稀疏文件只按实际分配的磁盘块计数，逻辑大小不参与图表面积。
+    func testFileMeasurementReportsAllocatedNotLogicalSizeForSparseFile() throws {
+        let root = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: root) }
+        let file = root.appendingPathComponent("sparse.bin")
+        fileManager.createFile(atPath: file.path, contents: Data([0x01]))
+        let handle = try FileHandle(forWritingTo: file)
+        defer { try? handle.close() }
+        try handle.seek(toOffset: 200_000_000)
+        try handle.write(contentsOf: Data([0x02]))
+
+        let measurement = StorageMeasurementService.measureFile(file, allocatedSize: nil)
+        XCTAssertLessThan(measurement.allocatedBytes, 1_000_000, "稀疏空洞不应计入磁盘占用")
+        XCTAssertGreaterThan(measurement.allocatedBytes, 0)
+    }
+
+    func testFileMeasurementReportsFailureWhenNoSizeIsAvailable() {
+        let missing = URL(fileURLWithPath: "/tmp/DevSweep-definitely-missing-\(UUID().uuidString)")
+
+        let measurement = StorageMeasurementService.measureFile(missing, allocatedSize: nil)
+        XCTAssertEqual(measurement.state, .failed)
+        XCTAssertEqual(measurement.failureReason, "无法读取文件占用信息")
+        XCTAssertEqual(measurement.warning, "无法读取文件占用信息")
+    }
+
     func testEnumerationFallbackDeduplicatesHardLinks() throws {
         let root = try temporaryDirectory()
         defer { try? fileManager.removeItem(at: root) }

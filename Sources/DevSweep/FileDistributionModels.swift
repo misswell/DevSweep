@@ -125,14 +125,50 @@ enum FileTypeCategory: String, CaseIterable, Hashable, Identifiable {
     ]
 }
 
+/// 图表与详情共用的搜索条件。
+enum DiscoverySearch {
+    static func trimmedQuery(_ query: String) -> String {
+        query.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func matches(_ node: DiscoveryNode, query: String) -> Bool {
+        node.name.localizedCaseInsensitiveContains(query)
+            || node.path.devSweepDisplayPath.localizedCaseInsensitiveContains(query)
+    }
+
+    static func filter(_ nodes: [DiscoveryNode], query: String) -> [DiscoveryNode] {
+        let trimmed = trimmedQuery(query)
+        guard !trimmed.isEmpty else { return nodes }
+        return nodes.filter { matches($0, query: trimmed) }
+    }
+}
+
 /// 当前层按文件类型和目录汇总的占用。目录单独成项，保证图表总量与列表一致。
 struct FileTypeSummary: Identifiable, Hashable {
     let category: FileTypeCategory
     let allocatedBytes: Int64
     let logicalBytes: Int64
     let itemCount: Int
+    /// 其中测量不完整（下限）的条目数，用于标注该分类的合计是否只是下限。
+    let lowerBoundCount: Int
+
+    init(
+        category: FileTypeCategory,
+        allocatedBytes: Int64,
+        logicalBytes: Int64 = 0,
+        itemCount: Int,
+        lowerBoundCount: Int = 0
+    ) {
+        self.category = category
+        self.allocatedBytes = allocatedBytes
+        self.logicalBytes = logicalBytes
+        self.itemCount = itemCount
+        self.lowerBoundCount = lowerBoundCount
+    }
 
     var id: String { category.rawValue }
+
+    var isLowerBound: Bool { lowerBoundCount > 0 }
 
     func share(of total: Int64) -> Double {
         total > 0 ? Double(allocatedBytes) / Double(total) : 0
@@ -142,12 +178,15 @@ struct FileTypeSummary: Identifiable, Hashable {
         let grouped = Dictionary(grouping: nodes) { node in
             FileTypeCategory.classify(url: node.path, isDirectory: node.isDirectory)
         }
-        return grouped.map { category, nodes in
+        return grouped.map { category, members in
             FileTypeSummary(
                 category: category,
-                allocatedBytes: nodes.reduce(0) { $0 + $1.measurement.allocatedBytes },
-                logicalBytes: nodes.reduce(0) { $0 + ($1.logicalBytes ?? 0) },
-                itemCount: nodes.count
+                allocatedBytes: members.reduce(0) { $0 + $1.measurement.allocatedBytes },
+                logicalBytes: members.reduce(0) { $0 + ($1.logicalBytes ?? 0) },
+                itemCount: members.count,
+                lowerBoundCount: members.reduce(0) {
+                    $0 + ($1.measurement.state == .complete ? 0 : 1)
+                }
             )
         }
         .sorted { lhs, rhs in
@@ -168,63 +207,239 @@ struct DiscoveryCleanupCandidate: Hashable {
     let note: String
 }
 
-/// 图表使用的最小数据单元；`other` 保留被合并条目的真实总量和成员路径。
+/// 图表使用的最小数据单元。「其他」分组只保留成员数量和总量：
+/// 超大目录不把整尾成员 ID 常驻在内存里，详情按需分页取回。
 struct TreemapItem: Identifiable, Hashable {
     let id: String
     let name: String
     let bytes: Int64
-    let memberIDs: [String]
+    let memberCount: Int
     let isOther: Bool
+    /// 图块面积只是已测量下限时为 true（含 `partial` / `timedOut` 测量）。
+    let isLowerBound: Bool
+    let isDirectory: Bool
+    let classification: DiscoveryClassification
 
     static let otherID = "distribution.other"
+
+    init(
+        id: String,
+        name: String,
+        bytes: Int64,
+        memberCount: Int = 1,
+        isOther: Bool = false,
+        isLowerBound: Bool = false,
+        isDirectory: Bool = false,
+        classification: DiscoveryClassification = .unknown
+    ) {
+        self.id = id
+        self.name = name
+        self.bytes = bytes
+        self.memberCount = memberCount
+        self.isOther = isOther
+        self.isLowerBound = isLowerBound
+        self.isDirectory = isDirectory
+        self.classification = classification
+    }
+
+    init(node: DiscoveryNode) {
+        self.init(
+            id: node.id,
+            name: node.name,
+            bytes: node.measurement.allocatedBytes,
+            isLowerBound: node.measurement.state != .complete,
+            isDirectory: node.isDirectory,
+            classification: node.classification
+        )
+    }
+
+    /// 图块对应的真实路径；`id` 就是标准化后的路径。
+    var url: URL { URL(fileURLWithPath: id) }
+}
+
+/// 一层目录的分组结果。绘制数量有上限，但总量、成员数和统计状态保持完整。
+struct TreemapGrouping: Hashable {
+    let items: [TreemapItem]
+    /// 测量失败或完全没有测到占用、因此无法绘制的条目数。
+    let unmeasuredCount: Int
+    /// 测量完整但分配为 0 B 的条目数：不占面积，但不算统计失败。
+    let emptyCount: Int
+    /// 已绘制但只是占用下限的图块数。
+    let lowerBoundCount: Int
+    /// 本层（含搜索筛选后）条目的分配大小合计；含下限项时它本身也是下限。
+    let totalBytes: Int64
+    let isLowerBound: Bool
+    /// 已绘制单项图块的 ID，用于判断选中项是否落在「其他」分组里。
+    let drawnIDs: Set<String>
 
     static func grouped(
         nodes: [DiscoveryNode],
         maxVisible: Int = 300
-    ) -> (items: [TreemapItem], unmeasuredCount: Int) {
-        let positive = nodes
-            .filter { $0.measurement.allocatedBytes > 0 }
-            .sorted { lhs, rhs in
-                if lhs.measurement.allocatedBytes != rhs.measurement.allocatedBytes {
-                    return lhs.measurement.allocatedBytes > rhs.measurement.allocatedBytes
-                }
-                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
-            }
-        let unmeasuredCount = nodes.count - positive.count
+    ) -> TreemapGrouping {
         let limit = max(1, maxVisible)
-        guard positive.count > limit else {
-            return (positive.map { node in
-                TreemapItem(
-                    id: node.id,
-                    name: node.name,
-                    bytes: node.measurement.allocatedBytes,
-                    memberIDs: [node.id],
-                    isOther: false
-                )
-            }, unmeasuredCount)
+
+        // 一趟分类：只对可绘制项建索引并排序，避免整份复制 DiscoveryNode。
+        var drawable: [Int] = []
+        var emptyCount = 0
+        var unmeasuredCount = 0
+        var totalBytes: Int64 = 0
+        var lowerBoundNodeCount = 0
+        for index in nodes.indices {
+            let node = nodes[index]
+            guard node.measurement.allocatedBytes > 0 else {
+                if node.measurement.state == .complete {
+                    emptyCount += 1
+                } else {
+                    unmeasuredCount += 1
+                }
+                continue
+            }
+            if node.measurement.state == .failed {
+                unmeasuredCount += 1
+                continue
+            }
+            if node.measurement.state != .complete { lowerBoundNodeCount += 1 }
+            totalBytes += node.measurement.allocatedBytes
+            drawable.append(index)
+        }
+        let order = drawable.sorted { lhs, rhs in
+            let lhsBytes = nodes[lhs].measurement.allocatedBytes
+            let rhsBytes = nodes[rhs].measurement.allocatedBytes
+            if lhsBytes != rhsBytes { return lhsBytes > rhsBytes }
+            return nodes[lhs].name.localizedStandardCompare(nodes[rhs].name) == .orderedAscending
         }
 
-        let kept = Array(positive.prefix(limit - 1))
-        let groupedNodes = positive.dropFirst(limit - 1)
-        var items = kept.map { node in
-            TreemapItem(
-                id: node.id,
-                name: node.name,
-                bytes: node.measurement.allocatedBytes,
-                memberIDs: [node.id],
-                isOther: false
+        func makeResult(items: [TreemapItem]) -> TreemapGrouping {
+            TreemapGrouping(
+                items: items,
+                unmeasuredCount: unmeasuredCount,
+                emptyCount: emptyCount,
+                lowerBoundCount: items.filter(\.isLowerBound).count,
+                totalBytes: totalBytes,
+                isLowerBound: lowerBoundNodeCount > 0,
+                drawnIDs: Set(items.filter { !$0.isOther }.map(\.id))
             )
         }
-        let groupedBytes = groupedNodes.reduce(Int64(0)) { $0 + $1.measurement.allocatedBytes }
-        if groupedBytes > 0 {
+
+        guard order.count > limit else {
+            return makeResult(items: order.map { TreemapItem(node: nodes[$0]) })
+        }
+
+        var items = order.prefix(limit - 1).map { TreemapItem(node: nodes[$0]) }
+        var tailBytes: Int64 = 0
+        var tailMembers = 0
+        var tailLowerBound = 0
+        for index in order[(limit - 1)...] {
+            tailBytes += nodes[index].measurement.allocatedBytes
+            tailMembers += 1
+            if nodes[index].measurement.state != .complete { tailLowerBound += 1 }
+        }
+        if tailBytes > 0 {
             items.append(TreemapItem(
                 id: TreemapItem.otherID,
-                name: "其他 \(groupedNodes.count) 项",
-                bytes: groupedBytes,
-                memberIDs: groupedNodes.map(\.id),
-                isOther: true
+                name: "其他 \(tailMembers) 项",
+                bytes: tailBytes,
+                memberCount: tailMembers,
+                isOther: true,
+                isLowerBound: tailLowerBound > 0
             ))
         }
-        return (items, unmeasuredCount)
+        return makeResult(items: items)
+    }
+}
+
+/// 一层目录的不可变图表快照：分组、查找表和类型统计一起构建，
+/// 悬停、选中这类视图状态变化不会触发对整层目录的重新排序。
+struct DistributionSnapshot: Hashable {
+    let grouping: TreemapGrouping
+    let typeSummaries: [FileTypeSummary]
+    let nodeLookup: [String: DiscoveryNode]
+    let matchedCount: Int
+
+    init(nodes: [DiscoveryNode], query: String) {
+        let matched = DiscoverySearch.filter(nodes, query: query)
+        self.grouping = TreemapGrouping.grouped(nodes: matched)
+        self.typeSummaries = FileTypeSummary.direct(nodes: matched)
+        self.matchedCount = matched.count
+        var lookup: [String: DiscoveryNode] = [:]
+        lookup.reserveCapacity(matched.count)
+        for node in matched {
+            lookup[node.id, default: node] = node
+        }
+        self.nodeLookup = lookup
+    }
+
+    var items: [TreemapItem] { grouping.items }
+    var totalBytes: Int64 { grouping.totalBytes }
+    var isEmptyLayer: Bool { grouping.items.isEmpty }
+
+    /// 选中项是否属于「其他」分组：在本层匹配、可绘制，但不在单项图块里。
+    func otherContains(nodeID: String?) -> Bool {
+        guard let nodeID,
+              let node = nodeLookup[nodeID],
+              node.measurement.allocatedBytes > 0,
+              node.measurement.state != .failed
+        else { return false }
+        return !grouping.drawnIDs.contains(nodeID)
+    }
+
+    func node(for id: String?) -> DiscoveryNode? {
+        guard let id else { return nil }
+        return nodeLookup[id]
+    }
+}
+
+/// 「其他」分组的成员按需取回：单趟遍历只保留占用最大的有限几项，
+/// 不为超大目录复制整尾成员。
+enum DistributionMembers {
+    static func top(
+        in nodes: [DiscoveryNode],
+        excluding drawnIDs: Set<String>,
+        query: String,
+        limit: Int
+    ) -> [DiscoveryNode] {
+        guard limit > 0 else { return [] }
+        let trimmed = DiscoverySearch.trimmedQuery(query)
+        var order: [Int] = []
+        order.reserveCapacity(limit)
+
+        for index in nodes.indices {
+            let node = nodes[index]
+            guard node.measurement.allocatedBytes > 0,
+                  node.measurement.state != .failed,
+                  !drawnIDs.contains(node.id)
+            else { continue }
+            if !trimmed.isEmpty, !DiscoverySearch.matches(node, query: trimmed) { continue }
+
+            let position = order.firstIndex { candidate in
+                let other = nodes[candidate]
+                if other.measurement.allocatedBytes != node.measurement.allocatedBytes {
+                    return other.measurement.allocatedBytes < node.measurement.allocatedBytes
+                }
+                return other.name.localizedStandardCompare(node.name) == .orderedDescending
+            } ?? order.count
+            order.insert(index, at: position)
+            if order.count > limit { order.removeLast() }
+        }
+        return order.map { nodes[$0] }
+    }
+
+    /// 无法统计的条目（测量失败，或超时后连下限都没拿到）单独列出诊断。
+    static func unmeasured(
+        in nodes: [DiscoveryNode],
+        query: String,
+        limit: Int
+    ) -> [DiscoveryNode] {
+        guard limit > 0 else { return [] }
+        let trimmed = DiscoverySearch.trimmedQuery(query)
+        var result: [DiscoveryNode] = []
+        result.reserveCapacity(limit)
+        for node in nodes where node.measurement.allocatedBytes == 0 || node.measurement.state == .failed {
+            guard node.measurement.state != .complete else { continue }
+            if !trimmed.isEmpty, !DiscoverySearch.matches(node, query: trimmed) { continue }
+            result.append(node)
+            if result.count == limit { break }
+        }
+        return result
     }
 }

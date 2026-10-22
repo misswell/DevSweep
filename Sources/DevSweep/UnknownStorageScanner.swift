@@ -217,9 +217,9 @@ enum UnknownStorageScanner {
             checkedCount: 0
         ))
 
-        for child in children.sorted(by: {
-            $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending
-        }) {
+        // 不再按名称预排：结果最终按占用降序展示，同名次序由排序时的名称比较决定，
+        // 超大目录可以省掉一次整层 URL 比较的排序和一份拷贝。
+        for child in children {
             if isCancelled() {
                 cancelled = true
                 return finish()

@@ -36,6 +36,28 @@ enum FileTypeMetric: String, CaseIterable, Identifiable {
     }
 }
 
+/// 类型统计的范围。`recursive` 会额外遍历整棵子树，代价明显更高，由用户显式开启。
+enum FileTypeScope: String, CaseIterable, Identifiable {
+    case direct
+    case recursive
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .direct: return "当前层"
+        case .recursive: return "递归子树"
+        }
+    }
+
+    var help: String {
+        switch self {
+        case .direct: return "只统计这一层展开后的条目，未展开的目录整体按「目录」计入。"
+        case .recursive: return "遍历整个子树按扩展名汇总，包目录（.app、.xcarchive 等）整体归类，不重复累计父目录。"
+        }
+    }
+}
+
 /// 发现页条目与当前清理列表的关系。加入清理并不等于删除，执行前仍会重新验证。
 enum DiscoveryCleanupLink: Equatable {
     case absent
@@ -43,53 +65,33 @@ enum DiscoveryCleanupLink: Equatable {
     case selected
 }
 
-enum DiscoverySearch {
-    static func filter(_ nodes: [DiscoveryNode], query: String) -> [DiscoveryNode] {
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nodes }
-        return nodes.filter { node in
-            node.name.localizedCaseInsensitiveContains(trimmed)
-                || node.path.devSweepDisplayPath.localizedCaseInsensitiveContains(trimmed)
-        }
-    }
-}
-
-/// 文件分布面板：图表、类型统计和详情共用同一份 `DiscoveryReport` 快照。
+/// 文件分布面板：图表、类型统计和详情共用同一份 `DistributionSnapshot`。
+/// 快照由 store 在扫描结果或搜索条件变化时构建一次，视图这里只做展示，
+/// 选中、悬停这类状态变化不会重新排序整层目录。
 /// 图表只把直接子项按占用布局，不会把父目录和子目录重复累计。
 struct FileDistributionPanel: View {
     let nodes: [DiscoveryNode]
+    let snapshot: DistributionSnapshot
     @Binding var searchText: String
     @Binding var selectedNodeID: String?
+    @Binding var typeScope: FileTypeScope
+    /// 祖先层（从靠近圆心向外），不含当前层；只有环形图使用。
+    let ancestorLevels: [SunburstLevel]
+    let rollup: FileTypeRollup?
+    let isRollupRunning: Bool
+    let rollupPhase: String?
     let isScanning: Bool
     let onDrillDown: (URL) -> Void
     let onIgnore: (DiscoveryNode) -> Void
+    let onRunRollup: () -> Void
+    let onCancelRollup: () -> Void
     let cleanupLink: (DiscoveryNode) -> DiscoveryCleanupLink
     let onAddToCleanup: (DiscoveryNode) -> Void
 
     @State private var mode: DistributionChartMode = .treemap
     @State private var typeMetric: FileTypeMetric = .bytes
-    @State private var hoveredItemID: String?
 
-    private var displayNodes: [DiscoveryNode] {
-        DiscoverySearch.filter(nodes, query: searchText)
-    }
-
-    private var nodeLookup: [String: DiscoveryNode] {
-        Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-    }
-
-    private var grouped: (items: [TreemapItem], unmeasuredCount: Int) {
-        TreemapItem.grouped(nodes: displayNodes)
-    }
-
-    private var totalBytes: Int64 {
-        displayNodes.reduce(0) { $0 + $1.measurement.allocatedBytes }
-    }
-
-    private var hoveredItem: TreemapItem? {
-        guard let hoveredItemID else { return nil }
-        return grouped.items.first { $0.id == hoveredItemID }
-    }
+    private var grouping: TreemapGrouping { snapshot.grouping }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -99,15 +101,11 @@ struct FileDistributionPanel: View {
     }
 
     private var chartCard: some View {
-        let snapshot = grouped
-        return VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 12) {
                 Label("文件分布", systemImage: "chart.bar.xaxis")
                     .font(.headline)
-                Text("\(displayNodes.count) 项 · \(totalBytes.devSweepFileSize)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
+                totalText
                 if isScanning {
                     Label("扫描进行中，当前为上一次结果", systemImage: "arrow.triangle.2.circlepath")
                         .font(.caption)
@@ -125,22 +123,28 @@ struct FileDistributionPanel: View {
                 .frame(width: 176)
             }
 
+            if grouping.isLowerBound {
+                Label(
+                    "含 \(grouping.lowerBoundCount) 项统计不完整，面积与角度只是已测量下限，不代表真实占比",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+
             Divider()
 
             HStack(alignment: .top, spacing: 16) {
-                chartSection(items: snapshot.items, unmeasuredCount: snapshot.unmeasuredCount)
+                chartSection
                 Divider()
                 DistributionDetailPanel(
                     selectedNodeID: selectedNodeID,
-                    items: snapshot.items,
-                    nodeLookup: nodeLookup,
-                    totalBytes: totalBytes,
-                    nodeCount: displayNodes.count,
-                    onDrillDown: { node in
-                        guard node.canNavigate else { return }
-                        selectedNodeID = node.id
-                        onDrillDown(node.path)
-                    },
+                    items: grouping.items,
+                    snapshot: snapshot,
+                    nodes: nodes,
+                    grouping: grouping,
+                    onDrillDown: drillDown,
                     onIgnore: onIgnore,
                     cleanupLink: cleanupLink,
                     onAddToCleanup: onAddToCleanup,
@@ -148,10 +152,65 @@ struct FileDistributionPanel: View {
                 )
                 .frame(width: 300, height: 390)
             }
+
+            chartFootnote
         }
         .padding(16)
         .background(.quaternary.opacity(0.2))
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    private var totalText: some View {
+        Text("\(snapshot.matchedCount) 项 · \(grouping.isLowerBound ? "≥ " : "")\(grouping.totalBytes.devSweepFileSize)")
+            .font(.caption)
+            .foregroundStyle(grouping.isLowerBound ? Color.orange : Color.secondary)
+            .monospacedDigit()
+    }
+
+    private var chartSection: some View {
+        Group {
+            if grouping.items.isEmpty {
+                chartPlaceholder
+            } else {
+                switch mode {
+                case .treemap:
+                    TreemapChartView(
+                        items: grouping.items,
+                        selectedNodeID: selectedNodeID,
+                        onSelect: { selectedNodeID = $0 },
+                        onDrillDown: drillDown
+                    )
+                case .sunburst:
+                    SunburstChartView(
+                        levels: sunburstLevels,
+                        selectedNodeID: selectedNodeID,
+                        onSelect: { selectedNodeID = $0 },
+                        onDrillDown: drillDown
+                    )
+                }
+            }
+        }
+        .frame(height: 330)
+        .frame(maxWidth: .infinity)
+        .background(Color.primary.opacity(0.035))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    /// 当前层作为最外圈；祖先层按从内到外排列。
+    private var sunburstLevels: [SunburstLevel] {
+        ancestorLevels + [SunburstLevel(items: grouping.items, enteredID: nil)]
+    }
+
+    private func drillDown(_ item: TreemapItem) {
+        guard item.isDirectory, !item.isOther else { return }
+        selectedNodeID = item.id
+        onDrillDown(item.url)
+    }
+
+    private func drillDown(_ node: DiscoveryNode) {
+        guard node.canNavigate else { return }
+        selectedNodeID = node.id
+        onDrillDown(node.path)
     }
 
     private var searchField: some View {
@@ -181,81 +240,30 @@ struct FileDistributionPanel: View {
         .frame(width: 210)
     }
 
-    private func chartSection(items: [TreemapItem], unmeasuredCount: Int) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                if let hoveredItem {
-                    Text(hoveredItem.name)
-                        .font(.caption.weight(.medium))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Text(hoveredItem.bytes.devSweepFileSize)
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                } else {
-                    Label("单击选择，双击目录进入下一级", systemImage: "cursorarrow.click.2")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer(minLength: 0)
-                Text(mode.title)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+    @ViewBuilder
+    private var chartFootnote: some View {
+        HStack(spacing: 12) {
+            Text(mode == .treemap
+                 ? "面积按分配大小计算，虚线边框表示只是下限"
+                 : "角度按分配大小计算，内圈是上一层目录")
+            if grouping.emptyCount > 0 {
+                Text("\(grouping.emptyCount) 项无占用（0 B）")
+                    .foregroundStyle(.secondary)
             }
-            .frame(height: 16)
-
-            Group {
-                if items.isEmpty {
-                    chartPlaceholder
-                } else {
-                    switch mode {
-                    case .treemap:
-                        TreemapCanvasView(
-                            items: items,
-                            lookup: nodeLookup,
-                            selectedNodeID: $selectedNodeID,
-                            hoveredItemID: $hoveredItemID,
-                            onDrillDown: { node in
-                                guard node.canNavigate else { return }
-                                selectedNodeID = node.id
-                                onDrillDown(node.path)
-                            }
-                        )
-                    case .sunburst:
-                        SunburstCanvasView(
-                            items: items,
-                            lookup: nodeLookup,
-                            selectedNodeID: $selectedNodeID,
-                            hoveredItemID: $hoveredItemID,
-                            onDrillDown: { node in
-                                guard node.canNavigate else { return }
-                                selectedNodeID = node.id
-                                onDrillDown(node.path)
-                            }
-                        )
-                    }
-                }
+            if grouping.unmeasuredCount > 0 {
+                Label("\(grouping.unmeasuredCount) 项无法统计，未绘制" +
+                      (selectedNodeID == nil ? "；点击右侧「诊断」查看" : ""),
+                      systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
             }
-            .frame(height: 330)
-            .background(Color.primary.opacity(0.035))
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-
-            HStack(spacing: 12) {
-                Text("面积 / 角度按分配大小计算，颜色对应识别分类")
-                if !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    Text("仅显示匹配项")
-                        .foregroundStyle(.secondary)
-                }
-                if unmeasuredCount > 0 {
-                    Label("\(unmeasuredCount) 项无法统计，未绘制", systemImage: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
-                }
+            if grouping.items.count > 1, grouping.items.contains(where: \.isOther) {
+                Text("超出绘制上限的条目合并为「其他」，总量按真实大小计算")
+                    .foregroundStyle(.secondary)
             }
-            .font(.caption2)
-            .foregroundStyle(.tertiary)
-            .lineLimit(1)
         }
-        .frame(maxWidth: .infinity)
+        .font(.caption2)
+        .foregroundStyle(.tertiary)
+        .lineLimit(1)
     }
 
     private var chartPlaceholder: some View {
@@ -263,7 +271,9 @@ struct FileDistributionPanel: View {
             Image(systemName: "chart.bar.xaxis")
                 .font(.system(size: 28))
                 .foregroundStyle(.secondary)
-            Text(searchText.isEmpty ? "本层没有可绘制的占用数据" : "没有匹配搜索的条目")
+            Text(DiscoverySearch.trimmedQuery(searchText).isEmpty
+                 ? "本层没有可绘制的占用数据"
+                 : "没有匹配搜索的条目")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -271,25 +281,37 @@ struct FileDistributionPanel: View {
     }
 
     private var typeCard: some View {
-        let summaries = typeMetric == .bytes
-            ? FileTypeSummary.direct(nodes: displayNodes)
-            : FileTypeSummary.direct(nodes: displayNodes).sorted {
-                $0.itemCount == $1.itemCount
-                    ? $0.allocatedBytes > $1.allocatedBytes
-                    : $0.itemCount > $1.itemCount
-            }
-        let totalMetric = summaries.reduce(Int64(0)) { partial, summary in
-            partial + metricValue(of: summary)
-        }
+        let summaries = activeSummaries
+        let totalMetric = summaries.reduce(Int64(0)) { $0 + metricValue(of: $1) }
 
         return VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
                 Label("文件类型分布", systemImage: "chart.pie")
                     .font(.headline)
-                Text("当前层直接子项")
+                Text(typeScope.title)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .help(typeScope.help)
+                if let rollupNote = rollup?.note, typeScope == .recursive {
+                    Text(rollupNote)
+                        .font(.caption)
+                        .foregroundStyle(rollup?.isLowerBound == true ? Color.orange : Color.secondary)
+                        .lineLimit(1)
+                }
                 Spacer()
+                if isRollupRunning {
+                    ProgressView().controlSize(.small)
+                    Button("取消") { onCancelRollup() }
+                        .controlSize(.small)
+                }
+                Picker("统计范围", selection: $typeScope) {
+                    ForEach(FileTypeScope.allCases) { scope in
+                        Text(scope.title).tag(scope)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .frame(width: 150)
                 Picker("统计方式", selection: $typeMetric) {
                     ForEach(FileTypeMetric.allCases) { metric in
                         Text(metric.title).tag(metric)
@@ -301,10 +323,7 @@ struct FileDistributionPanel: View {
             }
 
             if summaries.isEmpty {
-                Text("当前筛选下没有可统计的条目。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, minHeight: 54)
+                recursivePlaceholder
             } else {
                 VStack(spacing: 8) {
                     ForEach(summaries) { summary in
@@ -317,13 +336,63 @@ struct FileDistributionPanel: View {
                 }
             }
 
-            Text("目录未展开，整体按「目录」计入；类型只按扩展名判断，不代表可清理性。")
+            Text(typeFootnote)
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .padding(16)
         .background(.quaternary.opacity(0.18))
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    private var activeSummaries: [FileTypeSummary] {
+        let summaries: [FileTypeSummary]
+        switch typeScope {
+        case .direct: summaries = snapshot.typeSummaries
+        case .recursive: summaries = rollup?.summaries ?? []
+        }
+        guard typeMetric == .count else { return summaries }
+        return summaries.sorted { lhs, rhs in
+            if lhs.itemCount != rhs.itemCount { return lhs.itemCount > rhs.itemCount }
+            return lhs.allocatedBytes > rhs.allocatedBytes
+        }
+    }
+
+    private var typeFootnote: String {
+        switch typeScope {
+        case .direct:
+            return "目录未展开，整体按「目录」计入；类型只按扩展名判断，不代表可清理性。合计\(grouping.isLowerBound ? "含统计不完整条目，为下限" : "基于本层已测量数据")。"
+        case .recursive:
+            guard let rollup else {
+                return "递归统计需要遍历整棵子树，代价高于当前层统计。"
+            }
+            return "已扫描 \(rollup.scannedEntries) 个条目：\(rollup.fileCount) 个文件、\(rollup.directoryCount) 个普通目录、\(rollup.packageCount) 个包目录；符号链接 \(rollup.symlinkCount) 个未跟随，跨卷 \(rollup.crossVolumeCount) 个未进入。包目录按整体归类，父目录不重复累计。"
+        }
+    }
+
+    @ViewBuilder
+    private var recursivePlaceholder: some View {
+        if isRollupRunning {
+            Label(rollupPhase ?? "正在递归统计…", systemImage: "hourglass")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, minHeight: 54)
+        } else if typeScope == .recursive {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("这一层还没有递归统计结果。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button(rollup == nil ? "开始递归统计" : "重新递归统计") { onRunRollup() }
+                    .controlSize(.small)
+            }
+            .frame(maxWidth: .infinity, minHeight: 54, alignment: .leading)
+        } else {
+            Text("当前筛选下没有可统计的条目。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, minHeight: 54)
+        }
     }
 
     private func metricValue(of summary: FileTypeSummary) -> Int64 {
@@ -332,9 +401,8 @@ struct FileDistributionPanel: View {
 
     private func typeRow(_ summary: FileTypeSummary, value: Int64, total: Int64) -> some View {
         let fraction = total > 0 ? Double(value) / Double(total) : 0
-        let valueText = typeMetric == .bytes
-            ? summary.allocatedBytes.devSweepFileSize
-            : "\(summary.itemCount) 项"
+        let bytesText = (summary.isLowerBound ? "≥ " : "") + summary.allocatedBytes.devSweepFileSize
+        let valueText = typeMetric == .bytes ? bytesText : "\(summary.itemCount) 项"
         let percentText = String(format: "%.0f%%", fraction * 100)
 
         return HStack(spacing: 10) {
@@ -362,22 +430,30 @@ struct FileDistributionPanel: View {
             .frame(height: 6)
             Text(valueText)
                 .font(.caption.monospacedDigit())
+                .foregroundStyle(summary.isLowerBound ? Color.orange : Color.primary)
                 .frame(width: 92, alignment: .trailing)
             Text(percentText)
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(width: 40, alignment: .trailing)
         }
-        .help("\(summary.category.title)：\(summary.itemCount) 项，分配大小 \(summary.allocatedBytes.devSweepFileSize)，逻辑大小 \(summary.logicalBytes.devSweepFileSize)")
+        .help("""
+        \(summary.category.title)：\(summary.itemCount) 项，\
+        分配大小 \(bytesText)，逻辑大小 \(summary.logicalBytes.devSweepFileSize)\
+        \(summary.isLowerBound ? "，其中 \(summary.lowerBoundCount) 项统计不完整" : "")
+        """)
     }
 }
 
-private struct TreemapCanvasView: View {
+/// 矩形树图画布。悬停状态只保存在本视图内：指针移动不会让父面板重新派生数据。
+/// 绘制项已由分组上限截断，布局代价与目录大小无关。
+private struct TreemapChartView: View {
     let items: [TreemapItem]
-    let lookup: [String: DiscoveryNode]
-    @Binding var selectedNodeID: String?
-    @Binding var hoveredItemID: String?
-    let onDrillDown: (DiscoveryNode) -> Void
+    let selectedNodeID: String?
+    let onSelect: (String?) -> Void
+    let onDrillDown: (TreemapItem) -> Void
+
+    @State private var hovered: TreemapItem?
 
     var body: some View {
         GeometryReader { proxy in
@@ -389,9 +465,10 @@ private struct TreemapCanvasView: View {
             .onContinuousHover { phase in
                 switch phase {
                 case .active(let location):
-                    hoveredItemID = rects.first { $0.frame.contains(location) }?.item.id
+                    let next = rects.first { $0.frame.contains(location) }?.item
+                    if next?.id != hovered?.id { hovered = next }
                 case .ended:
-                    hoveredItemID = nil
+                    hovered = nil
                 }
             }
             .gesture(
@@ -404,8 +481,34 @@ private struct TreemapCanvasView: View {
                     handleTap(at: value.location, rects: rects, drillDown: false)
                 }
             )
+            .overlay(alignment: .topLeading) { hoverCaption }
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("矩形树图，按占用显示当前目录内容")
+        }
+    }
+
+    @ViewBuilder
+    private var hoverCaption: some View {
+        if let hovered {
+            HStack(spacing: 6) {
+                Text(hovered.name)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text((hovered.isLowerBound ? "≥ " : "") + hovered.bytes.devSweepFileSize)
+                    .monospacedDigit()
+                    .foregroundStyle(hovered.isLowerBound ? Color.orange : Color.secondary)
+                if hovered.isOther {
+                    Text("\(hovered.memberCount) 项")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .font(.caption2)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(.regularMaterial)
+            .clipShape(Capsule())
+            .padding(6)
+            .allowsHitTesting(false)
         }
     }
 
@@ -414,19 +517,22 @@ private struct TreemapCanvasView: View {
             let frame = rect.frame.insetBy(dx: 1, dy: 1)
             guard frame.width > 0.5, frame.height > 0.5 else { continue }
 
-            let baseColor = lookup[rect.item.id]?.classification.color
-                ?? (rect.item.isOther ? Color.secondary : Color.gray)
-            let isSelected = selectedNodeID.map { rect.item.memberIDs.contains($0) } ?? false
-            let isHovered = hoveredItemID == rect.item.id
+            let baseColor = rect.item.classification.color
+            let isSelected = rect.item.id == selectedNodeID
+            let isHovered = rect.item.id == hovered?.id
             let path = Path(
                 roundedRect: frame,
                 cornerRadius: min(4, min(frame.width, frame.height) / 3)
             )
             context.fill(path, with: .color(baseColor.opacity(isSelected ? 0.48 : isHovered ? 0.32 : 0.18)))
+            // 虚线边框：这块面积只是已测量下限。
             context.stroke(
                 path,
                 with: .color(baseColor.opacity(isSelected || isHovered ? 0.95 : 0.42)),
-                lineWidth: isSelected ? 2 : 0.8
+                style: StrokeStyle(
+                    lineWidth: isSelected ? 2 : 0.8,
+                    dash: rect.item.isLowerBound ? [4, 3] : []
+                )
             )
 
             guard frame.width > 64, frame.height > 30 else { continue }
@@ -440,9 +546,9 @@ private struct TreemapCanvasView: View {
             )
             if frame.height > 44 {
                 context.draw(
-                    Text(rect.item.bytes.devSweepFileSize)
+                    Text((rect.item.isLowerBound ? "≥ " : "") + rect.item.bytes.devSweepFileSize)
                         .font(.caption2)
-                        .foregroundColor(.secondary),
+                        .foregroundColor(rect.item.isLowerBound ? .orange : .secondary),
                     at: CGPoint(x: frame.minX + 5, y: frame.minY + 20),
                     anchor: .topLeading
                 )
@@ -452,16 +558,14 @@ private struct TreemapCanvasView: View {
 
     private func handleTap(at location: CGPoint, rects: [TreemapRect], drillDown: Bool) {
         guard let rect = rects.first(where: { $0.frame.contains(location) }) else {
-            if !drillDown { selectedNodeID = nil }
+            if !drillDown { onSelect(nil) }
             return
         }
-        selectedNodeID = rect.item.id
-        guard drillDown,
-              !rect.item.isOther,
-              let node = lookup[rect.item.id],
-              node.canNavigate
-        else { return }
-        onDrillDown(node)
+        if drillDown {
+            onDrillDown(rect.item)
+        } else {
+            onSelect(rect.item.id)
+        }
     }
 
     private func abbreviated(_ name: String, maxWidth: CGFloat) -> String {
@@ -471,16 +575,20 @@ private struct TreemapCanvasView: View {
     }
 }
 
-private struct SunburstCanvasView: View {
-    let items: [TreemapItem]
-    let lookup: [String: DiscoveryNode]
-    @Binding var selectedNodeID: String?
-    @Binding var hoveredItemID: String?
-    let onDrillDown: (DiscoveryNode) -> Void
+/// 多层环形图。每层一段半径区间，子层扇区落在父层被展开图块的角度内。
+private struct SunburstChartView: View {
+    let levels: [SunburstLevel]
+    let selectedNodeID: String?
+    let onSelect: (String?) -> Void
+    let onDrillDown: (TreemapItem) -> Void
+
+    @State private var hovered: SunburstSector?
+
+    private var outermostLevel: Int { max(0, levels.count - 1) }
 
     var body: some View {
         GeometryReader { proxy in
-            let sectors = SunburstLayout.layout(items: items)
+            let sectors = SunburstLayout.layout(levels: levels)
             Canvas { context, size in
                 draw(sectors, size: size, in: &context)
             }
@@ -488,13 +596,10 @@ private struct SunburstCanvasView: View {
             .onContinuousHover { phase in
                 switch phase {
                 case .active(let location):
-                    hoveredItemID = SunburstLayout.sector(
-                        at: location,
-                        in: proxy.size,
-                        sectors: sectors
-                    )?.item.id
+                    let next = SunburstLayout.sector(at: location, in: proxy.size, sectors: sectors)
+                    if next?.id != hovered?.id { hovered = next }
                 case .ended:
-                    hoveredItemID = nil
+                    hovered = nil
                 }
             }
             .gesture(
@@ -507,8 +612,34 @@ private struct SunburstCanvasView: View {
                     handleTap(at: value.location, in: proxy.size, sectors: sectors, drillDown: false)
                 }
             )
+            .overlay(alignment: .topLeading) { hoverCaption }
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel("环形分布图，按占用显示当前目录内容")
+            .accessibilityLabel(levels.count > 1
+                                ? "多层环形分布图，内圈是上一层目录"
+                                : "环形分布图，按占用显示当前目录内容")
+        }
+    }
+
+    @ViewBuilder
+    private var hoverCaption: some View {
+        if let hovered {
+            HStack(spacing: 6) {
+                Text("第 \(hovered.level + 1) 圈")
+                    .foregroundStyle(.secondary)
+                Text(hovered.item.name)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text((hovered.item.isLowerBound ? "≥ " : "") + hovered.item.bytes.devSweepFileSize)
+                    .monospacedDigit()
+                    .foregroundStyle(hovered.item.isLowerBound ? Color.orange : Color.secondary)
+            }
+            .font(.caption2)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(.regularMaterial)
+            .clipShape(Capsule())
+            .padding(6)
+            .allowsHitTesting(false)
         }
     }
 
@@ -538,15 +669,20 @@ private struct SunburstCanvasView: View {
             )
             path.closeSubpath()
 
-            let baseColor = lookup[sector.item.id]?.classification.color
-                ?? (sector.item.isOther ? Color.secondary : Color.gray)
-            let isSelected = selectedNodeID.map { sector.item.memberIDs.contains($0) } ?? false
-            let isHovered = hoveredItemID == sector.item.id
-            context.fill(path, with: .color(baseColor.opacity(isSelected ? 0.5 : isHovered ? 0.34 : 0.22)))
+            let baseColor = sector.item.classification.color
+            let isSelected = sector.level == outermostLevel && sector.item.id == selectedNodeID
+            let isHovered = hovered?.id == sector.id
+            // 内圈只是上下文，用更淡的填充区分。
+            let isAncestor = sector.level != outermostLevel
+            let fillOpacity: Double = isSelected ? 0.5 : isHovered ? 0.34 : isAncestor ? 0.14 : 0.22
+            context.fill(path, with: .color(baseColor.opacity(fillOpacity)))
             context.stroke(
                 path,
                 with: .color(baseColor.opacity(isSelected || isHovered ? 0.95 : 0.5)),
-                lineWidth: isSelected ? 2 : 0.8
+                style: StrokeStyle(
+                    lineWidth: isSelected ? 2 : 0.8,
+                    dash: sector.item.isLowerBound ? [4, 3] : []
+                )
             )
 
             if sector.span >= 16, outerRadius - innerRadius > 26 {
@@ -555,25 +691,25 @@ private struct SunburstCanvasView: View {
                     radiusFraction: (sector.innerRadius + sector.outerRadius) / 2,
                     in: size
                 )
-                let name = abbreviated(sector.item.name, maxCharacters: 9)
                 context.draw(
-                    Text(name)
+                    Text(abbreviated(sector.item.name, maxCharacters: 9))
                         .font(.caption2.weight(.medium))
-                        .foregroundColor(.primary),
+                        .foregroundColor(isAncestor ? .secondary : .primary),
                     at: point
                 )
             }
         }
 
-        let total = sectors.reduce(Int64(0)) { $0 + $1.item.bytes }
+        let total = sectors.filter { $0.level == outermostLevel }.reduce(Int64(0)) { $0 + $1.item.bytes }
+        let isLowerBound = sectors.contains { $0.level == outermostLevel && $0.item.isLowerBound }
         context.draw(
-            Text(total.devSweepFileSize)
+            Text((isLowerBound ? "≥ " : "") + total.devSweepFileSize)
                 .font(.system(.headline, design: .rounded))
-                .foregroundColor(.primary),
+                .foregroundColor(isLowerBound ? .orange : .primary),
             at: CGPoint(x: center.x, y: center.y - 7)
         )
         context.draw(
-            Text("本层占用")
+            Text(levels.count > 1 ? "最外层占用" : "本层占用")
                 .font(.caption2)
                 .foregroundColor(.secondary),
             at: CGPoint(x: center.x, y: center.y + 11)
@@ -587,16 +723,23 @@ private struct SunburstCanvasView: View {
         drillDown: Bool
     ) {
         guard let sector = SunburstLayout.sector(at: location, in: size, sectors: sectors) else {
-            if !drillDown { selectedNodeID = nil }
+            if !drillDown { onSelect(nil) }
             return
         }
-        selectedNodeID = sector.item.id
-        guard drillDown,
-              !sector.item.isOther,
-              let node = lookup[sector.item.id],
-              node.canNavigate
-        else { return }
-        onDrillDown(node)
+        if sector.level == outermostLevel {
+            if drillDown {
+                onDrillDown(sector.item)
+            } else {
+                onSelect(sector.item.id)
+            }
+            return
+        }
+        // 内圈单击即把该目录作为新的外层重新扫描，选中项随之下移一层。
+        if sector.item.isDirectory {
+            onDrillDown(sector.item)
+        } else if !drillDown {
+            onSelect(nil)
+        }
     }
 
     private func abbreviated(_ name: String, maxCharacters: Int) -> String {
@@ -605,35 +748,129 @@ private struct SunburstCanvasView: View {
     }
 }
 
+/// 右侧详情：单项、合并分组、以及无法统计条目的诊断。
 private struct DistributionDetailPanel: View {
     let selectedNodeID: String?
     let items: [TreemapItem]
-    let nodeLookup: [String: DiscoveryNode]
-    let totalBytes: Int64
-    let nodeCount: Int
+    let snapshot: DistributionSnapshot
+    let nodes: [DiscoveryNode]
+    let grouping: TreemapGrouping
     let onDrillDown: (DiscoveryNode) -> Void
     let onIgnore: (DiscoveryNode) -> Void
     let cleanupLink: (DiscoveryNode) -> DiscoveryCleanupLink
     let onAddToCleanup: (DiscoveryNode) -> Void
     let onSelect: (String) -> Void
 
+    @State private var otherLimit = DistributionDetailPanel.defaultMemberPageSize
+    @State private var otherQuery = ""
+
+    static let defaultMemberPageSize = 50
+    private static let maxMemberPages = 40
+
     var body: some View {
-        ScrollView(.vertical, showsIndicators: true) {
+        let otherItem = items.first(where: \.isOther)
+        return ScrollView(.vertical, showsIndicators: true) {
             Group {
-                if let selectedNodeID, let node = nodeLookup[selectedNodeID] {
+                if let node = snapshot.node(for: selectedNodeID) {
                     nodeDetail(node)
-                } else if let selectedNodeID,
-                          selectedNodeID == TreemapItem.otherID,
-                          let item = items.first(where: { $0.id == selectedNodeID }) {
-                    otherDetail(item)
+                } else if let otherItem,
+                          selectedNodeID == TreemapItem.otherID
+                            || snapshot.otherContains(nodeID: selectedNodeID) {
+                    otherDetail(otherItem)
                 } else {
                     emptyDetail
                 }
             }
             .padding(14)
+            .onChange(of: selectedNodeID) { _ in
+                otherLimit = Self.defaultMemberPageSize
+                otherQuery = ""
+            }
         }
         .background(.quaternary.opacity(0.14))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    @ViewBuilder
+    private var emptyDetail: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            summaryHeader
+            Divider()
+            LabeledContent("本层条目", value: "\(snapshot.matchedCount) 项")
+                .font(.caption)
+            LabeledContent(
+                "分配大小",
+                value: (grouping.isLowerBound ? "≥ " : "") + grouping.totalBytes.devSweepFileSize
+            )
+            .font(.caption)
+            if grouping.emptyCount > 0 {
+                LabeledContent("无占用（0 B）", value: "\(grouping.emptyCount) 项")
+                    .font(.caption)
+            }
+            if grouping.unmeasuredCount > 0 {
+                unmeasuredSection
+            }
+            Text("未知、系统管理、开发环境和模型条目始终只读。")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var summaryHeader: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Image(systemName: "cursorarrow.click.2")
+                .font(.system(size: 24))
+                .foregroundStyle(.secondary)
+            Text("图表与列表共享同一份扫描结果")
+                .font(.callout.weight(.semibold))
+            Text("单击色块或列表行查看分类、识别依据和清理状态；双击目录进入下一级。搜索会同时过滤图表、类型统计和列表。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// 无法统计的条目单独给出数量和逐条诊断，不与「0 B」混为一谈。
+    private var unmeasuredSection: some View {
+        let samples = DistributionMembers.unmeasured(in: nodes, query: otherQuery, limit: 20)
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Label("无法统计 \(grouping.unmeasuredCount) 项", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.orange)
+                Spacer()
+                TextField("筛选", text: $otherQuery)
+                    .textFieldStyle(.plain)
+                    .font(.caption2)
+                    .frame(width: 70)
+            }
+            Text("这些条目没有可靠的占用数据，因此不进入图表，也不参与面积换算。")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+            ForEach(samples.prefix(5)) { node in
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(node.name)
+                        .font(.caption2.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text(node.measurement.warning ?? node.measurement.failureReason ?? "无法统计")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if grouping.unmeasuredCount > samples.count {
+                Text("另有 \(grouping.unmeasuredCount - samples.count) 项未列出")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(10)
+        .background(Color.orange.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     private func nodeDetail(_ node: DiscoveryNode) -> some View {
@@ -832,23 +1069,52 @@ private struct DistributionDetailPanel: View {
         }
     }
 
+    /// 「其他」分组的成员按分页取回：默认只列出占用最大的 50 项，
+    /// 不在内存里保留整尾成员。
     private func otherDetail(_ item: TreemapItem) -> some View {
-        let members = item.memberIDs.compactMap { nodeLookup[$0] }
+        let members = DistributionMembers.top(
+            in: nodes,
+            excluding: grouping.drawnIDs,
+            query: otherQuery,
+            limit: otherLimit
+        )
+        let canLoadMore = members.count >= otherLimit
+            && otherLimit < item.memberCount
+            && otherLimit < Self.defaultMemberPageSize * Self.maxMemberPages
+
         return VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
                 Image(systemName: "square.stack.3d.up")
                     .foregroundStyle(.secondary)
                 Text(item.name)
                     .font(.callout.weight(.semibold))
+                Spacer()
+                if item.isLowerBound {
+                    Label("含下限", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
             }
-            Text("合计 \(item.bytes.devSweepFileSize) · \(members.count) 项")
+            Text((item.isLowerBound ? "合计 ≥ " : "合计 ") + item.bytes.devSweepFileSize + " · \(item.memberCount) 项")
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(item.isLowerBound ? Color.orange : Color.secondary)
                 .monospacedDigit()
-            Text("这些条目面积过小，在图中合并显示；总量和清理列表都按真实大小计算，不会与父目录重复累计。")
+            Text("这些条目面积过小，在图中合并显示；总量按真实大小计算，不会与父目录重复累计。列表默认只显示占用最大的前 \(Self.defaultMemberPageSize) 项。")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                TextField("在分组内筛选", text: $otherQuery)
+                    .textFieldStyle(.plain)
+                    .font(.caption)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(.quaternary.opacity(0.4))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
 
             Divider()
 
@@ -869,7 +1135,7 @@ private struct DistributionDetailPanel: View {
                                     .truncationMode(.middle)
                                 Text(member.sizeText)
                                     .font(.caption2.monospacedDigit())
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(member.measurement.isComplete ? Color.secondary : Color.orange)
                             }
                             Spacer(minLength: 0)
                             if member.canNavigate {
@@ -884,30 +1150,18 @@ private struct DistributionDetailPanel: View {
                     }
                     .buttonStyle(.plain)
                 }
+                if canLoadMore {
+                    Button("显示更多（已列出 \(members.count) / \(item.memberCount)）") {
+                        otherLimit += Self.defaultMemberPageSize
+                    }
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity)
+                } else if members.isEmpty {
+                    Text("分组内没有匹配「\(otherQuery)」的条目")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
-        }
-    }
-
-    private var emptyDetail: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Image(systemName: "cursorarrow.click.2")
-                .font(.system(size: 24))
-                .foregroundStyle(.secondary)
-            Text("图表与列表共享同一份扫描结果")
-                .font(.callout.weight(.semibold))
-            Text("单击色块或列表行查看分类、识别依据和清理状态；双击目录进入下一级。搜索会同时过滤图表、类型统计和列表。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Divider()
-            LabeledContent("本层条目", value: "\(nodeCount) 项")
-                .font(.caption)
-            LabeledContent("分配大小", value: totalBytes.devSweepFileSize)
-                .font(.caption)
-            Text("未知、系统管理、开发环境和模型条目始终只读。")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
