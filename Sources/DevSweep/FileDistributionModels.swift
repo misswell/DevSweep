@@ -369,12 +369,15 @@ struct DistributionSnapshot: Hashable {
     let typeSummaries: [FileTypeSummary]
     let nodeLookup: [String: DiscoveryNode]
     let matchedCount: Int
+    /// 搜索过滤后的本层条目，详情里的「其他」成员列表直接复用。
+    let layerNodes: [DiscoveryNode]
 
     init(nodes: [DiscoveryNode], query: String) {
         let matched = DiscoverySearch.filter(nodes, query: query)
         self.grouping = TreemapGrouping.grouped(nodes: matched)
         self.typeSummaries = FileTypeSummary.direct(nodes: matched)
         self.matchedCount = matched.count
+        self.layerNodes = matched
         var lookup: [String: DiscoveryNode] = [:]
         lookup.reserveCapacity(matched.count)
         for node in matched {

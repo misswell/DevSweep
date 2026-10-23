@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 
 enum DistributionChartMode: String, CaseIterable, Identifiable {
+    case nested
     case treemap
     case sunburst
 
@@ -9,13 +10,15 @@ enum DistributionChartMode: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .treemap: return "矩形树图"
+        case .nested: return "嵌套树图"
+        case .treemap: return "当前层"
         case .sunburst: return "环形图"
         }
     }
 
     var symbolName: String {
         switch self {
+        case .nested: return "square.grid.3x3.topleft.filled"
         case .treemap: return "square.grid.2x2"
         case .sunburst: return "circle.dashed"
         }
@@ -72,9 +75,22 @@ enum DiscoveryCleanupLink: Equatable {
 struct FileDistributionPanel: View {
     let nodes: [DiscoveryNode]
     let snapshot: DistributionSnapshot
+    /// 树图当前根的直接子项快照；与 `nodes` 在根节点时相同。
+    let treeSnapshot: DiscoveryTreeSnapshot?
+    let chartRootIndex: Int
+    let chartSnapshot: DistributionSnapshot
     @Binding var searchText: String
     @Binding var selectedNodeID: String?
     @Binding var typeScope: FileTypeScope
+    @Binding var nestedDepthLimit: Int
+    let chartRootPath: String?
+    let canChartGoBack: Bool
+    let canChartGoForward: Bool
+    let canChartGoUp: Bool
+    let onChartNavigate: (Int) -> Void
+    let onChartBack: () -> Void
+    let onChartForward: () -> Void
+    let onChartUp: () -> Void
     /// 祖先层（从靠近圆心向外），不含当前层；只有环形图使用。
     let ancestorLevels: [SunburstLevel]
     let rollup: FileTypeRollup?
@@ -88,10 +104,21 @@ struct FileDistributionPanel: View {
     let cleanupLink: (DiscoveryNode) -> DiscoveryCleanupLink
     let onAddToCleanup: (DiscoveryNode) -> Void
 
-    @State private var mode: DistributionChartMode = .treemap
+    @State private var mode: DistributionChartMode = .nested
     @State private var typeMetric: FileTypeMetric = .bytes
+    /// 嵌套树图中被点击的聚合图块；它没有真实路径，需要单独展示成员。
+    @State private var aggregateSelection: NestedAggregateSelection?
 
-    private var grouping: TreemapGrouping { snapshot.grouping }
+    private var activeSnapshot: DistributionSnapshot {
+        mode == .nested ? chartSnapshot : snapshot
+    }
+
+    /// 详情与「其他」成员列表使用的本层条目；嵌套模式下跟随图表根节点。
+    private var activeLayerNodes: [DiscoveryNode] {
+        mode == .nested ? chartSnapshot.layerNodes : nodes
+    }
+
+    private var grouping: TreemapGrouping { activeSnapshot.grouping }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -120,7 +147,7 @@ struct FileDistributionPanel: View {
                 }
                 .labelsHidden()
                 .pickerStyle(.segmented)
-                .frame(width: 176)
+                .frame(width: 240)
             }
 
             if grouping.isLowerBound {
@@ -133,16 +160,33 @@ struct FileDistributionPanel: View {
                 .fixedSize(horizontal: false, vertical: true)
             }
 
+            if mode == .nested {
+                nestedNavigationBar
+            }
+
             Divider()
 
             HStack(alignment: .top, spacing: 16) {
                 chartSection
                 Divider()
+                if let aggregateSelection, mode == .nested {
+                    NestedAggregateDetailPanel(
+                        selection: aggregateSelection,
+                        snapshot: treeSnapshot,
+                        onOpenContainer: { path in
+                            self.aggregateSelection = nil
+                            openInChart(path)
+                        }
+                    )
+                    .frame(width: 300)
+                    .frame(maxHeight: .infinity)
+                } else {
                 DistributionDetailPanel(
                     selectedNodeID: selectedNodeID,
                     items: grouping.items,
-                    snapshot: snapshot,
-                    nodes: nodes,
+                    snapshot: activeSnapshot,
+                    nodes: activeLayerNodes,
+                    treeSnapshot: treeSnapshot,
                     grouping: grouping,
                     onDrillDown: drillDown,
                     onIgnore: onIgnore,
@@ -150,7 +194,9 @@ struct FileDistributionPanel: View {
                     onAddToCleanup: onAddToCleanup,
                     onSelect: { selectedNodeID = $0 }
                 )
-                .frame(width: 300, height: 390)
+                .frame(width: 300)
+                .frame(maxHeight: .infinity)
+                }
             }
 
             chartFootnote
@@ -175,6 +221,27 @@ struct FileDistributionPanel: View {
                 chartPlaceholder
             } else {
                 switch mode {
+                case .nested:
+                    if let treeSnapshot {
+                        NestedTreemapChartView(
+                            snapshot: treeSnapshot,
+                            rootIndex: chartRootIndex,
+                            classifier: DiscoveryClassifier(),
+                            selectedNodeID: selectedNodeID,
+                            searchQuery: searchText,
+                            depthLimit: nestedDepthLimit,
+                            isScanning: isScanning,
+                            onSelect: { selectedNodeID = $0 },
+                            onOpen: openInChart,
+                            onInspectAggregate: { segment, drawnNodeIDs in
+                                aggregateSelection = NestedAggregateSelection(
+                                    segment: segment,
+                                    drawnNodeIDs: drawnNodeIDs
+                                )
+                                selectedNodeID = nil
+                            }
+                        )
+                    }
                 case .treemap:
                     TreemapChartView(
                         items: grouping.items,
@@ -192,7 +259,7 @@ struct FileDistributionPanel: View {
                 }
             }
         }
-        .frame(height: 330)
+        .frame(height: 480)
         .frame(maxWidth: .infinity)
         .background(Color.primary.opacity(0.035))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -201,6 +268,62 @@ struct FileDistributionPanel: View {
     /// 当前层作为最外圈；祖先层按从内到外排列。
     private var sunburstLevels: [SunburstLevel] {
         ancestorLevels + [SunburstLevel(items: grouping.items, enteredID: nil)]
+    }
+
+    private var nestedNavigationBar: some View {
+        HStack(spacing: 8) {
+            Button(action: onChartUp) {
+                Image(systemName: "arrow.up")
+            }
+            .buttonStyle(.borderless)
+            .disabled(!canChartGoUp)
+            .help("返回上一级目录")
+            Button(action: onChartBack) {
+                Image(systemName: "chevron.backward")
+            }
+            .buttonStyle(.borderless)
+            .disabled(!canChartGoBack)
+            .help("后退")
+            Button(action: onChartForward) {
+                Image(systemName: "chevron.forward")
+            }
+            .buttonStyle(.borderless)
+            .disabled(!canChartGoForward)
+            .help("前进")
+
+            Text(chartRootPath.map { URL(fileURLWithPath: $0).devSweepDisplayPath } ?? "扫描根目录")
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help(chartRootPath ?? "")
+
+            Spacer()
+
+            if !chartSnapshot.items.isEmpty {
+                Text("本层 \(chartSnapshot.matchedCount) 项 · " +
+                     (chartSnapshot.grouping.isLowerBound ? "≥ " : "") +
+                     chartSnapshot.grouping.totalBytes.devSweepFileSize)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(chartSnapshot.grouping.isLowerBound ? Color.orange : Color.secondary)
+            }
+
+            Picker("展开深度", selection: $nestedDepthLimit) {
+                ForEach(2...8, id: \.self) { depth in
+                    Text("\(depth) 层").tag(depth)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .frame(width: 78)
+            .help("嵌套树图最多展开的目录层数")
+        }
+    }
+
+    private func openInChart(_ nodeID: String) {
+        guard let snapshot = treeSnapshot, let index = snapshot.index(ofPath: nodeID) else { return }
+        aggregateSelection = nil
+        onChartNavigate(index)
     }
 
     private func drillDown(_ item: TreemapItem) {
@@ -245,9 +368,7 @@ struct FileDistributionPanel: View {
     @ViewBuilder
     private var chartFootnote: some View {
         HStack(spacing: 12) {
-            Text(mode == .treemap
-                 ? "面积按分配大小计算，虚线边框表示只是下限"
-                 : "角度按分配大小计算，内圈是上一层目录")
+            Text(footnoteText)
             if grouping.emptyCount > 0 {
                 Text("\(grouping.emptyCount) 项无占用（0 B）")
                     .foregroundStyle(.secondary)
@@ -266,6 +387,17 @@ struct FileDistributionPanel: View {
         .font(.caption2)
         .foregroundStyle(.tertiary)
         .lineLimit(1)
+    }
+
+    private var footnoteText: String {
+        switch mode {
+        case .nested:
+            return "面积按分配大小计算，子目录嵌套在父图块内；虚线边框表示只是下限"
+        case .treemap:
+            return "面积按分配大小计算，虚线边框表示只是下限"
+        case .sunburst:
+            return "角度按分配大小计算，内圈是上一层目录"
+        }
     }
 
     private var chartPlaceholder: some View {
@@ -355,7 +487,7 @@ struct FileDistributionPanel: View {
     private var activeSummaries: [FileTypeSummary] {
         let summaries: [FileTypeSummary]
         switch typeScope {
-        case .direct: summaries = snapshot.typeSummaries
+        case .direct: summaries = activeSnapshot.typeSummaries
         case .recursive: summaries = rollup?.summaries ?? []
         }
         guard typeMetric == .count else { return summaries }
@@ -755,11 +887,12 @@ private struct SunburstChartView: View {
 }
 
 /// 右侧详情：单项、合并分组、以及无法统计条目的诊断。
-private struct DistributionDetailPanel: View {
+struct DistributionDetailPanel: View {
     let selectedNodeID: String?
     let items: [TreemapItem]
     let snapshot: DistributionSnapshot
     let nodes: [DiscoveryNode]
+    let treeSnapshot: DiscoveryTreeSnapshot?
     let grouping: TreemapGrouping
     let onDrillDown: (DiscoveryNode) -> Void
     let onIgnore: (DiscoveryNode) -> Void
@@ -777,7 +910,7 @@ private struct DistributionDetailPanel: View {
         let otherItem = items.first(where: \.isOther)
         return ScrollView(.vertical, showsIndicators: true) {
             Group {
-                if let node = snapshot.node(for: selectedNodeID) {
+                if let node = resolveNode(selectedNodeID) {
                     nodeDetail(node)
                 } else if let otherItem,
                           selectedNodeID == TreemapItem.otherID
@@ -795,6 +928,15 @@ private struct DistributionDetailPanel: View {
         }
         .background(.quaternary.opacity(0.14))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    /// 选中项可能位于树图更深层，不在本层快照里；按路径回查完整快照，
+    /// 保证图表选中与详情始终指向同一个节点。
+    private func resolveNode(_ nodeID: String?) -> DiscoveryNode? {
+        if let node = snapshot.node(for: nodeID) { return node }
+        guard let nodeID, let treeSnapshot,
+              let index = treeSnapshot.index(ofPath: nodeID) else { return nil }
+        return treeSnapshot.discoveryNode(at: index, classifier: DiscoveryClassifier())
     }
 
     @ViewBuilder

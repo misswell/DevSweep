@@ -1168,7 +1168,10 @@ struct CacheScanner {
             items.append(rawDiskItem)
         }
 
-        guard DockerSupport.executableURL() != nil else { return items }
+        // 没有 Docker 数据目录时（例如扫描的是伪造 home），CLI 仍在运行也不能把
+        // 系统级 Docker 占用算进这个目录；否则清理结果会指向不存在的路径。
+        guard FileManager.default.fileExists(atPath: dockerDataRoot.path),
+              DockerSupport.executableURL() != nil else { return items }
         guard let output = DockerSupport.run(arguments: ["system", "df", "--format", "{{json .}}"])
         else {
             collector.skipped(

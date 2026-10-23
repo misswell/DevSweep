@@ -30,11 +30,15 @@ final class StorageDiscoveryStore: ObservableObject {
         didSet {
             guard searchText != oldValue else { return }
             rebuildGraphSnapshot()
+            rebuildChartSnapshot()
         }
     }
     /// 分布图快照。只在扫描结果、忽略项或搜索条件变化时重建，
     /// 选中与悬停这类视图状态不会触发整层目录重新排序。
     @Published private(set) var graphSnapshot = DistributionSnapshot(nodes: [], query: "")
+    /// 树图当前根的直接子项快照。图表、类型统计和列表都从这里取数，
+    /// 下钻只切换根节点，不重新扫描文件系统。
+    @Published private(set) var chartSnapshot = DistributionSnapshot(nodes: [], query: "")
     /// 多层环形图的祖先层，从靠近圆心向外排列，不含当前层。
     @Published private(set) var graphLevels: [SunburstLevel] = []
     @Published var graphTypeScope: FileTypeScope = .direct {
@@ -46,6 +50,14 @@ final class StorageDiscoveryStore: ObservableObject {
     @Published private(set) var rollup: FileTypeRollup?
     @Published private(set) var isRollupRunning = false
     @Published private(set) var rollupPhase: String?
+    /// 多层树图当前根节点在快照中的索引。下钻只移动图表根，不重新扫描文件系统。
+    @Published private(set) var chartRootIndex = 0
+    /// 树图展开深度；越小越快，也越不容易出现无法阅读的细条。
+    @Published var nestedDepthLimit = 5 {
+        didSet { nestedDepthLimit = min(max(nestedDepthLimit, 1), 8) }
+    }
+    @Published private(set) var chartHistoryBack: [Int] = []
+    @Published private(set) var chartHistoryForward: [Int] = []
 
     private let defaults: UserDefaults
     private var activeFlag: DiscoveryCancellationFlag?
@@ -69,6 +81,114 @@ final class StorageDiscoveryStore: ObservableObject {
     }
 
     var thresholdBytes: Int64 { Int64(thresholdMB) * 1_048_576 }
+
+    var treeSnapshot: DiscoveryTreeSnapshot? { report?.treeSnapshot }
+
+    var chartRootPath: String? {
+        guard let snapshot = treeSnapshot, snapshot.records.indices.contains(chartRootIndex) else { return nil }
+        return snapshot.path(of: chartRootIndex)
+    }
+
+    /// 树图当前根的直接子项，按占用降序，并按列表阈值过滤。
+    var chartLayerNodes: [DiscoveryNode] {
+        layerNodes(applyThreshold: true)
+    }
+
+    /// 图表与类型统计使用的本层条目：保留低于阈值的项目，
+    /// 面积和合计才不会被列表阈值截断。
+    var chartSnapshotNodes: [DiscoveryNode] {
+        layerNodes(applyThreshold: false)
+    }
+
+    private func layerNodes(applyThreshold: Bool) -> [DiscoveryNode] {
+        guard let report, let snapshot = treeSnapshot,
+              snapshot.records.indices.contains(chartRootIndex) else { return visibleNodes }
+        if chartRootIndex == snapshot.rootIndex {
+            return applyThreshold ? visibleNodes : graphNodes
+        }
+        let classifier = DiscoveryClassifier(knownCacheLocations: CacheScanner.knownCacheLocations())
+        let threshold = applyThreshold ? thresholdBytes : 0
+        var nodes: [DiscoveryNode] = []
+        for child in snapshot.children(of: chartRootIndex) {
+            guard let node = snapshot.discoveryNode(at: Int(child), classifier: classifier) else { continue }
+            guard !ignoredPaths.contains(node.id) else { continue }
+            if threshold > 0,
+               node.measurement.state == .complete,
+               node.measurement.allocatedBytes < threshold {
+                continue
+            }
+            nodes.append(node)
+        }
+        _ = report
+        nodes.sort { lhs, rhs in
+            if lhs.measurement.allocatedBytes != rhs.measurement.allocatedBytes {
+                return lhs.measurement.allocatedBytes > rhs.measurement.allocatedBytes
+            }
+            return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+        }
+        return nodes
+    }
+
+    func treeNode(atPath path: String) -> DiscoveryNode? {
+        guard let snapshot = treeSnapshot, let index = snapshot.index(ofPath: path) else { return nil }
+        return snapshot.discoveryNode(
+            at: index,
+            classifier: DiscoveryClassifier(knownCacheLocations: CacheScanner.knownCacheLocations())
+        )
+    }
+
+    func chartIndex(forPath path: String) -> Int? {
+        treeSnapshot?.index(ofPath: path)
+    }
+
+    var scanRootPath: String? { treeSnapshot?.rootURL.path }
+
+    /// 目录跳转优先在已扫描快照内移动图表根；只有快照外的目录才重新扫描。
+    func openDirectory(_ url: URL) {
+        if let index = chartIndex(forPath: url.path) {
+            navigateChart(to: index)
+        } else {
+            scan(directory: url)
+        }
+    }
+
+    func navigateChart(to index: Int) {
+        guard let snapshot = treeSnapshot, snapshot.records.indices.contains(index) else { return }
+        guard index != chartRootIndex else { return }
+        chartHistoryBack.append(chartRootIndex)
+        chartHistoryForward.removeAll()
+        chartRootIndex = index
+        rebuildChartSnapshot()
+    }
+
+    func chartGoUp() {
+        guard let snapshot = treeSnapshot,
+              snapshot.records.indices.contains(chartRootIndex) else { return }
+        let parent = Int(snapshot.records[chartRootIndex].parentIndex)
+        guard parent >= 0 else { return }
+        navigateChart(to: parent)
+    }
+
+    func chartGoBack() {
+        guard let previous = chartHistoryBack.popLast() else { return }
+        chartHistoryForward.append(chartRootIndex)
+        chartRootIndex = previous
+        rebuildChartSnapshot()
+    }
+
+    func chartGoForward() {
+        guard let next = chartHistoryForward.popLast() else { return }
+        chartHistoryBack.append(chartRootIndex)
+        chartRootIndex = next
+        rebuildChartSnapshot()
+    }
+
+    var canChartGoBack: Bool { !chartHistoryBack.isEmpty }
+    var canChartGoForward: Bool { !chartHistoryForward.isEmpty }
+    var canChartGoUp: Bool {
+        guard let snapshot = treeSnapshot, snapshot.records.indices.contains(chartRootIndex) else { return false }
+        return snapshot.records[chartRootIndex].parentIndex >= 0
+    }
 
     var visibleNodes: [DiscoveryNode] {
         (report?.nodes ?? []).filter { !ignoredPaths.contains($0.id) }
@@ -101,6 +221,10 @@ final class StorageDiscoveryStore: ObservableObject {
 
     func rebuildGraphSnapshot() {
         graphSnapshot = DistributionSnapshot(nodes: graphNodes, query: searchText)
+    }
+
+    func rebuildChartSnapshot() {
+        chartSnapshot = DistributionSnapshot(nodes: chartSnapshotNodes, query: searchText)
     }
 
     func addCustomRoots(_ urls: [URL]) {
@@ -164,10 +288,14 @@ final class StorageDiscoveryStore: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self, self.scanGeneration == generation else { return }
                 self.report = result
+                self.chartRootIndex = result.treeSnapshot.rootIndex
+                self.chartHistoryBack = []
+                self.chartHistoryForward = []
                 self.isScanning = false
                 self.activeFlag = nil
                 self.phase = result.wasCancelled ? "已取消" : "扫描完成"
                 self.rebuildGraphSnapshot()
+                self.rebuildChartSnapshot()
                 if self.graphTypeScope == .recursive {
                     // 递归统计比单层扫描贵得多，等本层测完再开始，避免两路 I/O 抢磁盘。
                     self.runRollup()
@@ -275,12 +403,14 @@ final class StorageDiscoveryStore: ObservableObject {
         ignoredPaths.insert(node.id)
         persistIgnoredPaths()
         rebuildGraphSnapshot()
+        rebuildChartSnapshot()
     }
 
     func restoreIgnoredPath(_ path: String) {
         ignoredPaths.remove(path)
         persistIgnoredPaths()
         rebuildGraphSnapshot()
+        rebuildChartSnapshot()
     }
 
     private func persistCustomRoots() {
@@ -341,7 +471,9 @@ struct StorageDiscoveryView: View {
             .max { $0.path.count < $1.path.count }
     }
 
-    private var nodes: [DiscoveryNode] { store.visibleNodes }
+    /// 列表跟随树图根节点：下钻后下方列表就是当前层的条目，
+    /// 不需要重新扫描，也不会与图表显示不同层的数据。
+    private var nodes: [DiscoveryNode] { store.chartLayerNodes }
 
     private var searchedNodes: [DiscoveryNode] {
         DiscoverySearch.filter(nodes, query: searchText)
@@ -379,9 +511,21 @@ struct StorageDiscoveryView: View {
                     FileDistributionPanel(
                         nodes: store.graphNodes,
                         snapshot: store.graphSnapshot,
+                        treeSnapshot: store.treeSnapshot,
+                        chartRootIndex: store.chartRootIndex,
+                        chartSnapshot: store.chartSnapshot,
                         searchText: $store.searchText,
                         selectedNodeID: $selectedNodeID,
                         typeScope: $store.graphTypeScope,
+                        nestedDepthLimit: $store.nestedDepthLimit,
+                        chartRootPath: store.chartRootPath,
+                        canChartGoBack: store.canChartGoBack,
+                        canChartGoForward: store.canChartGoForward,
+                        canChartGoUp: store.canChartGoUp,
+                        onChartNavigate: { store.navigateChart(to: $0) },
+                        onChartBack: { store.chartGoBack() },
+                        onChartForward: { store.chartGoForward() },
+                        onChartUp: { store.chartGoUp() },
                         ancestorLevels: store.graphLevels,
                         rollup: store.rollup,
                         isRollupRunning: store.isRollupRunning,
@@ -422,10 +566,13 @@ struct StorageDiscoveryView: View {
             selectedNodeID = nil
             searchText = ""
         }
+        .onChange(of: store.chartRootIndex) { _ in
+            selectedNodeID = nil
+        }
         .onChange(of: store.report?.scannedAt) { _ in
             guard let selectedNodeID else { return }
             let stillPresent = selectedNodeID == TreemapItem.otherID
-                || store.graphNodes.contains { $0.id == selectedNodeID }
+                || store.treeSnapshot?.index(ofPath: selectedNodeID) != nil
             if !stillPresent {
                 self.selectedNodeID = nil
             }
@@ -701,6 +848,16 @@ struct StorageDiscoveryView: View {
                     .foregroundStyle(.orange)
             }
 
+            if report.limitReached {
+                Label(
+                    "条目数达到上限，只扫描了前 \(report.checkedCount) 项；合计与图块面积只是已扫描部分的下限。",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+
             if !report.issues.isEmpty {
                 DisclosureGroup {
                     VStack(alignment: .leading, spacing: 7) {
@@ -737,21 +894,24 @@ struct StorageDiscoveryView: View {
     }
 
     private func breadcrumbCard(report: DiscoveryReport, root: URL) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let currentPath = report.directory.standardizedFileURL.path
+        return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Button("上一级") {
-                    if let parent = parentDirectory(root: root) {
+                    if store.canChartGoUp {
+                        store.chartGoUp()
+                    } else if let parent = parentDirectory(root: root) {
                         store.scan(directory: parent)
                     }
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .disabled(store.currentDirectory?.standardizedFileURL.path == root.standardizedFileURL.path)
+                .disabled(!store.canChartGoUp && currentPath == root.standardizedFileURL.path)
 
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 5) {
                         Button {
-                            store.scan(directory: root)
+                            store.openDirectory(root)
                         } label: {
                             Label(root.lastPathComponent, systemImage: "externaldrive")
                         }
@@ -768,7 +928,7 @@ struct StorageDiscoveryView: View {
                                     .lineLimit(1)
                             } else {
                                 Button(component.name) {
-                                    store.scan(directory: component.url)
+                                    store.openDirectory(component.url)
                                 }
                                 .buttonStyle(.plain)
                                 .font(.caption)
@@ -877,7 +1037,7 @@ struct StorageDiscoveryView: View {
                 HStack(spacing: 8) {
                     if node.canNavigate {
                         Button {
-                            store.scan(directory: node.path)
+                            store.openDirectory(node.path)
                         } label: {
                             Label("查看", systemImage: "chevron.right")
                         }
@@ -895,7 +1055,7 @@ struct StorageDiscoveryView: View {
                     }
                     Menu {
                         if node.canNavigate {
-                            Button("查看子目录") { store.scan(directory: node.path) }
+                            Button("查看子目录") { store.openDirectory(node.path) }
                         }
                         Button("在 Finder 中显示") {
                             NSWorkspace.shared.activateFileViewerSelecting([node.path])
@@ -934,7 +1094,7 @@ struct StorageDiscoveryView: View {
         .onTapGesture(count: 2) {
             guard node.canNavigate else { return }
             selectedNodeID = node.id
-            store.scan(directory: node.path)
+            store.openDirectory(node.path)
         }
         .simultaneousGesture(
             TapGesture(count: 1).onEnded {
@@ -1101,7 +1261,7 @@ struct StorageDiscoveryView: View {
     }
 
     private func breadcrumbComponents(from root: URL) -> [BreadcrumbComponent] {
-        guard let current = store.currentDirectory?.standardizedFileURL else { return [] }
+        guard let current = store.chartRootPath.map({ URL(fileURLWithPath: $0).standardizedFileURL }) else { return [] }
         let rootPath = root.standardizedFileURL.path
         let currentPath = current.path
         guard currentPath.hasPrefix(rootPath + "/") else { return [] }

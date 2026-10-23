@@ -149,6 +149,70 @@ final class StorageDiscoveryStoreTests: XCTestCase {
         XCTAssertNil(store.rollup)
     }
 
+    /// 下钻只移动图表根，不重扫文件系统；列表、类型统计与详情跟随同一份快照。
+    func testChartNavigationUsesSnapshotWithoutRescanning() throws {
+        let root = try temporaryDirectory(fileNames: ["a.bin"])
+        defer { try? fileManager.removeItem(at: root) }
+        let child = root.appendingPathComponent("child")
+        let grand = child.appendingPathComponent("grand")
+        try fileManager.createDirectory(at: grand, withIntermediateDirectories: true)
+        try Data(repeating: 0x5A, count: 90_000).write(to: grand.appendingPathComponent("deep.bin"))
+        try Data(repeating: 0x5A, count: 50_000).write(to: child.appendingPathComponent("mid.bin"))
+
+        let store = makeStore()
+        store.scan(directory: root)
+        XCTAssertTrue(waitUntil { !store.isScanning && store.report != nil })
+        let scannedAt = try XCTUnwrap(store.report).scannedAt
+        let snapshot = try XCTUnwrap(store.treeSnapshot)
+        XCTAssertEqual(store.chartRootIndex, snapshot.rootIndex)
+        XCTAssertTrue(store.chartSnapshot.items.contains { $0.name == "child" })
+
+        let childIndex = try XCTUnwrap(snapshot.index(ofPath: child.path))
+        store.navigateChart(to: childIndex)
+        XCTAssertEqual(store.chartRootIndex, childIndex)
+        XCTAssertEqual(store.report?.scannedAt, scannedAt, "下钻不能重新扫描")
+        XCTAssertEqual(Set(store.chartLayerNodes.map(\.name)), ["grand", "mid.bin"])
+        XCTAssertEqual(store.chartRootPath, child.standardizedFileURL.path)
+        XCTAssertTrue(store.canChartGoUp)
+
+        let grandIndex = try XCTUnwrap(snapshot.index(ofPath: grand.path))
+        store.navigateChart(to: grandIndex)
+        XCTAssertEqual(Set(store.chartLayerNodes.map(\.name)), ["deep.bin"])
+
+        store.chartGoUp()
+        XCTAssertEqual(store.chartRootIndex, childIndex)
+        store.chartGoBack()
+        XCTAssertEqual(store.chartRootIndex, grandIndex)
+        store.chartGoForward()
+        XCTAssertEqual(store.chartRootIndex, childIndex)
+        XCTAssertEqual(store.report?.scannedAt, scannedAt)
+    }
+
+    /// 树图快照保留低于列表阈值的条目，面积与合计才不会被阈值截断。
+    func testChartSnapshotKeepsEntriesBelowListThreshold() throws {
+        let root = try temporaryDirectory(fileNames: [])
+        defer { try? fileManager.removeItem(at: root) }
+        let child = root.appendingPathComponent("child")
+        try fileManager.createDirectory(at: child, withIntermediateDirectories: true)
+        try Data(repeating: 0x5A, count: 2_000_000).write(to: child.appendingPathComponent("big.bin"))
+        try Data(repeating: 0x5A, count: 1_024).write(to: child.appendingPathComponent("small.bin"))
+
+        let store = makeStore()
+        // 阈值 1 MB：big.bin 保留在列表，small.bin 只出现在图表数据里。
+        store.thresholdMB = 1
+        store.scan(directory: root)
+        XCTAssertTrue(waitUntil { !store.isScanning && store.report != nil })
+
+        let snapshot = try XCTUnwrap(store.treeSnapshot)
+        let childIndex = try XCTUnwrap(snapshot.index(ofPath: child.path))
+        store.navigateChart(to: childIndex)
+
+        XCTAssertEqual(store.chartLayerNodes.map(\.name), ["big.bin"], "列表按阈值过滤")
+        XCTAssertEqual(Set(store.chartSnapshot.items.map(\.name)), ["big.bin", "small.bin"], "图表保留全部条目")
+        XCTAssertEqual(store.chartSnapshot.totalBytes,
+                       snapshot.children(of: childIndex).reduce(Int64(0)) { $0 + snapshot.records[Int($1)].allocatedBytes })
+    }
+
     private func makeStore() -> StorageDiscoveryStore {
         let name = "DevSweepDiscoveryStore-\(UUID().uuidString)"
         suiteNames.append(name)
