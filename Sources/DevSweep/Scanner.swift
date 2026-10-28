@@ -518,6 +518,37 @@ struct CacheScanner {
         CacheRule(category: "CI/CD", name: "CircleCI 缓存", relativePath: ".circleci/cache", risk: .safe, note: "CircleCI 工具会重新生成缓存"),
         CacheRule(category: "云与基础设施", name: "Grafana 缓存", relativePath: ".grafana/cache", risk: .safe, note: "Grafana 会重新生成缓存"),
 
+        // MARK: 参考 PureMac / dusty 补充的覆盖
+        // 这些路径在我们的规则表里此前完全缺位；只新增、不改动上面任何既有条目。
+        // 依据：dusty 的 CleanupTargetRegistry（developer / deep 档）与 PureMac 的
+        // ScanEngine（系统垃圾、邮件附件、AI 应用），均为本机可验证的缓存目录。
+
+        // 浏览器：Safari 的 Cache 是 WebKit 自身的磁盘缓存，退出 Safari 后可重建。
+        // Brave/Arc 是 Chromium 系，缓存目录名固定，删掉只影响下次首屏加载。
+        CacheRule(category: "浏览器缓存", name: "Safari 缓存", relativePath: "Library/Caches/com.apple.Safari", risk: .safe, note: "退出 Safari 后清理；WebKit 会重建缓存，不影响书签、扩展或历史记录"),
+        CacheRule(category: "浏览器缓存", name: "Brave 缓存", relativePath: "Library/Caches/BraveSoftware/Brave-Browser", risk: .safe, note: "退出 Brave 后清理；浏览器会自动重建缓存"),
+        CacheRule(category: "浏览器缓存", name: "Arc 缓存", relativePath: "Library/Caches/Arc", risk: .safe, note: "退出 Arc 后清理；浏览器会自动重建缓存"),
+
+        // 通信类：只碰可重建的缓存/更新安装包，绝不碰聊天数据库与会话。
+        CacheRule(category: "应用缓存", name: "Slack 缓存", relativePath: "Library/Application Support/Slack/Cache", risk: .safe, note: "退出 Slack 后清理；只会重新下载消息与文件缓存，不删除登录状态"),
+        CacheRule(category: "应用缓存", name: "Slack Code Cache", relativePath: "Library/Application Support/Slack/Code Cache", risk: .safe, note: "退出 Slack 后清理；Electron 会重建脚本缓存"),
+        CacheRule(category: "应用缓存", name: "Slack GPUCache", relativePath: "Library/Application Support/Slack/GPUCache", risk: .safe, note: "退出 Slack 后清理；GPU 缓存会自动重建"),
+        CacheRule(category: "应用缓存", name: "Discord 缓存", relativePath: "Library/Application Support/discord/Cache", risk: .safe, note: "退出 Discord 后清理；只会重新下载媒体缓存，不删除登录状态"),
+        CacheRule(category: "应用缓存", name: "Discord Code Cache", relativePath: "Library/Application Support/discord/Code Cache", risk: .safe, note: "退出 Discord 后清理；Electron 会重建脚本缓存"),
+        CacheRule(category: "应用缓存", name: "Signal 缓存", relativePath: "Library/Application Support/Signal/Cache", risk: .safe, note: "退出 Signal 后清理；只重建缓存，不触碰消息数据库"),
+        CacheRule(category: "应用缓存", name: "Telegram 媒体缓存", relativePath: "Library/Application Support/Telegram Desktop/tdata/user_data/cache", risk: .safe, note: "退出 Telegram 后清理；媒体会按需重新从云端下载，不触碰聊天记录"),
+        CacheRule(category: "应用缓存", name: "Teams 缓存", relativePath: "Library/Containers/com.microsoft.teams2/Data/Library/Caches", risk: .safe, note: "退出 Teams 后清理容器内缓存；不触碰登录会话与频道数据"),
+        CacheRule(category: "应用缓存", name: "Zoom 更新安装包", relativePath: "Library/Application Support/zoom.us/AutoUpdater", risk: .safe, note: "仅为已下载的更新安装包；Zoom 会按需重新下载"),
+        CacheRule(category: "应用缓存", name: "Spotify 缓存", relativePath: "Library/Application Support/Spotify/PersistentCache", risk: .review, note: "退出 Spotify 后清理；离线曲目需要重新下载，请确认没有仍需离线收听的音乐"),
+        CacheRule(category: "应用缓存", name: "Obsidian 缓存", relativePath: "Library/Application Support/obsidian/Cache", risk: .safe, note: "退出 Obsidian 后清理；只重建渲染缓存，不触碰笔记库"),
+
+        // 构建工具：Unity 的导入缓存可重建；Go 的模块下载缓存可重新拉取（我们此前只扫 go-build）。
+        CacheRule(category: "测试产物", name: "Unity 导入缓存", relativePath: "Library/Unity/cache", risk: .safe, note: "Unity 会重新导入资源；首次打开项目会稍慢"),
+
+        // 邮件附件：两个参考项目都扫这两处；附件已随邮件保存在服务器，可重新下载。
+        CacheRule(category: "应用缓存", name: "邮件附件（旧路径）", relativePath: "Library/Mail Downloads", risk: .review, note: "已下载的邮件附件；确认不再需要离线附件后清理"),
+        CacheRule(category: "应用缓存", name: "邮件附件", relativePath: "Library/Containers/com.apple.mail/Data/Library/Mail Downloads", risk: .review, note: "已下载的邮件附件；确认不再需要离线附件后清理"),
+
     ]
 
     static func knownCacheLocations(

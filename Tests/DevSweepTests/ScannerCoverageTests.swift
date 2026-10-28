@@ -1250,6 +1250,86 @@ final class ScannerCoverageTests: XCTestCase {
         return url
     }
 
+    /// 参考 PureMac / dusty 补齐的规则：浏览器缓存、通信类 App 缓存、Unity / Go 模块缓存、
+    /// 邮件附件。每一条都必须被扫描器真正发现，并且风险等级按预期（缓存 .safe、
+    /// 离线内容/附件 .review），否则这些目录会继续被静默漏扫。
+    func testReferenceGapRulesAreScannedWithExpectedRisk() throws {
+        let home = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: home) }
+
+        let expected: [(path: String, category: String, risk: RiskLevel)] = [
+            ("Library/Caches/com.apple.Safari", "浏览器缓存", .safe),
+            ("Library/Caches/BraveSoftware/Brave-Browser", "浏览器缓存", .safe),
+            ("Library/Caches/Arc", "浏览器缓存", .safe),
+            ("Library/Application Support/Slack/Cache", "应用缓存", .safe),
+            ("Library/Application Support/discord/Cache", "应用缓存", .safe),
+            ("Library/Application Support/Signal/Cache", "应用缓存", .safe),
+            ("Library/Application Support/Telegram Desktop/tdata/user_data/cache", "应用缓存", .safe),
+            ("Library/Containers/com.microsoft.teams2/Data/Library/Caches", "应用缓存", .safe),
+            ("Library/Application Support/zoom.us/AutoUpdater", "应用缓存", .safe),
+            ("Library/Application Support/Spotify/PersistentCache", "应用缓存", .review),
+            ("Library/Application Support/obsidian/Cache", "应用缓存", .safe),
+            ("Library/Unity/cache", "测试产物", .safe),
+            ("Library/Mail Downloads", "应用缓存", .review),
+            ("Library/Containers/com.apple.mail/Data/Library/Mail Downloads", "应用缓存", .review)
+        ]
+        for entry in expected {
+            try createAllocatedCache(at: home.appendingPathComponent(entry.path))
+        }
+
+        let report = CacheScanner.scan(
+            projectRoots: [],
+            deepScan: false,
+            home: home,
+            includeSystemCaches: false,
+            simulatorRuntimeLister: EmptySimulatorRuntimeListing(),
+            progress: { _ in },
+            environment: [:]
+        )
+        let byPath = Dictionary(uniqueKeysWithValues: report.items.map {
+            ($0.path.standardizedFileURL.path, $0)
+        })
+
+        for entry in expected {
+            let url = home.appendingPathComponent(entry.path).standardizedFileURL
+            guard let item = byPath[url.path] else {
+                XCTFail("未扫描到 \(entry.path)")
+                continue
+            }
+            XCTAssertEqual(item.risk, entry.risk, "\(entry.path) 风险等级")
+            XCTAssertEqual(item.category, entry.category, "\(entry.path) 分类")
+        }
+
+        // Go 的模块下载缓存在既有规则里由 `go/pkg/mod`（.review）整体覆盖，
+        // 不应再单独列一条子路径（否则会被 nonOverlappingItems 折叠成重复项）。
+        try createAllocatedCache(at: home.appendingPathComponent("go/pkg/mod/cache/download"))
+        let goReport = CacheScanner.scan(
+            projectRoots: [],
+            deepScan: false,
+            home: home,
+            includeSystemCaches: false,
+            simulatorRuntimeLister: EmptySimulatorRuntimeListing(),
+            progress: { _ in },
+            environment: [:]
+        )
+        let goItem = goReport.items.first {
+            $0.path.standardizedFileURL.path == home.appendingPathComponent("go/pkg/mod").standardizedFileURL.path
+        }
+        XCTAssertEqual(goItem?.risk, .review, "Go 模块缓存由 go/pkg/mod 覆盖且必须是需确认")
+        XCTAssertFalse(goReport.items.contains {
+            $0.path.standardizedFileURL.path
+                == home.appendingPathComponent("go/pkg/mod/cache/download").standardizedFileURL.path
+        }, "子路径不应重复出现")
+
+        // 邮件附件与 Spotify 离线缓存都属于「需确认」，绝不能默认勾选。
+        for path in ["Library/Mail Downloads",
+                     "Library/Containers/com.apple.mail/Data/Library/Mail Downloads",
+                     "Library/Application Support/Spotify/PersistentCache"] {
+            let url = home.appendingPathComponent(path).standardizedFileURL
+            XCTAssertEqual(byPath[url.path]?.isSelected, false, "\(path) 不应默认勾选")
+        }
+    }
+
     private func createAllocatedCache(at directory: URL) throws {
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         try Data(repeating: 0xA5, count: 1_100_000).write(to: directory.appendingPathComponent("cache.bin"))
