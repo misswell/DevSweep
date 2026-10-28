@@ -519,6 +519,9 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 18) {
                     switch destination {
                     case .all, .category:
+                        // 每帧只过滤一次：`visibleItems` 是计算属性，之前在同一个
+                        // body 里被引用 8 次，等价于 8 趟全量过滤 + 8 次数组分配。
+                        let items = visibleItems
                         overviewCard
                         projectScopeCard
 
@@ -526,18 +529,18 @@ struct ContentView: View {
                             scanSummaryCard(report)
                         }
 
-                        toolbar
+                        toolbar(items: items)
 
                         if store.isScanning && !hasScanReport {
                             scanningState
-                        } else if visibleItems.isEmpty {
+                        } else if items.isEmpty {
                             EmptyStateView(
                                 title: emptyStateTitle,
                                 message: emptyStateMessage
                             )
                         } else {
                             LazyVStack(spacing: 10) {
-                                ForEach(visibleItems) { item in
+                                ForEach(items) { item in
                                     CacheItemRow(item: item, onClean: onCleanSingleItem) { rowItem in
                                         requestAddToQuickClean([rowItem])
                                     }
@@ -971,31 +974,43 @@ struct ContentView: View {
     }
 
     /// 列表头 checkbox：□ 全未选 / − 部分已选 / ✓ 全部已选。
-    private var visibleSelectionStateIcon: String {
-        let selectable = visibleItems.filter { $0.risk != .manual }
-        guard !selectable.isEmpty else { return "square" }
-        if selectable.allSatisfy(\.isSelected) { return "checkmark.square.fill" }
-        if selectable.contains(where: \.isSelected) { return "minus.square" }
+    /// 接收已经过滤好的条目，避免再各跑一趟全量过滤。
+    private func selectionStateIcon(for items: [CacheItem]) -> String {
+        var sawSelectable = false
+        var sawSelected = false
+        var sawUnselected = false
+        for item in items where item.risk != .manual {
+            sawSelectable = true
+            if item.isSelected { sawSelected = true } else { sawUnselected = true }
+            if sawSelected && sawUnselected { break }
+        }
+        guard sawSelectable else { return "square" }
+        if !sawUnselected { return "checkmark.square.fill" }
+        if sawSelected { return "minus.square" }
         return "square"
     }
 
-    private var allVisibleSelected: Bool {
-        let selectable = visibleItems.filter { $0.risk != .manual }
-        return !selectable.isEmpty && selectable.allSatisfy(\.isSelected)
+    private func allSelected(in items: [CacheItem]) -> Bool {
+        var sawSelectable = false
+        for item in items where item.risk != .manual {
+            sawSelectable = true
+            if !item.isSelected { return false }
+        }
+        return sawSelectable
     }
 
-    private var toolbar: some View {
+    private func toolbar(items: [CacheItem]) -> some View {
         HStack(spacing: 12) {
             Button {
-                store.setVisibleSelected(visibleItems, selected: !allVisibleSelected)
+                store.setVisibleSelected(items, selected: !allSelected(in: items))
             } label: {
-                Image(systemName: visibleSelectionStateIcon)
+                Image(systemName: selectionStateIcon(for: items))
                     .font(.body.weight(.medium))
             }
             .buttonStyle(.plain)
             .foregroundStyle(.tint)
-            .disabled(visibleItems.isEmpty || store.isScanning || store.isCleaning)
-            .help(allVisibleSelected ? "取消当前显示选择" : "全选当前显示")
+            .disabled(items.isEmpty || store.isScanning || store.isCleaning)
+            .help(allSelected(in: items) ? "取消当前显示选择" : "全选当前显示")
 
             Label("筛选", systemImage: "line.3.horizontal.decrease.circle")
                 .font(.subheadline.weight(.medium))
@@ -1019,16 +1034,16 @@ struct ContentView: View {
             .disabled(!onlyLarge)
             .help("选择“只看大于”的文件大小阈值")
             Spacer()
-            Text("显示 \(visibleItems.count) 项 · 本页已选 \(scopedSelectedItems.count) 项")
+            Text("显示 \(items.count) 项 · 本页已选 \(scopedSelectedItems.count) 项")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .help(outsideScopeNotice ?? "清理范围＝当前侧栏页面勾选的项目，过滤器不改变它")
             Menu {
                 Button("全选当前显示") {
-                    store.setVisibleSelected(visibleItems, selected: true)
+                    store.setVisibleSelected(items, selected: true)
                 }
                 Button("取消当前显示选择") {
-                    store.setVisibleSelected(visibleItems, selected: false)
+                    store.setVisibleSelected(items, selected: false)
                 }
                 Divider()
                 Button {
@@ -1087,10 +1102,10 @@ struct ContentView: View {
     /// 侧栏「Xcode 空间」显示的合计：扫描得到的 Xcode/CoreSimulator/XCTest 条目。
     /// Runtime 条目已在扫描结果里，不重复加。
     private var xcodeStorageBytes: Int64 {
-        let categories: Set<String> = ["Xcode", "CoreSimulator", "XCTest"]
-        return store.items
-            .filter { categories.contains($0.category) }
-            .reduce(0) { $0 + max(0, $1.size) }
+        store.categorySize("Xcode")
+            + store.categorySize("CoreSimulator")
+            + store.categorySize("XCTest")
+            + store.categorySize("Time Machine 快照")
     }
 
     /// Runtime 删除：先经过清理内核（删除前复核 + 删后轮询验证），
@@ -1115,8 +1130,8 @@ struct ContentView: View {
     }
 
     private func categorySubtitle(_ category: String) -> String {
-        let count = store.items.filter { $0.category == category }.count
-        return "\(count) 项"
+        // 走 store 的缓存索引：之前每个分类都全量 filter 一次，36 个分类就是 36 趟。
+        "\(store.categoryCount(category)) 项"
     }
 
     private func categoryIcon(_ category: String) -> String {

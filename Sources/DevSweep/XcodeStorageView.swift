@@ -62,20 +62,44 @@ final class XcodeRuntimeSource: ObservableObject {
         Self.summaries(for: runtimes)
     }
 
+    /// 保留策略只跟 `runtimes` 有关，算一次缓存起来。
+    ///
+    /// 之前 `removableIdentifiers` / `blockedReasons` / `selectableRuntimeIdentifiers`
+    /// 各自跑一遍 `removableIdentifiers(...)`，而 `blockedReasons[...]` 又写在
+    /// Runtime 行的 ForEach 里，N 个 Runtime 就是 N 次策略计算（每次 O(n log n)）。
+    /// 现在统一走这一个缓存。
+    private var policy: RemovableRuntimes {
+        if let cachedPolicy, cachedPolicyToken == runtimes {
+            return cachedPolicy
+        }
+        let computed = SimulatorRuntimeCleaner.removableIdentifiers(runtimes, protection: protector)
+        cachedPolicy = computed
+        cachedPolicyToken = runtimes
+        return computed
+    }
+
+    private var cachedPolicy: RemovableRuntimes?
+    private var cachedPolicyToken: [SimulatorRuntimeInfo]?
+
     /// 可删除的 identifier（每平台保留最新）。
     var removableIdentifiers: [String] {
-        SimulatorRuntimeCleaner.removableIdentifiers(runtimes, protection: protector).removableIdentifiers
+        policy.removableIdentifiers
     }
 
     /// 不可删除的 Runtime 及原因，用于行内解释。
     var blockedReasons: [String: String] {
-        Dictionary(
-            SimulatorRuntimeCleaner.removableIdentifiers(runtimes, protection: protector)
-                .blocked
-                .map { ($0.runtime.identifier, $0.reason) },
+        if let cachedBlockedReasons, cachedPolicyToken == runtimes {
+            return cachedBlockedReasons
+        }
+        let computed = Dictionary(
+            policy.blocked.map { ($0.runtime.identifier, $0.reason) },
             uniquingKeysWith: { first, _ in first }
         )
+        cachedBlockedReasons = computed
+        return computed
     }
+
+    private var cachedBlockedReasons: [String: String]?
 
     /// 按平台分组的 Runtime，平台内版本从新到旧。
     var runtimeGroups: [XcodeRuntimeGroup] {
@@ -176,9 +200,16 @@ final class XcodeRuntimeSource: ObservableObject {
 
     /// 界面上允许用户勾选的 Runtime：排除 simctl 标记不可移除、以及被保护名单拦下的。
     var selectableRuntimeIdentifiers: Set<String> {
-        Set(runtimes.lazy.filter { $0.deletable != false }.map(\.identifier))
+        if let cachedSelectable, cachedPolicyToken == runtimes {
+            return cachedSelectable
+        }
+        let computed = Set(runtimes.lazy.filter { $0.deletable != false }.map(\.identifier))
             .subtracting(blockedReasons.keys)
+        cachedSelectable = computed
+        return computed
     }
+
+    private var cachedSelectable: Set<String>?
 
     /// 「模拟器 Runtime」行开关：整组勾选/取消所有可删除的 Runtime。
     func setAllRuntimesSelected(_ selected: Bool) {
@@ -600,6 +631,15 @@ enum XcodeCleanSchedule: String, CaseIterable, Identifiable, Hashable {
 
 // MARK: - 页面
 
+/// 快照缓存键：只包含会影响派生结果的输入，避免每次 body 都重新分类全部条目。
+struct XcodeSnapshotKey: Equatable {
+    let itemCount: Int
+    let itemBytes: Int64
+    let runtimeIdentifiers: [String]
+    let diskTotalBytes: Int64?
+    let diskAvailableBytes: Int64?
+}
+
 struct XcodeStorageView: View {
     @ObservedObject private var store: DevSweepStore
     @ObservedObject private var runtimeSource: XcodeRuntimeSource
@@ -623,6 +663,21 @@ struct XcodeStorageView: View {
         _store = ObservedObject(wrappedValue: store)
         _runtimeSource = ObservedObject(wrappedValue: runtimeSource)
         _selection = State(initialValue: XcodeStorageSelection())
+        // 首帧就准备好快照：否则第一次渲染拿到空快照，13 行会闪一下。
+        let initialSnapshot = XcodeStorageSnapshot.build(
+            items: store.items,
+            runtimeItems: runtimeSource.runtimeSummaries,
+            diskTotalBytes: nil,
+            diskAvailableBytes: nil
+        )
+        _snapshot = State(initialValue: initialSnapshot)
+        _snapshotKey = State(initialValue: XcodeSnapshotKey(
+            itemCount: store.items.count,
+            itemBytes: store.items.reduce(0) { $0 + $1.size },
+            runtimeIdentifiers: runtimeSource.runtimes.map(\.identifier),
+            diskTotalBytes: nil,
+            diskAvailableBytes: nil
+        ))
         self.onCleanItems = onCleanItems
         self.onDeleteRuntimes = onDeleteRuntimes
     }
@@ -639,9 +694,16 @@ struct XcodeStorageView: View {
             categorySection
             actionBar
         }
-        .onAppear(perform: markCheckedIfNeeded)
+        .onAppear {
+            markCheckedIfNeeded()
+            refreshSnapshotIfNeeded()
+        }
+        .onChange(of: inputKey) { _ in refreshSnapshotIfNeeded() }
         .onChange(of: store.isScanning) { isScanning in
-            if !isScanning { markCheckedIfNeeded() }
+            if !isScanning {
+                markCheckedIfNeeded()
+                refreshSnapshotIfNeeded()
+            }
             if isScanning { runtimeSource.refresh() }
         }
         .onChange(of: runtimeSource.lastCheckedAt) { value in
@@ -678,19 +740,39 @@ struct XcodeStorageView: View {
         return reason + "\n\n将处理 " + targets + "，合计 " + size + "。"
     }
 
-    // MARK: 派生
+    // MARK: 派生（全部读缓存，body 里不再重算）
 
-    private var rows: [XcodeStorageRow] {
-        XcodeStorageRows.rows(from: summary, items: store.items)
+    /// 缓存一次快照：分类、汇总、13 行、id 映射只在该变的东西变时重算。
+    ///
+    /// 之前这些是计算属性，body 每次求值都会重新分类全部条目（13 × N 次判定），
+    /// 勾一个复选框、悬停一行都会触发，5000 条目时明显卡顿。
+    @State private var snapshot: XcodeStorageSnapshot = .empty()
+    /// 快照对应的输入指纹：条目数 + 总大小 + Runtime 清单 + 磁盘信息。
+    @State private var snapshotKey: XcodeSnapshotKey?
+
+    private var rows: [XcodeStorageRow] { snapshot.rows }
+    private var summary: XcodeStorageSummary { snapshot.summary }
+
+    private var inputKey: XcodeSnapshotKey {
+        XcodeSnapshotKey(
+            itemCount: store.items.count,
+            itemBytes: store.items.reduce(0) { $0 + $1.size },
+            runtimeIdentifiers: runtimeSource.runtimes.map(\.identifier),
+            diskTotalBytes: disk?.totalBytes,
+            diskAvailableBytes: disk?.availableBytes
+        )
     }
 
-    private var summary: XcodeStorageSummary {
-        XcodeStorageSummary(
+    private func refreshSnapshotIfNeeded() {
+        let key = inputKey
+        guard key != snapshotKey else { return }
+        snapshot = XcodeStorageSnapshot.build(
             items: store.items,
             runtimeItems: runtimeSource.runtimeSummaries,
             diskTotalBytes: disk?.totalBytes,
             diskAvailableBytes: disk?.availableBytes
         )
+        snapshotKey = key
     }
 
     private var runtimeItemsByIdentifier: [String: CacheItem] {
@@ -702,15 +784,8 @@ struct XcodeStorageView: View {
         return result
     }
 
-    /// 分类三态判定要用的 id → 条目映射（避免每行重复线性过滤 store.items）。
-    private var itemsByID: [UUID: CacheItem] {
-        var result: [UUID: CacheItem] = [:]
-        result.reserveCapacity(store.items.count)
-        for item in store.items {
-            result[item.id] = item
-        }
-        return result
-    }
+    /// 分类三态判定要用的 id → 条目映射，随快照一起算好。
+    private var itemsByID: [UUID: CacheItem] { snapshot.itemsByID }
 
     /// 可删除的 Runtime 数量；`selected == true` 时只数其中已被勾选的。
     private func selectableRuntimeCount(selected: Bool) -> Int {

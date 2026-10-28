@@ -425,6 +425,21 @@ struct XcodeStorageSummary: Equatable {
         diskTotalBytes: Int64? = nil,
         diskAvailableBytes: Int64? = nil
     ) {
+        self.init(
+            classified: XcodeStorageSnapshot.Classified.build(from: items),
+            runtimeItems: runtimeItems,
+            diskTotalBytes: diskTotalBytes,
+            diskAvailableBytes: diskAvailableBytes
+        )
+    }
+
+    /// 内部入口：使用已经分好类的结果，避免 summary 与 rows 各走一遍分类。
+    init(
+        classified: XcodeStorageSnapshot.Classified,
+        runtimeItems: [SimulatorRuntimeSummary] = [],
+        diskTotalBytes: Int64? = nil,
+        diskAvailableBytes: Int64? = nil
+    ) {
         // Runtime：大小单独累加，不混进条目三档小计，避免视图重复计数。
         let sortedRuntimes = runtimeItems.sorted {
             ($0.platform, $0.version, $0.identifier) < ($1.platform, $1.version, $1.identifier)
@@ -433,68 +448,26 @@ struct XcodeStorageSummary: Equatable {
         self.runtimesByPlatform = Dictionary(grouping: sortedRuntimes, by: \.platform)
             .mapValues { $0.reduce(0) { $0 + max(0, $1.sizeBytes) } }
 
-        var derivedData: Int64 = 0
-        var xcodeCaches: Int64 = 0
-        var simulatorLogs: Int64 = 0
-        var previews: Int64 = 0
-        var simulatorDevices: Int64 = 0
-        var unavailableSimulators: Int64 = 0
-        var deviceSupport: [String: Int64] = [:]
-        var deviceLogs: Int64 = 0
-        var products: Int64 = 0
-        var archives: Int64 = 0
-        var xcodeLogs: Int64 = 0
-        var swiftPM: Int64 = 0
-        var rebuildable: Int64 = 0
-        var review: Int64 = 0
-        var manual: Int64 = 0
+        // 分类与风险都已在那唯一一趟里算好，这里只做汇总，不再逐条判定。
+        self.derivedDataBytes = classified.bytes(for: .derivedData)
+        self.xcodeCachesBytes = classified.bytes(for: .xcodeCaches)
+        self.simulatorLogsCachesBytes = classified.bytes(for: .simulatorLogsCaches)
+        self.swiftUIPreviewBytes = classified.bytes(for: .swiftUIPreviews)
+        self.simulatorDeviceBytes = classified.bytes(for: .simulatorDevices)
+        self.unavailableSimulatorBytes = classified.bytes(for: .unavailableSimulators)
+        self.deviceLogBytes = classified.bytes(for: .deviceLogs)
+        self.xcodeProductBytes = classified.bytes(for: .xcodeProducts)
+        self.deviceSupportByPlatform = classified.deviceSupportByPlatform
+        self.archivesBytes = classified.bytes(for: .archives)
+        self.xcodeLogBytes = classified.bytes(for: .xcodeLogs)
+        self.swiftPMBytes = classified.bytes(for: .swiftPM)
+        let manualExtra = classified.bytes(for: .runtimes)
 
-        for item in Self.xcodeStorageItems(from: items) {
-            let size = max(0, item.size)
-            let category = XcodeStorageClassifier.category(for: item)
-            switch category {
-            case .derivedData: derivedData += size
-            case .xcodeCaches: xcodeCaches += size
-            case .simulatorLogsCaches: simulatorLogs += size
-            case .swiftUIPreviews: previews += size
-            case .simulatorDevices: simulatorDevices += size
-            case .unavailableSimulators: unavailableSimulators += size
-            case .deviceSupport:
-                deviceSupport[XcodeStorageClassifier.deviceSupportPlatform(for: item), default: 0] += size
-            case .deviceLogs: deviceLogs += size
-            case .xcodeProducts: products += size
-            case .archives: archives += size
-            case .xcodeLogs: xcodeLogs += size
-            case .swiftPM: swiftPM += size
-            case .runtimes:
-                // Runtime 由注入清单负责；文件系统里残留的 Runtime 目录归到手动档。
-                manual += size
-            }
-
-            switch XcodeStorageRisk.xcodeRisk(for: item) {
-            case .safe: rebuildable += size
-            case .review: review += size
-            case .manual: manual += size
-            }
-        }
-
-        self.derivedDataBytes = derivedData
-        self.xcodeCachesBytes = xcodeCaches
-        self.simulatorLogsCachesBytes = simulatorLogs
-        self.swiftUIPreviewBytes = previews
-        self.simulatorDeviceBytes = simulatorDevices
-        self.unavailableSimulatorBytes = unavailableSimulators
-        self.deviceSupportByPlatform = deviceSupport
-        self.deviceLogBytes = deviceLogs
-        self.xcodeProductBytes = products
-        self.archivesBytes = archives
-        self.xcodeLogBytes = xcodeLogs
-        self.swiftPMBytes = swiftPM
-
-        self.rebuildableBytes = rebuildable
-        self.reviewBytes = review
-        self.manualBytes = manual
-        self.totalBytes = rebuildable + review + manual
+        self.rebuildableBytes = classified.rebuildableBytes
+        self.reviewBytes = classified.reviewBytes
+        self.manualBytes = classified.manualBytes + manualExtra
+        self.totalBytes = classified.rebuildableBytes + classified.reviewBytes
+            + classified.manualBytes + manualExtra
             + sortedRuntimes.reduce(0) { $0 + max(0, $1.sizeBytes) }
         self.diskTotalBytes = diskTotalBytes
         self.diskAvailableBytes = diskAvailableBytes
@@ -739,6 +712,124 @@ enum XcodeStorageClassifier {
     }
 }
 
+// MARK: - 单趟快照
+
+/// 「Xcode 空间」页面的派生数据：分类、汇总、13 行一次算完。
+///
+/// 早先 `XcodeStorageSummary` 与 `XcodeStorageRows.rows` 各自遍历一遍 items，
+/// 且 rows 对 13 个分类各 filter 一次，等价于 13 × N 次分类判定。这两处都在
+/// SwiftUI body 里被反复求值，5000 条目时单帧要 200ms 以上，页面就卡住了。
+/// 现在统一成「一条目只算一次」，并且由视图缓存结果、只在该变的东西变时重算。
+struct XcodeStorageSnapshot: Equatable {
+    /// 一趟扫描的中间结果：分类桶 + 各类合计 + 风险小计 + DeviceSupport 分平台。
+    struct Classified: Equatable {
+        var byCategory: [XcodeStorageCategory: [CacheItem]] = [:]
+        var bytesByCategory: [XcodeStorageCategory: Int64] = [:]
+        var deviceSupportByPlatform: [String: Int64] = [:]
+        var rebuildableBytes: Int64 = 0
+        var reviewBytes: Int64 = 0
+        var manualBytes: Int64 = 0
+
+        func bytes(for category: XcodeStorageCategory) -> Int64 {
+            bytesByCategory[category] ?? 0
+        }
+
+        /// 单趟：去重 → 分类 → 记大小 → 记风险。
+        static func build(from items: [CacheItem]) -> Classified {
+            var result = Classified()
+            var seen = Set<String>()
+            seen.reserveCapacity(items.count)
+            for item in items where XcodeStorageRisk.isXcodeStorageItem(item) {
+                // CacheItem.path 在 makeItem 里已标准化，这里只做字符串比较去重。
+                guard seen.insert(item.path.path).inserted else { continue }
+                let size = max(0, item.size)
+                let category = XcodeStorageClassifier.category(for: item)
+                result.byCategory[category, default: []].append(item)
+                result.bytesByCategory[category, default: 0] += size
+                if category == .deviceSupport {
+                    result.deviceSupportByPlatform[
+                        XcodeStorageClassifier.deviceSupportPlatform(for: item), default: 0
+                    ] += size
+                }
+                switch XcodeStorageRisk.xcodeRisk(for: item) {
+                case .safe: result.rebuildableBytes += size
+                case .review: result.reviewBytes += size
+                case .manual: result.manualBytes += size
+                }
+            }
+            return result
+        }
+    }
+
+    let classified: Classified
+    let summary: XcodeStorageSummary
+    let rows: [XcodeStorageRow]
+    /// id → 条目。分类三态判定与清理计划都按 id 查，避免每行线性过滤大数组。
+    let itemsByID: [UUID: CacheItem]
+
+    static func empty() -> XcodeStorageSnapshot {
+        build(items: [], runtimeItems: [], diskTotalBytes: nil, diskAvailableBytes: nil)
+    }
+
+    static func build(
+        items: [CacheItem],
+        runtimeItems: [SimulatorRuntimeSummary],
+        diskTotalBytes: Int64?,
+        diskAvailableBytes: Int64?
+    ) -> XcodeStorageSnapshot {
+        let classified = Classified.build(from: items)
+        let summary = XcodeStorageSummary(
+            classified: classified,
+            runtimeItems: runtimeItems,
+            diskTotalBytes: diskTotalBytes,
+            diskAvailableBytes: diskAvailableBytes
+        )
+        var byID: [UUID: CacheItem] = [:]
+        byID.reserveCapacity(items.count)
+        for item in items { byID[item.id] = item }
+
+        var rows: [XcodeStorageRow] = []
+        rows.reserveCapacity(XcodeStorageCategory.allCases.count)
+        let runtimeIDs = summary.runtimeItems.map(\.identifier)
+        for category in XcodeStorageCategory.allCases {
+            let matched = classified.byCategory[category] ?? []
+            let size = category.isRuntimeBacked ? summary.runtimeBytes : classified.bytes(for: category)
+            rows.append(XcodeStorageRow(
+                id: XcodeStorageClassifier.rowID(for: category),
+                title: category.title,
+                subtitle: category.subtitle,
+                risk: category.risk,
+                sizeBytes: size,
+                itemIDs: matched.map(\.id),
+                runtimeIdentifiers: category.isRuntimeBacked ? runtimeIDs : [],
+                isGroup: true,
+                allowsAutomaticClean: category.allowsAutomaticClean
+            ))
+        }
+        return XcodeStorageSnapshot(
+            classified: classified, summary: summary, rows: rows, itemsByID: byID
+        )
+    }
+
+    /// 磁盘信息变化只需要重算 summary，不重新分类。
+    func withDisk(totalBytes: Int64?, availableBytes: Int64?) -> XcodeStorageSnapshot {
+        guard summary.diskTotalBytes != totalBytes || summary.diskAvailableBytes != availableBytes else {
+            return self
+        }
+        return XcodeStorageSnapshot(
+            classified: classified,
+            summary: XcodeStorageSummary(
+                classified: classified,
+                runtimeItems: summary.runtimeItems,
+                diskTotalBytes: totalBytes,
+                diskAvailableBytes: availableBytes
+            ),
+            rows: rows,
+            itemsByID: itemsByID
+        )
+    }
+}
+
 // MARK: - 行模型
 
 /// 一行 = 一个分类（固定 13 行）。空分类 sizeBytes 为 0。
@@ -769,12 +860,22 @@ enum XcodeStorageRows {
         from summary: XcodeStorageSummary,
         items: [CacheItem]
     ) -> [XcodeStorageRow] {
+        // 每个条目只分类一次，再按分类归并。
+        //
+        // 早先的写法是对 13 个分类各 `filter` 一遍全部条目，等价于 13 × N 次
+        // 分类判定（每次都要 lowercased + 多次子串匹配）。5000 条时单次
+        // 计算约 120ms，而这个函数在 SwiftUI body 里会被反复调用，直接表现为
+        // 页面卡顿。改成单趟分组后是 O(N)。
         let storageItems = XcodeStorageSummary.xcodeStorageItems(from: items)
+        var matchedByCategory: [XcodeStorageCategory: [CacheItem]] = [:]
+        matchedByCategory.reserveCapacity(XcodeStorageCategory.allCases.count)
+        for item in storageItems {
+            matchedByCategory[XcodeStorageClassifier.category(for: item), default: []].append(item)
+        }
+
+        let runtimeIDs = summary.runtimeItems.map(\.identifier)
         return XcodeStorageCategory.allCases.map { category in
-            let matched = storageItems.filter {
-                XcodeStorageClassifier.category(for: $0) == category
-            }
-            let runtimeIDs = category.isRuntimeBacked ? summary.runtimeItems.map(\.identifier) : []
+            let matched = matchedByCategory[category] ?? []
             let size: Int64
             if category.isRuntimeBacked {
                 size = summary.runtimeBytes
@@ -788,7 +889,7 @@ enum XcodeStorageRows {
                 risk: category.risk,
                 sizeBytes: size,
                 itemIDs: matched.map(\.id),
-                runtimeIdentifiers: runtimeIDs,
+                runtimeIdentifiers: category.isRuntimeBacked ? runtimeIDs : [],
                 isGroup: true,
                 allowsAutomaticClean: category.allowsAutomaticClean
             )

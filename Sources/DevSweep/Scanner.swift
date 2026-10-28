@@ -3026,7 +3026,9 @@ final class DevSweepStore: ObservableObject {
     private static let quickCleanEntriesKey = "DevSweep.quickCleanEntries"
     private static let quickCleanSortKey = "DevSweep.quickCleanSort"
 
-    @Published private(set) var items: [CacheItem] = []
+    @Published private(set) var items: [CacheItem] = [] {
+        didSet { itemsGeneration &+= 1 }
+    }
     @Published private(set) var isScanning = false
     @Published private(set) var isCleaning = false
     @Published private(set) var statusMessage = "准备扫描"
@@ -3121,11 +3123,55 @@ final class DevSweepStore: ObservableObject {
         return order.filter(present.contains) + present.subtracting(order).sorted()
     }
 
-    var totalSize: Int64 { items.reduce(0) { $0 + $1.size } }
+    var totalSize: Int64 { categoryIndex.totalBytes }
+
+    /// 分类汇总索引：侧栏每个分类都要问一次「多大、几项」，
+    /// 之前每次都是一趟全量 filter+reduce（分类数 × 条目数），侧栏因此常年偏慢。
+    /// 现在按 `items` 的代数缓存，条目变了才重建。
+    private var categoryIndex: CategoryIndex {
+        if let cachedCategoryIndex, cachedCategoryIndexGeneration == itemsGeneration {
+            return cachedCategoryIndex
+        }
+        let index = CategoryIndex(items: items)
+        cachedCategoryIndex = index
+        cachedCategoryIndexGeneration = itemsGeneration
+        return index
+    }
+
+    private var cachedCategoryIndex: CategoryIndex?
+    private var cachedCategoryIndexGeneration: Int = -1
+    /// `items` 每次整体替换时递增；用于让派生缓存失效，避免比较整个数组。
+    private var itemsGeneration: Int = 0
+
+    struct CategoryIndex {
+        let totalBytes: Int64
+        let bytesByCategory: [String: Int64]
+        let countByCategory: [String: Int]
+
+        init(items: [CacheItem]) {
+            var bytes: [String: Int64] = [:]
+            var counts: [String: Int] = [:]
+            var total: Int64 = 0
+            bytes.reserveCapacity(16)
+            counts.reserveCapacity(16)
+            for item in items {
+                bytes[item.category, default: 0] += item.size
+                counts[item.category, default: 0] += 1
+                total += item.size
+            }
+            self.totalBytes = total
+            self.bytesByCategory = bytes
+            self.countByCategory = counts
+        }
+    }
 
     func categorySize(_ category: String?) -> Int64 {
         guard let category else { return totalSize }
-        return items.filter { $0.category == category }.reduce(0) { $0 + $1.size }
+        return categoryIndex.bytesByCategory[category] ?? 0
+    }
+
+    func categoryCount(_ category: String) -> Int {
+        categoryIndex.countByCategory[category] ?? 0
     }
 
     /// 全 App 唯一的清理候选计算入口；过滤器和 Mini 模式都不再各自计算清理范围。
