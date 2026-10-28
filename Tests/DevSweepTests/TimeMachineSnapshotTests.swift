@@ -10,8 +10,11 @@ final class TimeMachineSnapshotTests: XCTestCase {
         var listTimesOut = false
         /// 设置后：删掉的 token 才从列表里消失；为 false 时模拟「命令返回 0 但没删掉」。
         var deleteRemoves = true
+        /// 删除后需要多少次列表刷新才真正消失；用来模拟系统延迟卸载。
+        var deletionLagsListCalls = 0
         var deleteCalls: [[String]] = []
         var listCalls = 0
+        private var pendingRemoval: String?
 
         func run(executable: URL, arguments: [String], environment: [String: String]?, timeout: TimeInterval) -> ProcessResult? {
             if arguments.first == "listlocalsnapshots" {
@@ -22,16 +25,32 @@ final class TimeMachineSnapshotTests: XCTestCase {
                 if listFails {
                     return ProcessResult(status: 1, stdout: Data(), stderr: Data("boom".utf8), timedOut: false)
                 }
+                if let pending = pendingRemoval {
+                    if deletionLagsListCalls > 1 {
+                        deletionLagsListCalls -= 1
+                    } else {
+                        listOutput = listOutput
+                            .split(whereSeparator: \.isNewline)
+                            .filter { !$0.contains(pending) }
+                            .joined(separator: "\n")
+                        pendingRemoval = nil
+                    }
+                }
                 return ProcessResult(status: 0, stdout: Data(listOutput.utf8), stderr: Data(), timedOut: false)
             }
             if arguments.first == "deletelocalsnapshots" {
                 deleteCalls.append(arguments)
                 if deleteRemoves, arguments.count == 2 {
                     let token = arguments[1]
-                    listOutput = listOutput
-                        .split(whereSeparator: \.isNewline)
-                        .filter { !$0.contains(token) }
-                        .joined(separator: "\n")
+                    if deletionLagsListCalls > 0 {
+                        // 模拟「命令已生效，但列表要过几次刷新才更新」。
+                        pendingRemoval = token
+                    } else {
+                        listOutput = listOutput
+                            .split(whereSeparator: \.isNewline)
+                            .filter { !$0.contains(token) }
+                            .joined(separator: "\n")
+                    }
                 }
                 // 故意返回 0：验证我们对「返回 0 但没删掉」的处理。
                 return ProcessResult(status: 0, stdout: Data(), stderr: Data(), timedOut: false)
@@ -75,13 +94,31 @@ final class TimeMachineSnapshotTests: XCTestCase {
         XCTAssertEqual(runner.listCalls, 1, "删除后必须重新列一次确认")
     }
 
+    /// 系统在 tmutil 返回后才把快照从列表摘掉：单次检查会误报失败，
+    /// 轮询复核必须把它等到消失为止。
+    func testDeleteWaitsForLaggedRemovalBeforeReportingFailure() throws {
+        let runner = Runner()
+        runner.listOutput = sample
+        runner.deletionLagsListCalls = 3   // 头几次刷新仍能看到
+        let snapshot = try XCTUnwrap(TimeMachineSnapshotCleaner.parseSnapshots(from: sample).first)
+
+        XCTAssertNoThrow(try TimeMachineSnapshotCleaner.delete(
+            snapshot, runner: runner,
+            verificationTimeout: 5, pollInterval: 0, sleep: { _ in }
+        ), "延迟消失不应被判为失败")
+    }
+
     func testDeleteFailsWhenTmutilReturnsZeroButSnapshotRemains() throws {
         let runner = Runner()
         runner.listOutput = sample
         runner.deleteRemoves = false
         let snapshot = try XCTUnwrap(TimeMachineSnapshotCleaner.parseSnapshots(from: sample).first)
 
-        XCTAssertThrowsError(try TimeMachineSnapshotCleaner.delete(snapshot, runner: runner)) { error in
+        // 轮询复核会一直等到超时，所以这里必须注入短超时，否则单个用例要跑满 30 秒。
+        XCTAssertThrowsError(try TimeMachineSnapshotCleaner.delete(
+            snapshot, runner: runner,
+            verificationTimeout: 0.2, pollInterval: 0, sleep: { _ in }
+        )) { error in
             XCTAssertEqual(error as? TimeMachineSnapshotError,
                            .notRemoved("2026-10-27-151925"),
                            "tmutil 返回 0 但快照仍在时必须报错")

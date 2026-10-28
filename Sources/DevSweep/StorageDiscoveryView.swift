@@ -36,8 +36,20 @@ final class StorageDiscoveryStore: ObservableObject {
     @Published private(set) var largeOldReport: LargeOldFileScanReport?
     @Published private(set) var isScanningLargeOldFiles = false
     /// 大文件阈值（MB）与旧文件天数；0 天数表示不按年龄过滤。
-    @Published var largeFileThresholdMB = 200
-    @Published var largeFileOlderThanDays = 180
+    /// 改值后如果正处在大文件模式，就地重扫——否则界面显示的仍是旧条件的结果，
+    /// 用户会以为筛选没生效。
+    @Published var largeFileThresholdMB = 200 {
+        didSet {
+            guard largeFileThresholdMB != oldValue, isLargeFileMode else { return }
+            scanLargeOldFiles()
+        }
+    }
+    @Published var largeFileOlderThanDays = 180 {
+        didSet {
+            guard largeFileOlderThanDays != oldValue, isLargeFileMode else { return }
+            scanLargeOldFiles()
+        }
+    }
 
     @Published var searchText = "" {
         didSet {
@@ -265,6 +277,8 @@ final class StorageDiscoveryStore: ObservableObject {
 
         scanGeneration += 1
         let generation = scanGeneration
+        // 切换目录后大文件结果同样过期，必须按新目录重扫，否则列表还指着上一个目录。
+        if isLargeFileMode { scanLargeOldFiles() }
         activeFlag?.cancel()
         let flag = DiscoveryCancellationFlag()
         activeFlag = flag
@@ -322,8 +336,13 @@ final class StorageDiscoveryStore: ObservableObject {
     }
 
     /// 只读扫描「大文件 / 旧文件」。与目录树扫描完全独立，互不覆盖结果。
+    /// 大文件扫描的代次：切目录/改阈值会连续触发，旧任务的结果必须丢弃，
+    /// 否则会出现「选了目录 B，列表却是目录 A 的结果」。
+    private var largeOldGeneration = 0
+
     func scanLargeOldFiles() {
-        guard !isScanningLargeOldFiles else { return }
+        largeOldGeneration += 1
+        let generation = largeOldGeneration
         isScanningLargeOldFiles = true
         let home = FileManager.default.homeDirectoryForCurrentUser
         // 只接受用户主目录内的扫描根：如果当前根是 "/" 或 "/Library" 这类系统位置，
@@ -345,7 +364,7 @@ final class StorageDiscoveryStore: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let report = LargeOldFileScanner.scan(criteria: criteria, home: home)
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self, generation == self.largeOldGeneration else { return }
                 self.largeOldReport = report
                 self.isScanningLargeOldFiles = false
             }

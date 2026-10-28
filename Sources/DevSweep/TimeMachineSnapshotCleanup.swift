@@ -130,10 +130,17 @@ enum TimeMachineSnapshotCleaner {
     }
 
     /// 删除一个快照，并以「重新列出后确实消失」作为成功判据。
+    ///
+    /// 系统在 tmutil 返回后可能还要一点时间才把快照从列表里摘掉，所以按
+    /// `verificationTimeout` / `pollInterval` 轮询复核，而不是只看一眼——
+    /// 单次检查会把「删掉了但还没更新」误报成失败。
     static func delete(
         _ snapshot: TimeMachineSnapshot,
         runner: any ProcessRunning & Sendable,
-        deleteTimeout: TimeInterval = 300
+        deleteTimeout: TimeInterval = 300,
+        verificationTimeout: TimeInterval = 30,
+        pollInterval: TimeInterval = 1,
+        sleep: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }
     ) throws {
         guard isValidToken(snapshot.dateToken) else {
             throw TimeMachineSnapshotError.invalidToken(snapshot.dateToken)
@@ -144,11 +151,26 @@ enum TimeMachineSnapshotCleaner {
             environment: nil,
             timeout: deleteTimeout
         )
-        // tmutil 可能返回 0 但什么都没删，必须复核。
-        let remaining = try listSnapshots(runner: runner)
-        guard !remaining.contains(where: { $0.dateToken == snapshot.dateToken }) else {
-            throw TimeMachineSnapshotError.notRemoved(snapshot.dateToken)
+
+        // tmutil 可能返回 0 但什么都没删，也可能删掉了但列表尚未更新：轮询复核。
+        let deadline = Date().addingTimeInterval(max(0, verificationTimeout))
+        var lastError: Error?
+        while true {
+            do {
+                let remaining = try listSnapshots(runner: runner)
+                if !remaining.contains(where: { $0.dateToken == snapshot.dateToken }) {
+                    return
+                }
+                lastError = nil
+            } catch {
+                // 列表本身读不到时留到超时再报，避免一次瞬时失败就判死。
+                lastError = error
+            }
+            if Date() >= deadline { break }
+            sleep(max(0, pollInterval))
         }
+        if let lastError { throw lastError }
+        throw TimeMachineSnapshotError.notRemoved(snapshot.dateToken)
     }
 
     /// 可复制到终端的兜底命令。

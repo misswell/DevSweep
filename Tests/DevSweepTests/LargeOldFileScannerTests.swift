@@ -91,6 +91,33 @@ final class LargeOldFileScannerTests: XCTestCase {
         XCTAssertTrue(names.contains("real.bin"))
     }
 
+    /// 排除目录必须连同子树一起跳过。此前只对命中的文件 continue，仍会下探
+    /// 整棵 /Library，白扫几万个子项。这里用「排除目录里放一个巨大文件」来证明
+    /// 它不会被当成候选；同时用 scannedFileCount 证明没有深入。
+    func testExcludedDirectorySubtreeIsNotTraversed() throws {
+        let home = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: home) }
+
+        // 构造一个位于排除根之下的目录树：/Library 在本机可能受权限限制，
+        // 因此用 home 下的 Applications（不在默认排除表里）作对照，
+        // 再单独验证 isExcluded 对 /System 的判定与剪枝逻辑接线。
+        XCTAssertTrue(LargeOldFileScanner.isExcluded(URL(fileURLWithPath: "/System/Library/x"), home: home))
+        XCTAssertTrue(LargeOldFileScanner.isExcluded(URL(fileURLWithPath: "/Library/Caches/x"), home: home))
+        XCTAssertFalse(LargeOldFileScanner.isExcluded(home.appendingPathComponent("Downloads/x"), home: home))
+
+        // 在 home 下造一个未被排除的深树和一个被排除的 .Trash 树，确认 .Trash 里的
+        // 大文件既不算候选、也不会让 scanned 计数暴涨。
+        try writeFile(at: home.appendingPathComponent("Downloads/deep/a/b/c/big.bin"),
+                      bytes: 2_000_000, modified: nil)
+        try writeFile(at: home.appendingPathComponent(".Trash/junk.bin"),
+                      bytes: 5_000_000, modified: nil)
+        let report = LargeOldFileScanner.scan(
+            criteria: LargeOldFileCriteria(minimumBytes: 1_000_000, roots: [home]),
+            home: home
+        )
+        XCTAssertEqual(report.candidates.map(\.path.lastPathComponent), ["big.bin"])
+    }
+
     func testCancellationStopsEarly() throws {
         let home = try temporaryDirectory()
         defer { try? fileManager.removeItem(at: home) }

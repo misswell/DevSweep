@@ -105,6 +105,11 @@ enum LargeOldFileScanner {
                     )
                 }
                 if isExcluded(url, home: home) {
+                    // 命中排除目录要连同整棵子树跳过：只 continue 会继续下探，
+                    // 把 /Library、~/Applications 之类几万个子项白扫一遍。
+                    if (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
+                        enumerator.skipDescendants()
+                    }
                     continue
                 }
                 guard let values = try? url.resourceValues(forKeys: Set(keys)) else {

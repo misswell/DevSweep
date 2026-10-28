@@ -979,14 +979,18 @@ struct CacheScanner {
             guard !hostName.hasPrefix(".") else { continue }
 
             // 应用缓存目录直接在 <App>/ 下；少数 Electron 版本放在 <App>/session/ 下。
-            let candidateParents = [host, host.appendingPathComponent("session")]
+            // 两处的目录名相同，所以展示名要带上位置，否则列表里会出现两条同名条目。
+            let candidateParents: [(url: URL, suffix: String)] = [
+                (host, ""),
+                (host.appendingPathComponent("session"), " · session")
+            ]
             for parent in candidateParents {
-                guard fileManager.fileExists(atPath: parent.path) else { continue }
+                guard fileManager.fileExists(atPath: parent.url.path) else { continue }
                 for cacheName in electronCacheDirectoryNames {
-                    let cacheURL = parent.appendingPathComponent(cacheName)
+                    let cacheURL = parent.url.appendingPathComponent(cacheName)
                     guard let item = makeItem(
                         category: "应用缓存",
-                        name: "\(hostName) · \(cacheName)",
+                        name: "\(hostName) · \(cacheName)\(parent.suffix)",
                         path: cacheURL,
                         risk: .safe,
                         note: "Electron/Chromium 系应用的渲染与脚本缓存；退出该应用后清理，应用会按需重建",
