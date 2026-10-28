@@ -11,6 +11,9 @@ struct TimeMachineSnapshot: Equatable, Hashable, Sendable {
     let dateToken: String
     /// 界面展示用的本地时间文案。
     let displayDate: Date?
+    /// 快照所属卷（`tmutil listlocalsnapshots /` 的挂载点）。
+    /// 证书/展示用；删除仍只走 `tmutil deletelocalsnapshots`。
+    var volumePath: String = "/"
 
     var displayName: String {
         guard let displayDate else { return dateToken }

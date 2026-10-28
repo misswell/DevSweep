@@ -144,6 +144,28 @@ final class TimeMachineSnapshotTests: XCTestCase {
                        ["2026-10-27-151925", "2026-10-26-090000"])
     }
 
+    /// 快照条目不能用 "/" 当路径：那会命中受保护路径校验，并且在界面上看起来
+    /// 像一个可以「删除整个根目录」的条目。这里钉住它指向快照卷、且能通过校验。
+    func testSnapshotItemPointsAtVolumeNotRootAndValidates() throws {
+        let runner = Runner()
+        runner.listOutput = sample
+        let lister = TimeMachineSnapshotLister(runner: runner)
+        var collector = ScanCollector()
+        let items = CacheScanner.timeMachineSnapshotItems(snapshotLister: lister, collector: &collector)
+
+        let first = try XCTUnwrap(items.first)
+        XCTAssertNotEqual(first.path.standardizedFileURL.path, "/", "不能用根目录当快照路径")
+
+        // 用真实 home 构造上下文，确认这条条目不会被当成受保护路径直接拒掉。
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let context = DeletionContext(
+            whitelistedPaths: [], projectRoots: [], home: home,
+            allowedPaths: [first.path]
+        )
+        XCTAssertNoThrow(try DeletionValidator.validate(item: first, context: context),
+                         "快照条目应当能通过校验；真正的删除由 tmutil 执行器负责")
+    }
+
     func testScannerRecordsDiagnosticWhenTmutilFails() {
         let runner = Runner()
         runner.listFails = true

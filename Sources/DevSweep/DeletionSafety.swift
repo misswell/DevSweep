@@ -135,8 +135,23 @@ struct DeletionValidator {
         guard item.kind == .trash
             || item.kind == .trashContents
             || item.kind == .toolCommand
-            || item.kind == .simulatorDevice else {
+            || item.kind == .simulatorDevice
+            || item.kind == .timeMachineSnapshot else {
             throw DeletionValidationError.unsupportedTarget
+        }
+
+        // Time Machine 快照不是文件系统目标：它没有单独的目录/文件路径可删，
+        // 删除只经 `tmutil deletelocalsnapshots <date>`。这里直接放行，
+        // 由 TimeMachineSnapshotDeletingExecutor 校验 token、重新列举确认。
+        if item.kind == .timeMachineSnapshot {
+            guard let token = item.identifier,
+                  TimeMachineSnapshotCleaner.isValidToken(token) else {
+                throw DeletionValidationError.unsupportedTarget
+            }
+            guard !PathWhitelist.contains(item.path, in: context.whitelistedPaths) else {
+                throw DeletionValidationError.whitelisted
+            }
+            return
         }
 
         let standardized = item.path.standardizedFileURL

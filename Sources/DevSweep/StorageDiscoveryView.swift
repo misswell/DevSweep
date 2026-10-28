@@ -326,7 +326,15 @@ final class StorageDiscoveryStore: ObservableObject {
         guard !isScanningLargeOldFiles else { return }
         isScanningLargeOldFiles = true
         let home = FileManager.default.homeDirectoryForCurrentUser
-        let roots = currentDirectory.map { [ $0 ] } ?? LargeOldFileScanner.defaultRoots(home: home)
+        // 只接受用户主目录内的扫描根：如果当前根是 "/" 或 "/Library" 这类系统位置，
+        // 按它扫会遍历整盘（且几乎全是排除项），所以退回默认的用户数据目录。
+        let userRoot: URL? = currentDirectory.flatMap { directory in
+            let path = directory.standardizedFileURL.path
+            let homePath = home.standardizedFileURL.path
+            guard path == homePath || path.hasPrefix(homePath + "/") else { return nil }
+            return LargeOldFileScanner.isExcluded(directory, home: home) ? nil : directory
+        }
+        let roots = userRoot.map { [ $0 ] } ?? LargeOldFileScanner.defaultRoots(home: home)
         let days = largeFileOlderThanDays > 0 ? largeFileOlderThanDays : nil
         let criteria = LargeOldFileCriteria(
             minimumBytes: Int64(max(1, largeFileThresholdMB)) * 1_048_576,

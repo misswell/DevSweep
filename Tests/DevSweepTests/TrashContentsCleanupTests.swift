@@ -73,6 +73,34 @@ final class TrashContentsCleanupTests: XCTestCase {
         XCTAssertFalse(executor.trashed.contains(caches.standardizedFileURL.path))
     }
 
+    /// `~/Library/Caches` 里可能有指向别处的符号链接。清空时移走的必须是链接本身，
+    /// 而不是链接目标；否则「清空一个缓存目录」会删到目录外的东西。
+    func testTrashContentsTrashesSymlinkItselfNotItsTarget() throws {
+        let home = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: home) }
+
+        let caches = home.appendingPathComponent("Library/Caches")
+        let realData = home.appendingPathComponent("Documents/precious")
+        try fileManager.createDirectory(at: caches, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: realData, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: realData.appendingPathComponent("inside"), withIntermediateDirectories: true)
+        let link = caches.appendingPathComponent("link-to-documents")
+        try fileManager.createSymbolicLink(at: link, withDestinationURL: realData)
+
+        let executor = RecordingTrashExecutor()
+        let item = makeContentsItem(at: caches)
+        let report = CacheCleaner.clean(
+            [item], context: context(for: [caches], home: home), trashExecutor: executor
+        )
+
+        XCTAssertTrue(report.failures.isEmpty, "\(report.failures)")
+        // 被移入废纸篓的是链接自身。
+        XCTAssertEqual(executor.trashed.map { ($0 as NSString).lastPathComponent }, ["link-to-documents"])
+        // 目标绝不能被当成子项。
+        XCTAssertFalse(executor.trashed.contains { $0.contains("precious") })
+        XCTAssertFalse(executor.trashed.contains { $0.contains("inside") })
+    }
+
     func testTrashContentsRejectsItemWhoseIdentityChanged() throws {
         let home = try temporaryDirectory()
         defer { try? fileManager.removeItem(at: home) }

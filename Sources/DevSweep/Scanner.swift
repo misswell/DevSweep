@@ -661,8 +661,7 @@ struct CacheScanner {
                 progress: progress,
                 isSelected: false,
                 kind: .trashContents,
-                statusTitle: "清空内容",
-                omitFromNonOverlapPruning: true
+                statusTitle: "清空内容"
             ) {
                 items.append(item)
             }
@@ -1723,7 +1722,12 @@ struct CacheScanner {
             CacheItem(
                 category: "Time Machine 快照",
                 name: "本地快照 \(snapshot.displayName)",
-                path: URL(fileURLWithPath: "/"),
+                // 快照没有可直接删除的文件路径：删除只走 `tmutil deletelocalsnapshots`。
+                // 这里不做成真实路径——用 "/" 或卷根都会命中「受保护路径」校验，且在
+                // 界面上看起来像「要删整个磁盘」。改用一条不可解析为真实路径的标记
+                // URL（位于受保护的系统快照命名空间），配合 kind == .timeMachineSnapshot
+                // 在校验里按「非文件系统目标」处理。
+                path: URL(fileURLWithPath: "/System/Volumes/Data/.devsweep-time-machine-snapshots/\(snapshot.dateToken)"),
                 size: 0,
                 sizeWarning: "Time Machine 不报告单个本地快照的体积；删除后由系统回收空间",
                 details: snapshot.name,
@@ -2628,8 +2632,7 @@ struct CacheScanner {
         identifier: String? = nil,
         toolAction: ToolCleanupAction? = nil,
         statusTitle: String? = nil,
-        measurement: StorageMeasurement? = nil,
-        omitFromNonOverlapPruning: Bool = false
+        measurement: StorageMeasurement? = nil
     ) -> CacheItem? {
         let standardized = path.standardizedFileURL
         guard fileManager.fileExists(atPath: standardized.path) else { return nil }
@@ -2784,11 +2787,17 @@ protocol TrashExecuting {
 }
 
 extension TrashExecuting {
+    /// 清空目录内容、保留目录本身。
+    ///
+    /// 子项**包含符号链接本身**（`trashItem` 移走的是链接，不会跟随到目标），
+    /// 因此不会因为 `~/Library/Caches` 里有个指向别处的链接就删到链接目标。
+    /// 唯一需要注意的是 `contentsOfDirectory` 不递归，子目录整体移入废纸篓，
+    /// 这正是「清空」的语义。
     func trashContents(keepingDirectory url: URL) throws -> Int {
         let fileManager = FileManager.default
         let children = try fileManager.contentsOfDirectory(
             at: url,
-            includingPropertiesForKeys: [.isSymbolicLinkKey],
+            includingPropertiesForKeys: [.isSymbolicLinkKey, .isDirectoryKey],
             options: []
         )
         var trashed = 0
