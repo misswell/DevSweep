@@ -862,6 +862,12 @@ struct CacheScanner {
             }
         }
 
+        items += electronAppSupportCaches(
+            home: home,
+            collector: &collector,
+            progress: progress
+        )
+
         let documents = home.appendingPathComponent("Documents")
         for browserRoot in childDirectories(at: documents, collector: &collector, progress: progress)
             where browserRoot.lastPathComponent.lowercased().hasPrefix("chrome") {
@@ -918,6 +924,67 @@ struct CacheScanner {
             }
         }
 
+        return items
+    }
+
+    /// `~/Library/Application Support/*` 下的 Electron / Chromium 系缓存目录。
+    ///
+    /// 这类应用（QQ/钉钉/飞书/网盘/各类桌面客户端）把缓存放在
+    /// `Application Support/<App>/{Cache,Code Cache,GPUCache,DawnGraphiteCache,
+    /// DawnWebGPUCache,ShaderCache}` 里，路径无统一命名规则，只能按目录名模式发现。
+    /// 参考 PureMac 的「用户缓存动态发现」与 dusty 的 App Cache 目标清单。
+    ///
+    /// 只认这几种**纯缓存**目录名；`Local Storage`、`IndexedDB`、`Session Storage`、
+    /// `databases`、`Service Worker`（可能持有离线数据/登录态）一律不碰。
+    /// 另外跳过容器/系统托管目录，避免与沙盒、iCloud、钥匙串边界打架。
+    private static let electronCacheDirectoryNames: Set<String> = [
+        "Cache", "Code Cache", "GPUCache", "DawnGraphiteCache",
+        "DawnWebGPUCache", "ShaderCache"
+    ]
+
+    /// 明确不扫描的宿主目录：系统/容器/托管型，缓存不是可自由删除的应用缓存，
+    /// 或是 DevSweep 自身与 Agent 状态。
+    private static let electronAppSupportExcludedHosts: Set<String> = [
+        "com.apple.sharedfilelist", "CloudDocs", "MobileSync", "AddressBook",
+        "CallHistoryDB", "Knowledge", "com.apple.TCC", "com.apple.mail",
+        "Code", "Cursor", "Lingma", "Windsurf", "Trae CN", "Trae",
+        "ai.opencode.desktop", "Zed", "Nova", "com.apple.dt.Xcode",
+        "devsweep", "DevSweep", ".DS_Store"
+    ]
+
+    private static func electronAppSupportCaches(
+        home: URL,
+        collector: inout ScanCollector,
+        progress: @escaping (ScanProgress) -> Void
+    ) -> [CacheItem] {
+        let support = home.appendingPathComponent("Library/Application Support")
+        guard fileManager.fileExists(atPath: support.path) else { return [] }
+
+        var items: [CacheItem] = []
+        for host in childDirectories(at: support, collector: &collector, progress: progress) {
+            let hostName = host.lastPathComponent
+            guard !electronAppSupportExcludedHosts.contains(hostName) else { continue }
+            guard !hostName.hasPrefix(".") else { continue }
+
+            // 应用缓存目录直接在 <App>/ 下；少数 Electron 版本放在 <App>/session/ 下。
+            let candidateParents = [host, host.appendingPathComponent("session")]
+            for parent in candidateParents {
+                guard fileManager.fileExists(atPath: parent.path) else { continue }
+                for cacheName in electronCacheDirectoryNames {
+                    let cacheURL = parent.appendingPathComponent(cacheName)
+                    guard let item = makeItem(
+                        category: "应用缓存",
+                        name: "\(hostName) · \(cacheName)",
+                        path: cacheURL,
+                        risk: .safe,
+                        note: "Electron/Chromium 系应用的渲染与脚本缓存；退出该应用后清理，应用会按需重建",
+                        collector: &collector,
+                        progress: progress
+                    ) else { continue }
+                    items.append(item)
+                }
+            }
+        }
         return items
     }
 

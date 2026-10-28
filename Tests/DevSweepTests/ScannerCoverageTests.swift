@@ -1250,6 +1250,70 @@ final class ScannerCoverageTests: XCTestCase {
         return url
     }
 
+    /// Electron / Chromium 系的 `Application Support/<App>/{Cache,Code Cache,GPUCache,...}`
+    /// 只能按目录名动态发现；同时必须跳过可能持有离线数据/登录态的目录，以及已经
+    /// 由专门规则覆盖的 IDE 宿主。这个测试把「发现什么」和「绝不发现什么」都钉住。
+    func testElectronAppSupportCachesAreDiscoveredButSensitiveDirsSkipped() throws {
+        let home = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: home) }
+
+        let support = home.appendingPathComponent("Library/Application Support")
+        let discovered = [
+            "SomeChat/Code Cache",
+            "SomeChat/GPUCache",
+            "NetDisk/Cache",
+            "NetDisk/DawnGraphiteCache",
+            "FooClient/session/Code Cache",
+            "BarApp/ShaderCache"
+        ]
+        let mustNotDiscover = [
+            // 可能持有离线数据或登录态，绝不当纯缓存清掉。
+            "SomeChat/Local Storage",
+            "SomeChat/IndexedDB",
+            "SomeChat/databases",
+            "SomeChat/Service Worker",
+            "SomeChat/Session Storage",
+            // 系统托管目录。
+            "CloudDocs/Cache",
+            "com.apple.sharedfilelist/Cache"
+        ]
+        for relative in discovered + mustNotDiscover {
+            try createAllocatedCache(at: support.appendingPathComponent(relative))
+        }
+
+        let report = CacheScanner.scan(
+            projectRoots: [],
+            deepScan: false,
+            home: home,
+            includeSystemCaches: false,
+            simulatorRuntimeLister: EmptySimulatorRuntimeListing(),
+            progress: { _ in },
+            environment: [:]
+        )
+        let paths = Set(report.items.map { $0.path.standardizedFileURL.path })
+
+        for relative in discovered {
+            let url = support.appendingPathComponent(relative).standardizedFileURL
+            XCTAssertTrue(paths.contains(url.path), "应发现 \(relative)")
+            XCTAssertEqual(report.items.first { $0.path.standardizedFileURL.path == url.path }?.category,
+                           "应用缓存", relative)
+        }
+        for relative in mustNotDiscover {
+            let url = support.appendingPathComponent(relative).standardizedFileURL
+            XCTAssertFalse(paths.contains(url.path), "不应发现 \(relative)")
+        }
+
+        // IDE 宿主（Code / Cursor）已有专门的固定规则。动态发现必须跳过它们，
+        // 否则同一路径会出现两条（一条 IDE、一条应用缓存）。这里只钉「不会重复」。
+        for relative in ["Code/Cache", "Cursor/GPUCache"] {
+            let url = support.appendingPathComponent(relative).standardizedFileURL
+            let matches = report.items.filter { $0.path.standardizedFileURL.path == url.path }
+            XCTAssertLessThanOrEqual(matches.count, 1, "\(relative) 不能被重复列入")
+            XCTAssertFalse(matches.contains { $0.category == "应用缓存" },
+                           "\(relative) 不应由动态发现归入应用缓存")
+        }
+    }
+
     /// 参考 PureMac / dusty 补齐的规则：浏览器缓存、通信类 App 缓存、Unity / Go 模块缓存、
     /// 邮件附件。每一条都必须被扫描器真正发现，并且风险等级按预期（缓存 .safe、
     /// 离线内容/附件 .review），否则这些目录会继续被静默漏扫。
