@@ -343,7 +343,9 @@ struct XcodeStorageSelection: Equatable {
             let key = Self.categoryKeyPrefix + category.rawValue
             if let saved = defaults.object(forKey: key) as? Bool {
                 if saved { enabled.insert(category) }
-            } else if category.risk == .safe {
+            } else if category.defaultSwitchOn {
+                // 对齐参考实现：DerivedData / Xcode 缓存 / 模拟器日志缓存 /
+                // SwiftUI 预览 / 不可用模拟器 / 模拟器 Runtime 默认打开，其余默认关闭。
                 enabled.insert(category)
             }
         }

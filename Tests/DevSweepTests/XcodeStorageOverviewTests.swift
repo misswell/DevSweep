@@ -191,6 +191,33 @@ final class XcodeStorageOverviewTests: XCTestCase {
         }
     }
 
+    /// 对齐参考实现 XcodeCacheCleaner 的 `includedInOneTapClean`：默认打开的开关
+    /// 与默认关闭的开关必须逐类一致。这个映射错一位，用户就会在没点过任何开关的
+    /// 情况下多清理或少清理一整类占用。
+    func testDefaultSwitchMatchesReferenceIncludedInOneTapClean() {
+        let shouldBeOn: Set<XcodeStorageCategory> = [
+            .derivedData, .xcodeCaches, .simulatorLogsCaches, .swiftUIPreviews,
+            .unavailableSimulators, .runtimes
+        ]
+        for category in XcodeStorageCategory.allCases {
+            XCTAssertEqual(category.defaultSwitchOn, shouldBeOn.contains(category),
+                           "\(category.title) 的默认开关与参考实现不一致")
+        }
+        // 「默认打开」不等于「可直接删除」：这两类必须仍然逐项确认。
+        XCTAssertFalse(XcodeStorageCategory.runtimes.allowsAutomaticClean)
+        XCTAssertFalse(XcodeStorageCategory.simulatorDevices.allowsAutomaticClean)
+        XCTAssertFalse(XcodeStorageCategory.archives.allowsAutomaticClean)
+        XCTAssertFalse(XcodeStorageCategory.deviceSupport.allowsAutomaticClean)
+        // 参考实现里 runtimes / unavailableSimulators 的 includedInOneTapClean 是 true。
+        XCTAssertTrue(XcodeStorageCategory.runtimes.defaultSwitchOn)
+        XCTAssertTrue(XcodeStorageCategory.unavailableSimulators.defaultSwitchOn)
+        // 设备日志、产品缓存、Xcode 日志、SwiftPM 在参考实现里都是 false。
+        for c in [XcodeStorageCategory.deviceLogs, .xcodeProducts, .xcodeLogs,
+                  .swiftPM, .archives, .deviceSupport, .simulatorDevices] {
+            XCTAssertFalse(c.defaultSwitchOn, "\(c.title) 默认应关闭")
+        }
+    }
+
     func testDeviceSupportIsManualForAllPlatformNames() {
         for platform in ["iOS", "watchOS", "tvOS", "macOS", "visionOS", "xrOS"] {
             let cacheItem = CacheItem(

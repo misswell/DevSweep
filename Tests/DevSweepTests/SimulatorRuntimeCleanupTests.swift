@@ -411,6 +411,38 @@ final class SimulatorRuntimeCleanupTests: XCTestCase {
         XCTAssertTrue(single.removable.isEmpty)
     }
 
+    /// 复现用户截图里的真实形态：iOS 26.5 + 27.0 两个版本，UUID 作 identifier，
+    /// 平台相同。必须只有一个「保留最新」（27.0），26.5 可删除；两版本都被判为
+    /// 「保留最新」会让整行一个都删不掉，这正是 `RuntimeVersion("27.0")` 早期
+    /// 解析失败留下的坑。
+    func testRealMacTwoRuntimeShapeKeepsOnlyTheNewest() {
+        let old = makeRuntime(
+            "10DA06ED-69CE-43AC-BC36-998873EBD095",
+            version: "26.5",
+            runtimeIdentifier: "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
+            build: "23F77",
+            mountPath: "/Library/Developer/CoreSimulator/Volumes/iOS_23F77"
+        )
+        let new = makeRuntime(
+            "C921E11F-A3CA-49B7-B19A-1B3250611292",
+            version: "27.0",
+            runtimeIdentifier: "com.apple.CoreSimulator.SimRuntime.iOS-27-0",
+            build: "24A5370g",
+            mountPath: "/Library/Developer/CoreSimulator/Volumes/iOS_24A5370g"
+        )
+        let plan = SimulatorRuntimeCleaner.removableIdentifiers([old, new], protection: openProtection)
+        XCTAssertEqual(plan.kept.map(\.version), ["27.0"], "只保留最新版本")
+        XCTAssertEqual(plan.removableIdentifiers, [old.identifier], "26.5 可删除")
+        XCTAssertTrue(plan.blocked.isEmpty, "不应有额外阻塞：\(plan.blocked)")
+
+        // 版本字符串带 build 后缀时也必须正确排序（文本兜底输出常见）。
+        let taggedOld = makeRuntime("OLD", version: "26.5 - 23F77")
+        let taggedNew = makeRuntime("NEW", version: "27.0 - 24A5370g")
+        let taggedPlan = SimulatorRuntimeCleaner.removableIdentifiers([taggedOld, taggedNew], protection: openProtection)
+        XCTAssertEqual(taggedPlan.kept.map(\.identifier), ["NEW"])
+        XCTAssertEqual(taggedPlan.removableIdentifiers, ["OLD"])
+    }
+
     func testDeletableFalseIsNeverRemovedEvenWhenOldest() {
         let lockedOld = makeRuntime("iOS-26-5", version: "26.5", deletable: false)
         let new = makeRuntime("iOS-27-0", version: "27.0", deletable: true)
@@ -488,6 +520,12 @@ final class SimulatorRuntimeCleanupTests: XCTestCase {
         XCTAssertNil(RuntimeVersion(""))
         XCTAssertNil(RuntimeVersion("beta"))
         XCTAssertNil(RuntimeVersion("26.beta"))
+        // simctl 的 version 可能被文本兜底或诊断输出串上 build（`26.5 - 23F77`），
+        // 保留策略只认数字前缀；这里断言不会把整段当成非法而误保留全部版本。
+        XCTAssertEqual(RuntimeVersion("26.5 - 23F77")?.description, "26.5")
+        XCTAssertTrue(RuntimeVersion("26.5 - 23F77")! < RuntimeVersion("27.0")!)
+        // 但纯数字后面跟的非点号内容一律拒绝，避免把 27 当成 27.x 参与比较。
+        XCTAssertNil(RuntimeVersion("27beta"))
     }
 
     // MARK: - 4. 删除流程

@@ -89,12 +89,40 @@ enum XcodeStorageCategory: String, CaseIterable, Hashable {
 
     /// 是否允许参与「一键清理 / 定时清理」。模拟器设备清空、Runtime、归档、
     /// 不可用模拟器、DeviceSupport 在参考实现里都不允许自动清理。
+    /// 是否允许参与「一键清理 / 定时清理」。
+    ///
+    /// 对齐参考实现（XcodeCacheCleaner 的 `allowsAutomaticClean`）：
+    /// - 可重建的文件/日志类缓存允许；
+    /// - Runtime 不在一键清理里（但可在本页逐条勾选删除）——参考实现给 runtimes 的
+    ///   `includedInOneTapClean` 是 true、`allowsAutomaticClean` 是 false，这里保持
+    ///   「不参与自动/定时清理」，避免无人值守时把系统镜像删掉；
+    /// - 归档、DeviceSupport、模拟器设备清空一律手动；
+    /// - 不可用模拟器在参考实现里允许（includedInOneTapClean: true），但它仍然
+    ///   必须逐项勾选，所以这里保持允许，只是默认不勾选。
     var allowsAutomaticClean: Bool {
         switch self {
         case .derivedData, .xcodeCaches, .simulatorLogsCaches, .swiftUIPreviews,
              .deviceLogs, .xcodeProducts, .xcodeLogs, .swiftPM, .unavailableSimulators:
             return true
         case .simulatorDevices, .deviceSupport, .archives, .runtimes:
+            return false
+        }
+    }
+
+    /// 分类开关的默认状态，对齐参考实现的 `includedInOneTapClean`：
+    /// DerivedData / Xcode 缓存 / 模拟器日志缓存 / SwiftUI 预览 / 不可用模拟器 /
+    /// 模拟器 Runtime 默认打开；归档、DeviceSupport、设备数据、设备日志、产品缓存、
+    /// Xcode 日志、SwiftPM 缓存默认关闭。
+    ///
+    /// 注意「开关打开」不等于「会被删除」：真正删除时还要过 `allowsAutomaticClean`
+    /// 和逐条勾选（Runtime、不可用模拟器都必须逐项确认）。
+    var defaultSwitchOn: Bool {
+        switch self {
+        case .derivedData, .xcodeCaches, .simulatorLogsCaches, .swiftUIPreviews,
+             .unavailableSimulators, .runtimes:
+            return true
+        case .simulatorDevices, .deviceSupport, .deviceLogs, .xcodeProducts,
+             .archives, .xcodeLogs, .swiftPM:
             return false
         }
     }

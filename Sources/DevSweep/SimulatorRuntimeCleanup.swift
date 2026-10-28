@@ -197,16 +197,24 @@ struct RuntimeVersion: Comparable, CustomStringConvertible, Hashable {
     let rawValue: String
 
     init?(_ raw: String) {
+        // 允许两种输入：纯数字版本（`26.5`、`27.0`），以及文本兜底里带 build 的
+        // `26.5 - 23F77`。只截到「空格/`(`/`-`」之前的数字前缀，其余一律拒绝：
+        // `26.beta`、`27beta` 这种半数字版本必须返回 nil，让调用方按「无法比较」
+        // 保守保留，而不是悄悄截成 26/27 参与保留或删除判断。
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
+        let head = trimmed.split(whereSeparator: { $0 == " " || $0 == "(" || $0 == "-" }).first.map(String.init) ?? ""
+        guard !head.isEmpty else { return nil }
+        let segments = head.split(separator: ".", omittingEmptySubsequences: false)
+        guard !segments.isEmpty else { return nil }
         var components: [Int] = []
-        for part in trimmed.split(separator: ".") {
+        for part in segments {
             guard let value = Int(part), value >= 0 else { return nil }
             components.append(value)
         }
         guard !components.isEmpty else { return nil }
         self.components = components
-        self.rawValue = trimmed
+        self.rawValue = head
     }
 
     var description: String { rawValue }
