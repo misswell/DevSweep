@@ -98,6 +98,13 @@ final class XcodeRuntimeSource: ObservableObject {
         Self.activityLike(activity)
     }
 
+    /// 测试注入：直接放进一份 Runtime 清单，不启动任何进程。
+    func installForTesting(_ runtimes: [SimulatorRuntimeInfo]) {
+        self.runtimes = runtimes
+        self.error = nil
+        syncSelectionWithRuntimes()
+    }
+
     // MARK: 动作
 
     /// 重新读 Runtime 清单与 Xcode 活动状态。与 `store.scan()` 并行，互不等待。
@@ -150,8 +157,15 @@ final class XcodeRuntimeSource: ObservableObject {
         persistSelection()
     }
 
+    /// 单条 Runtime 的勾选。
+    ///
+    /// 这里只拦「明确不可删除」的（simctl 标记不可移除 / 命中保护名单）。
+    /// **不再**要求它必须是「比最新版本旧的版本」——每个平台如果只剩一个版本，
+    /// 用户依然应该能明确选择删掉它，只是默认不勾。真正删除前
+    /// `SimulatorRuntimeDeletingExecutor` 会重新核对，并为「删掉平台唯一版本」
+    /// 给出明确理由，因此这里放开不会造成误删。
     func setRuntimeSelected(_ identifier: String, selected: Bool) {
-        guard removableIdentifiers.contains(identifier) || !selected else { return }
+        guard selectableRuntimeIdentifiers.contains(identifier) || !selected else { return }
         if selected {
             selectedRuntimeIdentifiers.insert(identifier)
         } else {
@@ -160,21 +174,31 @@ final class XcodeRuntimeSource: ObservableObject {
         persistSelection()
     }
 
+    /// 界面上允许用户勾选的 Runtime：排除 simctl 标记不可移除、以及被保护名单拦下的。
+    var selectableRuntimeIdentifiers: Set<String> {
+        Set(runtimes.lazy.filter { $0.deletable != false }.map(\.identifier))
+            .subtracting(blockedReasons.keys)
+    }
+
     /// 「模拟器 Runtime」行开关：整组勾选/取消所有可删除的 Runtime。
     func setAllRuntimesSelected(_ selected: Bool) {
         if selected {
-            selectedRuntimeIdentifiers = Set(removableIdentifiers)
+            selectedRuntimeIdentifiers = selectableRuntimeIdentifiers
         } else {
             selectedRuntimeIdentifiers.removeAll()
         }
         persistSelection()
     }
 
-    /// 删除前把「当前勾选」再和真实清单核对一次：勾选里已经不可删除的会被剔掉。
+    /// 删除前把「当前勾选」再和真实清单核对一次：只保留仍然存在、且没有被标记
+    /// 为不可删除的 identifier。是否「仍是本平台最新版本」交给执行器在删除时复核，
+    /// 这里不静默剔除，否则界面勾了却什么都不发生。
     func takeDeletionIdentifiers() -> [String] {
-        let removable = removableIdentifiers
-        let ordered = removable.filter { selectedRuntimeIdentifiers.contains($0) }
-        selectedRuntimeIdentifiers.subtract(Set(removable).subtracting(Set(ordered)))
+        let selectable = selectableRuntimeIdentifiers
+        let ordered = runtimes.map(\.identifier).filter {
+            selectable.contains($0) && selectedRuntimeIdentifiers.contains($0)
+        }
+        selectedRuntimeIdentifiers = selectedRuntimeIdentifiers.intersection(selectable)
         return ordered
     }
 
@@ -377,12 +401,12 @@ struct XcodeStorageSelection: Equatable {
         guard !row.isEmpty else {
             return isCategoryEnabled(category) ? .on : .off
         }
-        let total = row.itemIDs.filter { itemsByID[$0]?.risk != .manual }.count
+        let total = row.itemIDs.filter { itemsByID[$0] != nil }.count
         guard total > 0 else {
             return isCategoryEnabled(category) ? .on : .off
         }
         let chosen = row.itemIDs.filter { id in
-            guard let item = itemsByID[id], item.risk != .manual else { return false }
+            guard let item = itemsByID[id] else { return false }
             return isItemIncluded(path: SelectionMemory.key(for: item.path))
         }.count
         if chosen == 0 { return .off }
@@ -488,7 +512,8 @@ struct XcodeCleanupPlan: Equatable {
             guard selection.isCategoryEnabled(category) else { continue }
             let wanted = Set(row.itemIDs)
             for item in items where wanted.contains(item.id) {
-                guard item.risk != .manual else { continue }
+                // 手动项也允许被选择：安全由「逐项勾选 + 执行器自身复核」保证，
+                // 而不是在这里静默剔除，否则用户勾了却删不掉、或者根本点不动。
                 guard selection.isItemIncluded(path: SelectionMemory.key(for: item.path)) else { continue }
                 chosen.append(item)
             }
@@ -1321,10 +1346,13 @@ private struct XcodeStorageItemRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
+            // 手动项（DeviceSupport / 归档 / 模拟器设备数据等）也必须能勾选：
+            // 它们只是不能「批量/自动」清理，不代表用户不能明确选择。真正执行时
+            // 仍由各自的专用删除路径处理（模拟器设备走 simctl、其余走废纸篓）。
             Toggle("", isOn: $included)
                 .labelsHidden()
                 .toggleStyle(.checkbox)
-                .disabled(item.risk == .manual || isBusy)
+                .disabled(isBusy)
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 8) {

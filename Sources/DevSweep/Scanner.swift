@@ -76,7 +76,7 @@ fileprivate enum DockerSupport {
     }
 }
 
-private struct ScanCollector {
+struct ScanCollector {
     var checkedPaths = 0
     var skippedPaths = 0
     var permissionFailures = 0
@@ -108,6 +108,7 @@ struct CacheScanner {
         includeSystemCaches: Bool = true,
         xctestActivityInspector: XCTestActivityInspecting = XCTestActivityInspector(),
         simulatorRuntimeLister: SimulatorRuntimeListing = SimulatorRuntimeLister(),
+        timeMachineSnapshotLister: TimeMachineSnapshotListing = TimeMachineSnapshotLister(),
         progress: @escaping (ScanProgress) -> Void,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> ScanReport {
@@ -194,6 +195,18 @@ struct CacheScanner {
         items += simulatorRuntimeItems(
             runtimeLister: simulatorRuntimeLister,
             home: home,
+            collector: &collector
+        )
+
+        progress(ScanProgress(
+            phase: "检查 Time Machine 本地快照",
+            checkedPaths: collector.checkedPaths,
+            matchedPaths: items.count,
+            skippedPaths: collector.skippedPaths,
+            permissionFailures: collector.permissionFailures
+        ))
+        items += timeMachineSnapshotItems(
+            snapshotLister: timeMachineSnapshotLister,
             collector: &collector
         )
 
@@ -1687,6 +1700,44 @@ struct CacheScanner {
         return items
     }
 
+    /// Time Machine 本地快照作为可清理条目。
+    ///
+    /// 每个快照单独一条、永不默认勾选：快照是备份，删掉就没有这一份时间点。
+    /// `com.apple.os.update-*` 不进入候选（由 TimeMachineSnapshotCleaner 过滤）。
+    static func timeMachineSnapshotItems(
+        snapshotLister: TimeMachineSnapshotListing,
+        collector: inout ScanCollector
+    ) -> [CacheItem] {
+        let snapshots: [TimeMachineSnapshot]
+        do {
+            snapshots = try snapshotLister.snapshots()
+        } catch {
+            collector.skipped(
+                URL(fileURLWithPath: "/"),
+                reason: "无法读取 Time Machine 本地快照：\(error.localizedDescription)",
+                kind: .unavailable
+            )
+            return []
+        }
+        return snapshots.map { snapshot in
+            CacheItem(
+                category: "Time Machine 快照",
+                name: "本地快照 \(snapshot.displayName)",
+                path: URL(fileURLWithPath: "/"),
+                size: 0,
+                sizeWarning: "Time Machine 不报告单个本地快照的体积；删除后由系统回收空间",
+                details: snapshot.name,
+                risk: .manual,
+                kind: .timeMachineSnapshot,
+                identifier: snapshot.dateToken,
+                note: "本地快照是 Time Machine 在磁盘上保留的一个还原点，删除后无法恢复；"
+                    + "系统需要空间时本来也会自动回收最早的快照",
+                statusTitle: "需逐条确认",
+                isSelected: false
+            )
+        }
+    }
+
     private static func projectArtifacts(
         in root: URL,
         deepScan: Bool,
@@ -2776,7 +2827,8 @@ struct CacheCleaner {
         xctestActivityInspector: XCTestActivityInspecting = XCTestActivityInspector(),
         trashExecutor: TrashExecuting = FileManagerTrashExecutor(),
         simulatorExecutor: SimulatorCleanupExecuting = SimulatorCleanupExecutor(),
-        simulatorRuntimeExecutor: SimulatorRuntimeDeleting = SimulatorRuntimeDeletingExecutor()
+        simulatorRuntimeExecutor: SimulatorRuntimeDeleting = SimulatorRuntimeDeletingExecutor(),
+        timeMachineExecutor: TimeMachineSnapshotDeleting = TimeMachineSnapshotDeletingExecutor()
     ) -> CleanupReport {
         var removed: [CacheItem] = []
         var failures: [(CacheItem, String)] = []
@@ -2832,6 +2884,8 @@ struct CacheCleaner {
                     try simulatorExecutor.delete(item, context: context)
                 case .simulatorRuntime:
                     try simulatorRuntimeExecutor.delete(item, context: context)
+                case .timeMachineSnapshot:
+                    try timeMachineExecutor.delete(item, context: context)
                 case .dockerPrune:
                     guard let rawTarget = item.identifier,
                           let target = DockerCleanupTarget(rawValue: rawTarget) else {
@@ -3048,7 +3102,7 @@ final class DevSweepStore: ObservableObject {
             "Android 项目", "测试产物", "测试工具", "包管理器", "语言工具链", "Ruby", "前端工具链",
             "CI/CD", "云与基础设施", "Docker", "AI/ML", "AI Agent", "JVM", "IDE", "数据库工具",
             "API / 调试工具", "开发工具", "Android Studio", "设计工具", "浏览器缓存", "应用缓存",
-            "项目日志", "其他开发缓存"
+            "项目日志", "Time Machine 快照", "其他开发缓存"
         ]
         let present = Set(items.map(\.category))
         return order.filter(present.contains) + present.subtracting(order).sorted()

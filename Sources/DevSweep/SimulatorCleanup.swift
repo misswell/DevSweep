@@ -169,13 +169,22 @@ struct SimulatorRuntimeDeletingExecutor: SimulatorRuntimeDeleting {
             return
         }
         let label = current.displayName
-        let candidates = SimulatorRuntimeCleaner.removableIdentifiers(installed)
-        guard candidates.removable.contains(where: { $0.identifier == identifier }) else {
-            let reason = candidates.blocked.first(where: { $0.runtime.identifier == identifier })?.reason
-            throw SimulatorRuntimeLookupError.stillProtected(
-                runtime: label,
-                reason: reason ?? "它是所在平台的最新版本，删除后该平台将没有可用模拟器；如需删除请先安装更高版本"
-            )
+        // 只有「明确不可删除」才直接拒绝：simctl 标记不可移除、或落在保护根目录下。
+        if let reason = SimulatorRuntimeCleaner.removalCandidates(installed)
+            .first(where: { $0.runtime.identifier == identifier })?.blockReason,
+           !(SimulatorRuntimeCleaner.removalCandidates(installed)
+                .first(where: { $0.runtime.identifier == identifier })?.isLatest ?? false) {
+            throw SimulatorRuntimeLookupError.stillProtected(runtime: label, reason: reason)
+        }
+
+        // 用户可能明确选择删掉某平台的唯一版本。允许，但要在结果里说清楚：
+        // 该平台将没有可用模拟器（而不是静默删掉让人下次开机才发现）。
+        let siblings = installed.filter {
+            SimulatorRuntimeCleaner.platformTitle($0.platformIdentifier)
+                == SimulatorRuntimeCleaner.platformTitle(current.platformIdentifier)
+        }
+        if siblings.count <= 1 {
+            throw SimulatorRuntimeLookupError.lastRuntimeOfPlatform(runtime: label)
         }
 
         let outcome = SimulatorRuntimeCleaner.delete(
@@ -213,6 +222,7 @@ enum SimulatorRuntimeLookupError: LocalizedError, Equatable {
     case invalidTarget
     case listFailed(String)
     case stillProtected(runtime: String, reason: String)
+    case lastRuntimeOfPlatform(runtime: String)
     case deletionFailed(runtime: String, detail: String, remaining: [String])
 
     var errorDescription: String? {
@@ -223,6 +233,9 @@ enum SimulatorRuntimeLookupError: LocalizedError, Equatable {
             return "清理前无法确认模拟器 Runtime 列表：\(detail)"
         case let .stillProtected(runtime, reason):
             return "Runtime \(runtime) 已跳过：\(reason)"
+        case let .lastRuntimeOfPlatform(runtime):
+            return "\(runtime) 是所在平台仅剩的 Runtime，删除后该平台将没有可用模拟器；"
+                + "如确实需要删除，请先装一个更高版本的 Runtime 再来清理"
         case let .deletionFailed(runtime, detail, remaining):
             let left = remaining.isEmpty ? "" : "；仍存在的 Runtime：\(remaining.joined(separator: ", "))"
             return "Runtime \(runtime) 删除失败：\(detail)\(left)。可以复制兜底命令到终端重试"

@@ -215,7 +215,11 @@ struct ContentView: View {
     private var bottomBarNotice: String {
         let recoverability: String
         if selectedCleanupIncludesNonRecoverable {
-            recoverability = "包含官方工具或设备清理，执行后不可从废纸篓恢复"
+            if scopedSelectedItems.contains(where: { $0.kind == .timeMachineSnapshot }) {
+                recoverability = "包含 Time Machine 本地快照，删除后这个还原点无法恢复"
+            } else {
+                recoverability = "包含官方工具或设备清理，执行后不可从废纸篓恢复"
+            }
         } else if scopedSelectedItems.contains(where: { $0.kind == .trashContents }) {
             // 清空内容：目录保留，但被清空的子项同样进入废纸篓，可以逐个恢复，
             // 数量可能很多，措辞要和「删一个目录」区分开。
@@ -2157,6 +2161,7 @@ private struct CacheItemRow: View {
         case .dockerPrune: return "shippingbox"
         case .toolCommand: return "wrench.and.screwdriver"
         case .requestLogTrim: return "cylinder.split.1x2"
+        case .timeMachineSnapshot: return "clock.arrow.circlepath"
         case .trashContents: return "trash"
         case .trash:
             if item.category.contains("Xcode") || item.category == "XCTest" { return "hammer" }
@@ -2173,6 +2178,7 @@ private struct CacheItemRow: View {
         case .dockerPrune: return "Docker 资源"
         case .toolCommand: return "官方清理命令"
         case .requestLogTrim: return "就地裁剪日志"
+        case .timeMachineSnapshot: return "Time Machine 本地快照"
         case .trashContents: return "清空目录内容"
         case .trash: return item.expectedFileIdentity?.kind == .regular ? "缓存文件" : "缓存目录"
         }

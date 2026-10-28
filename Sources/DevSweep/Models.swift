@@ -11,6 +11,9 @@ enum CleanupKind: String, Hashable {
     /// `~/.Trash`、`~/Downloads` 这类系统预期的根目录。直接丢进废纸篓会破坏
     /// 目录结构，因此逐个把子项移入废纸篓，目录本身保留。
     case trashContents
+    /// Time Machine 本地快照：只能通过 `tmutil deletelocalsnapshots` 删除。
+    /// 快照是备份数据，只做逐条手动确认，永不自动勾选。
+    case timeMachineSnapshot
     case dockerPrune
     case toolCommand
     case requestLogTrim
@@ -19,7 +22,8 @@ enum CleanupKind: String, Hashable {
         switch self {
         case .trash:
             return false
-        case .simulatorDevice, .simulatorRuntime, .dockerPrune, .toolCommand, .requestLogTrim:
+        case .simulatorDevice, .simulatorRuntime, .dockerPrune, .toolCommand,
+             .requestLogTrim, .timeMachineSnapshot:
             return true
         case .trashContents:
             // 子项各自进废纸篓，仍可从废纸篓恢复。
@@ -238,7 +242,7 @@ struct CleanupSelection {
             return true
         case .trashContents:
             return false
-        case .dockerPrune, .toolCommand, .requestLogTrim:
+        case .dockerPrune, .toolCommand, .requestLogTrim, .timeMachineSnapshot:
             return false
         }
     }
