@@ -26,6 +26,19 @@ final class StorageDiscoveryStore: ObservableObject {
     @Published private(set) var checkedCount = 0
     @Published private(set) var lastError: String?
     /// 图表、类型统计和列表共用的搜索条件。
+    /// 「大文件 / 旧文件」模式：与目录树扫描并列的只读发现，不改变目录树结果。
+    @Published var isLargeFileMode = false {
+        didSet {
+            guard isLargeFileMode != oldValue else { return }
+            if isLargeFileMode { scanLargeOldFiles() } else { largeOldReport = nil }
+        }
+    }
+    @Published private(set) var largeOldReport: LargeOldFileScanReport?
+    @Published private(set) var isScanningLargeOldFiles = false
+    /// 大文件阈值（MB）与旧文件天数；0 天数表示不按年龄过滤。
+    @Published var largeFileThresholdMB = 200
+    @Published var largeFileOlderThanDays = 180
+
     @Published var searchText = "" {
         didSet {
             guard searchText != oldValue else { return }
@@ -308,6 +321,29 @@ final class StorageDiscoveryStore: ObservableObject {
         }
     }
 
+    /// 只读扫描「大文件 / 旧文件」。与目录树扫描完全独立，互不覆盖结果。
+    func scanLargeOldFiles() {
+        guard !isScanningLargeOldFiles else { return }
+        isScanningLargeOldFiles = true
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let roots = currentDirectory.map { [ $0 ] } ?? LargeOldFileScanner.defaultRoots(home: home)
+        let days = largeFileOlderThanDays > 0 ? largeFileOlderThanDays : nil
+        let criteria = LargeOldFileCriteria(
+            minimumBytes: Int64(max(1, largeFileThresholdMB)) * 1_048_576,
+            olderThanDays: days,
+            limit: 200,
+            roots: roots
+        )
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let report = LargeOldFileScanner.scan(criteria: criteria, home: home)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.largeOldReport = report
+                self.isScanningLargeOldFiles = false
+            }
+        }
+    }
+
     func rescan() {
         guard let currentDirectory else { return }
         scan(directory: currentDirectory)
@@ -502,7 +538,9 @@ struct StorageDiscoveryView: View {
                 progressCard
             }
 
-            if let report = store.report {
+            if store.isLargeFileMode {
+                largeOldFilesCard
+            } else if let report = store.report {
                 summaryCard(report)
                 if let activeRoot {
                     breadcrumbCard(report: report, root: activeRoot)
@@ -576,6 +614,104 @@ struct StorageDiscoveryView: View {
             if !stillPresent {
                 self.selectedNodeID = nil
             }
+        }
+    }
+
+    /// 「大文件 / 旧文件」结果卡：只读，每项可跳到 Finder；不提供删除按钮，
+    /// 因为这里不是清理入口，避免把「发现」误当成「清理」。
+    @ViewBuilder
+    private var largeOldFilesCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                Text("大文件 / 旧文件")
+                    .font(.headline)
+                Spacer()
+                Text("大于")
+                    .font(.caption).foregroundStyle(.secondary)
+                Picker("大小", selection: $store.largeFileThresholdMB) {
+                    ForEach([100, 200, 500, 1024, 2048], id: \.self) { mb in
+                        Text(mb >= 1024 ? "\(mb / 1024) GB" : "\(mb) MB").tag(mb)
+                    }
+                }
+                .labelsHidden().pickerStyle(.menu).frame(width: 100)
+                Text("且超过")
+                    .font(.caption).foregroundStyle(.secondary)
+                Picker("天数", selection: $store.largeFileOlderThanDays) {
+                    Text("不限天数").tag(0)
+                    ForEach([30, 90, 180, 365], id: \.self) { days in
+                        Text("\(days) 天").tag(days)
+                    }
+                }
+                .labelsHidden().pickerStyle(.menu).frame(width: 110)
+                Text("未修改")
+                    .font(.caption).foregroundStyle(.secondary)
+                Button("重新发现") { store.scanLargeOldFiles() }
+                    .disabled(store.isScanningLargeOldFiles)
+            }
+
+            if store.isScanningLargeOldFiles {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("正在发现大文件…").font(.caption).foregroundStyle(.secondary)
+                }
+            } else if let report = store.largeOldReport {
+                Text("已检查 \(report.scannedFileCount) 个文件，找到 \(report.candidates.count) 项"
+                    + (report.truncatedByLimit ? "（只显示最大的 200 项）" : ""))
+                    .font(.caption).foregroundStyle(.secondary)
+
+                if report.candidates.isEmpty {
+                    Text("没有符合条件的文件")
+                        .font(.callout).foregroundStyle(.secondary)
+                        .padding(.vertical, 8)
+                } else {
+                    VStack(spacing: 0) {
+                        ForEach(report.candidates, id: \.path) { candidate in
+                            HStack(spacing: 10) {
+                                Image(systemName: "doc.fill")
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 18)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(candidate.path.lastPathComponent)
+                                        .font(.callout).lineLimit(1)
+                                    Text(candidate.path.devSweepDisplayPath)
+                                        .font(.caption2.monospaced())
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1).truncationMode(.middle)
+                                }
+                                Spacer(minLength: 12)
+                                Text(candidate.modifiedAt.formatted(date: .abbreviated, time: .omitted))
+                                    .font(.caption2).foregroundStyle(.tertiary)
+                                Text(candidate.sizeBytes.devSweepFileSize)
+                                    .font(.callout.monospacedDigit().weight(.medium))
+                                    .frame(minWidth: 80, alignment: .trailing)
+                                Button {
+                                    NSWorkspace.shared.activateFileViewerSelecting([candidate.path])
+                                } label: {
+                                    Image(systemName: "magnifyingglass")
+                                }
+                                .buttonStyle(.borderless)
+                                .help("在 Finder 中显示")
+                            }
+                            .padding(.vertical, 5)
+                            Divider()
+                        }
+                    }
+                }
+            } else {
+                Text("点「重新发现」开始扫描")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            Text("这里只做只读发现：不提供删除按钮，也不会加入本次清理。确认确实不需要的文件，请在 Finder 中自行处理。")
+                .font(.caption2).foregroundStyle(.tertiary)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.background)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.primary.opacity(0.07))
         }
     }
 
@@ -729,7 +865,13 @@ struct StorageDiscoveryView: View {
                     .labelsHidden()
                     .pickerStyle(.menu)
                     .frame(width: 190)
+                    .disabled(store.isLargeFileMode)
                 }
+
+                Toggle("大文件 / 旧文件", isOn: $store.isLargeFileMode)
+                    .toggleStyle(.checkbox)
+                    .font(.caption)
+                    .help("只读发现超过阈值、且长时间未修改的文件；结果仅供查看与逐项确认，不会自动清理")
 
                 Spacer(minLength: 0)
 
