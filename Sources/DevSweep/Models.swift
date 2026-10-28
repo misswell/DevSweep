@@ -18,6 +18,17 @@ enum CleanupKind: String, Hashable {
     case toolCommand
     case requestLogTrim
 
+    /// 该类型的条目体积不可测量（或与「能不能删」无关），不参与 1 MB 门槛过滤。
+    var isSizeAgnostic: Bool {
+        switch self {
+        case .timeMachineSnapshot:
+            return true
+        case .trash, .trashContents, .simulatorDevice, .simulatorRuntime,
+             .dockerPrune, .toolCommand, .requestLogTrim:
+            return false
+        }
+    }
+
     var isNonRecoverable: Bool {
         switch self {
         case .trash:
@@ -225,7 +236,10 @@ struct CleanupSelection {
     /// 清理候选计算入口：只由勾选状态决定。调用方决定送进来的集合
     /// （普通模式是当前侧栏分类，Mini 模式是全部项目），列表过滤器永远不参与。
     static func selectedItems(from items: [CacheItem]) -> [CacheItem] {
-        items.filter { $0.isSelected && $0.risk != .manual }
+        // 再次校验可批量选择：勾选状态可能来自历史记忆（路径没变、类型变了），
+        // 不能因为 isSelected 为 true 就让 .toolCommand / .trashContents 之类
+        // 特殊操作混进批量清理。
+        items.filter { $0.isSelected && $0.risk != .manual && isBatchSelectable($0) }
     }
 
     static func remainingItems(from items: [CacheItem], removing removedItems: [CacheItem]) -> [CacheItem] {
@@ -256,9 +270,10 @@ struct SelectionMemory {
     static func restore(_ items: [CacheItem], from states: [String: Bool]) -> [CacheItem] {
         items.map { item in
             guard let savedSelection = states[key(for: item.path)] else { return item }
-            // 手动风险项（如正在测试的 XCTest clone）永远不恢复历史勾选：
-            // 状态从 safe 变为 manual 后，上一次的勾选记忆不能让它看起来仍被选中。
-            guard item.risk != .manual else {
+            // 手动项与不可批量选择的特殊操作都不恢复历史勾选：
+            // 同一路径以前可能是普通缓存（当时勾过），现在变成了 toolCommand /
+            // trashContents / 快照，旧记忆不能替用户做这个决定。
+            guard item.risk != .manual, CleanupSelection.isBatchSelectable(item) else {
                 var deselected = item
                 deselected.isSelected = false
                 return deselected

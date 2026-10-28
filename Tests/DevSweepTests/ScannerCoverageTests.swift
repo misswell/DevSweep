@@ -1072,7 +1072,10 @@ final class ScannerCoverageTests: XCTestCase {
             environment: [:]
         )
 
-        XCTAssertTrue(report.items.isEmpty, "items: \(report.items.map(\.path))")
+        // 该测试只关心「生成物容器不会被当成项目根」。Time Machine 快照是真实
+        // 机器状态、与项目扫描无关，因此过滤掉它们再断言（本机可能装有快照）。
+        let projectItems = report.items.filter { $0.kind != .timeMachineSnapshot }
+        XCTAssertTrue(projectItems.isEmpty, "items: \(projectItems.map(\.path))")
         XCTAssertTrue(report.diagnostics.contains { $0.reason.contains("生成物容器") },
                       "diagnostics: \(report.diagnostics.map(\.reason))")
     }

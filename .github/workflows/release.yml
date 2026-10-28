@@ -120,10 +120,11 @@ jobs:
 
           if gh release view "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" \
-              "$zip_path" \
-              --repo "$GITHUB_REPOSITORY" \
-              --clobber
+            # 已发布的版本不覆盖：在线更新按 Release 资产的 SHA-256 校验，
+            # 覆盖同一 tag 的安装包会让同一版本的内容悄悄变化。
+            # 需要重新发布时用新版本号和新 tag。
+            echo "::error::Release $RELEASE_TAG 已存在，拒绝覆盖已发布资产；请使用新版本号重新发布"
+            exit 1
           else
             gh release create "$RELEASE_TAG" \
               "$zip_path" \

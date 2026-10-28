@@ -175,8 +175,11 @@ final class TimeMachineSnapshotTests: XCTestCase {
 
         XCTAssertEqual(items.count, 2)
         XCTAssertTrue(items.allSatisfy { $0.kind == .timeMachineSnapshot })
-        XCTAssertTrue(items.allSatisfy { $0.risk == .manual })
+        // .review 而非 .manual：.manual 会让 UI 的复选框与「清理这一项」直接禁用，
+        // 快照就在界面里彻底没法删（这是外部审查发现的 P1）。
+        XCTAssertTrue(items.allSatisfy { $0.risk == .review })
         XCTAssertTrue(items.allSatisfy { $0.isSelected == false }, "快照永不默认勾选")
+        XCTAssertFalse(CleanupSelection.isBatchSelectable(items[0]), "快照不得进入批量选择")
         XCTAssertEqual(Set(items.compactMap(\.identifier)),
                        ["2026-10-27-151925", "2026-10-26-090000"])
     }

@@ -229,15 +229,24 @@ struct CacheScanner {
 
         // Scanner 只负责「机器上发现了什么」；白名单等用户规则由 DevSweepStore
         // 在 rebuildItems() 中统一套用，这样加入/移出白名单都不需要重新扫描。
+        // 严格弱序：先比标准化路径，路径相同再让官方清理命令优先。
+        // 原写法在路径不同时一律返回 false，破坏排序契约（结果顺序未定义），
+        // 而随后的 nonOverlappingItems 依赖「同路径里先出现的胜出」，
+        // 顺序不定就可能保留错的操作类型。
         let candidates = items
             .sorted { left, right in
-                guard left.path.standardizedFileURL.path == right.path.standardizedFileURL.path else {
-                    return false
-                }
-                return (left.kind == .toolCommand ? 0 : 1) < (right.kind == .toolCommand ? 0 : 1)
+                let leftPath = left.path.standardizedFileURL.path
+                let rightPath = right.path.standardizedFileURL.path
+                if leftPath != rightPath { return leftPath < rightPath }
+                let leftRank = left.kind == .toolCommand ? 0 : 1
+                let rightRank = right.kind == .toolCommand ? 0 : 1
+                if leftRank != rightRank { return leftRank < rightRank }
+                return left.name.localizedStandardCompare(right.name) == .orderedAscending
             }
+        // 体积未知的特殊操作项（Time Machine 快照不报告单个体积）不能因为
+        // size == 0 就被丢掉：它连 UI 都进不去，功能等于不存在。
         let uniqueItems = nonOverlappingItems(candidates)
-        .filter { $0.size >= minimumItemSize }
+        .filter { $0.size >= minimumItemSize || $0.kind.isSizeAgnostic }
         .sorted {
             if $0.size == $1.size { return $0.name.localizedStandardCompare($1.name) == .orderedAscending }
             return $0.size > $1.size
@@ -281,7 +290,14 @@ struct CacheScanner {
                 if leftDepth == rightDepth {
                     let leftPath = $0.element.path.standardizedFileURL.path
                     let rightPath = $1.element.path.standardizedFileURL.path
-                    if leftPath == rightPath { return $0.offset < $1.offset }
+                    if leftPath == rightPath {
+                        // 同一路径既有普通删除又有官方清理命令时，必须让 toolCommand 胜出：
+                        // 普通 trash 会删掉整个目录，而官方命令能保留工具自身的状态结构。
+                        let leftRank = $0.element.kind == .toolCommand ? 0 : 1
+                        let rightRank = $1.element.kind == .toolCommand ? 0 : 1
+                        if leftRank != rightRank { return leftRank < rightRank }
+                        return $0.offset < $1.offset
+                    }
                     return leftPath < rightPath
                 }
                 return leftDepth < rightDepth
@@ -1625,7 +1641,7 @@ struct CacheScanner {
     /// - `deletable == false`、或属于「每平台保留最新」的系统内置运行时永远不可勾选；
     /// - 旧版本默认勾选，最新版本默认不勾选，避免一键清理把唯一可用的 Runtime 删掉；
     /// - 体积来自 simctl 报告的 disk image 大小，不再 du 挂载点（只读挂载会重复计算）。
-    fileprivate static func simulatorRuntimeItems(
+    static func simulatorRuntimeItems(
         runtimeLister: SimulatorRuntimeListing,
         home: URL,
         collector: inout ScanCollector
@@ -1664,7 +1680,8 @@ struct CacheScanner {
                 risk = .review
                 note = "较旧的 Runtime：删除后需要时重新下载；仍在用它的模拟器设备会变得不可用，且不能从废纸篓恢复"
                 statusTitle = "可删除"
-                isSelected = true
+                // 不可恢复的系统镜像不默认勾选：让用户看清版本与影响后自己决定。
+                isSelected = false
             } else if kept.contains(runtime.identifier) || runtime.deletable != false {
                 risk = .review
                 note = "该平台最新的 Runtime：保留它才能运行模拟器；删除后需要重新下载系统镜像"
@@ -1735,7 +1752,10 @@ struct CacheScanner {
                 size: 0,
                 sizeWarning: "Time Machine 不报告单个本地快照的体积；删除后由系统回收空间",
                 details: snapshot.name,
-                risk: .manual,
+                // 用 .review 而不是 .manual：.manual 会让复选框与「清理这一项」
+                // 直接禁用，用户在界面上根本删不掉快照。逐项确认由
+                // isBatchSelectable（批量入口拒绝）与执行器（删前重列、删后复核）保证。
+                risk: .review,
                 kind: .timeMachineSnapshot,
                 identifier: snapshot.dateToken,
                 note: "本地快照是 Time Machine 在磁盘上保留的一个还原点，删除后无法恢复；"

@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build and test
+    # 必须用带 macOS 26 SDK 的 Xcode：ContentView 的 glass 表面在旧 SDK 上编不过。
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Build
+        run: swift build --build-tests
+
+      - name: Test
+        # 纯 SwiftPM 单测，不起模拟器、不跑 xcodebuild，因此不涉及并行测试配置。
+        run: swift test

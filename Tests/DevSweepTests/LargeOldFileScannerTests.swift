@@ -132,6 +132,103 @@ final class LargeOldFileScannerTests: XCTestCase {
         XCTAssertTrue(report.candidates.isEmpty)
     }
 
+    // MARK: - Top-K 内存上界 + 根符号链接拒绝
+
+    /// limit=3、10 个候选：只留最大的 3 个，且 truncatedByLimit 仍如实为 true
+    /// （用匹配总数判断，而不是保留下来的条数）。
+    func testTopKKeepsLargestThreeOfTenAndFlagsTruncation() throws {
+        let home = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: home) }
+        for index in 0..<10 {
+            try writeFile(at: home.appendingPathComponent("Downloads/f\(index).bin"),
+                          bytes: 1_000_000 + index * 200_000, modified: nil)
+        }
+        let report = LargeOldFileScanner.scan(
+            criteria: LargeOldFileCriteria(minimumBytes: 1_000_000, olderThanDays: nil,
+                                           limit: 3, roots: [home.appendingPathComponent("Downloads")]),
+            home: home
+        )
+        XCTAssertEqual(report.candidates.count, 3, "只保留 limit 项")
+        XCTAssertEqual(report.candidates.map(\.path.lastPathComponent), ["f9.bin", "f8.bin", "f7.bin"],
+                       "保留最大的 3 个，按大小降序")
+        XCTAssertTrue(report.truncatedByLimit, "10 > 3，必须仍然报告被截断")
+        for pair in zip(report.candidates, report.candidates.dropFirst()) {
+            XCTAssertGreaterThanOrEqual(pair.0.sizeBytes, pair.1.sizeBytes)
+        }
+    }
+
+    /// 候选数不超过 limit：不截断，且全部按 size 降序返回。
+    func testWithinLimitDoesNotFlagTruncation() throws {
+        let home = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: home) }
+        for index in 0..<3 {
+            try writeFile(at: home.appendingPathComponent("Downloads/s\(index).bin"),
+                          bytes: 2_000_000 + index * 200_000, modified: nil)
+        }
+        let report = LargeOldFileScanner.scan(
+            criteria: LargeOldFileCriteria(minimumBytes: 1_000_000, olderThanDays: nil,
+                                           limit: 3, roots: [home.appendingPathComponent("Downloads")]),
+            home: home
+        )
+        XCTAssertEqual(report.candidates.count, 3)
+        XCTAssertFalse(report.truncatedByLimit, "恰好等于 limit 不算截断")
+        XCTAssertEqual(report.candidates.map(\.path.lastPathComponent), ["s2.bin", "s1.bin", "s0.bin"])
+
+        let underLimit = LargeOldFileScanner.scan(
+            criteria: LargeOldFileCriteria(minimumBytes: 1_000_000, olderThanDays: nil,
+                                           limit: 10, roots: [home.appendingPathComponent("Downloads")]),
+            home: home
+        )
+        XCTAssertEqual(underLimit.candidates.count, 3)
+        XCTAssertFalse(underLimit.truncatedByLimit, "3 < 10 不截断")
+    }
+
+    /// 扫描根本身是符号链接：整棵树跳过，不进入链接目标，并计入 skippedUnreadableCount。
+    func testSymbolicLinkRootIsSkippedEntirely() throws {
+        let home = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: home) }
+
+        let realRoot = home.appendingPathComponent("Movies")
+        try writeFile(at: realRoot.appendingPathComponent("huge.mp4"),
+                      bytes: 4_000_000, modified: nil)
+        let linkRoot = home.appendingPathComponent("MoviesLink")
+        try fileManager.createSymbolicLink(at: linkRoot, withDestinationURL: realRoot)
+
+        let viaLink = LargeOldFileScanner.scan(
+            criteria: LargeOldFileCriteria(minimumBytes: 1_000_000, olderThanDays: nil, roots: [linkRoot]),
+            home: home
+        )
+        XCTAssertTrue(viaLink.candidates.isEmpty, "符号链接根整棵树跳过，不能越出授权范围")
+        XCTAssertEqual(viaLink.scannedFileCount, 0, "没有进入链接目标")
+        XCTAssertEqual(viaLink.skippedUnreadableCount, 1, "符号链接根计入不可读计数")
+
+        // 对照：直接用真实目录扫描能扫到，证明跳过的是链接而不是文件。
+        let direct = LargeOldFileScanner.scan(
+            criteria: LargeOldFileCriteria(minimumBytes: 1_000_000, olderThanDays: nil, roots: [realRoot]),
+            home: home
+        )
+        XCTAssertEqual(direct.candidates.map(\.path.lastPathComponent), ["huge.mp4"])
+    }
+
+    /// size 相同时按 path 升序，Top-K 截断不能打乱这个次序。
+    func testTopKKeepsPathAscendingOnSizeTies() throws {
+        let home = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: home) }
+        let names = ["e", "a", "d", "b", "c"]
+        for name in names {
+            try writeFile(at: home.appendingPathComponent("Downloads/tie-\(name).bin"),
+                          bytes: 1_100_000, modified: nil)
+        }
+        let report = LargeOldFileScanner.scan(
+            criteria: LargeOldFileCriteria(minimumBytes: 1_000_000, olderThanDays: nil,
+                                           limit: 2, roots: [home.appendingPathComponent("Downloads")]),
+            home: home
+        )
+        XCTAssertEqual(report.candidates.map(\.path.lastPathComponent), ["tie-a.bin", "tie-b.bin"],
+                       "size 全相同时取 path 升序的前 limit 个")
+        XCTAssertTrue(report.truncatedByLimit)
+    }
+
     func testMissingRootIsSkippedSilently() throws {
         let home = try temporaryDirectory()
         defer { try? fileManager.removeItem(at: home) }

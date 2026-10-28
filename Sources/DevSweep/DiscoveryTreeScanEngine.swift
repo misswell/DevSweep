@@ -60,20 +60,19 @@ enum DiscoveryTreeScanEngine {
 
         while let entry = fts_read(stream) {
             let info = Int32(entry.pointee.fts_info)
-            if info == FTS_ERR || info == FTS_NS {
-                // FTS_NS / FTS_ERR 不是目录生命周期事件，直接作为无法统计的条目挂在当前目录下。
-                // FTS_DNR 走下面的目录分支，避免同一目录被记两次。
-                builder.noteError(entry, kind: info)
-                builder.appendUnreadableEntry(entry, parent: openDirectories.last)
-                entryCount += 1
-                continue
-            }
-
             entryCount += 1
-            if entryCount % 64 == 0, options.isCancelled() {
+
+            // 取消与节点上限检查放在每次迭代的公共入口：错误分支（FTS_ERR / FTS_NS）
+            // 与各 FTS_DNR 子分支都先经过这里，不会因为 continue 跳过退出条件。
+            if options.isCancelled() {
                 builder.wasCancelled = true
                 break
             }
+            if builder.reachedLimit {
+                builder.limitReached = true
+                break
+            }
+
             if entryCount % 512 == 0 {
                 if Date().timeIntervalSince(lastProgressAt) > 0.15
                     || entryCount - lastProgressCount >= 8_192 {
@@ -86,6 +85,14 @@ enum DiscoveryTreeScanEngine {
                         directoryCount: builder.directoryCount
                     ))
                 }
+            }
+
+            if info == FTS_ERR || info == FTS_NS {
+                // FTS_NS / FTS_ERR 不是目录生命周期事件，直接作为无法统计的条目挂在当前目录下。
+                // FTS_DNR 走下面的目录分支，避免同一目录被记两次。
+                builder.noteError(entry, kind: info)
+                builder.appendUnreadableEntry(entry, parent: openDirectories.last)
+                continue
             }
 
             switch info {
@@ -391,7 +398,9 @@ enum DiscoveryTreeScanEngine {
                 guardCount += 1
             }
             guard !components.isEmpty else { return rootURL.path }
-            return rootURL.path + "/" + components.reversed().joined(separator: "/")
+            // 根为 "/" 时不能拼出 "//Users"，前缀直接就是 "/"。
+            let prefix = rootURL.path == "/" ? "/" : rootURL.path + "/"
+            return prefix + components.reversed().joined(separator: "/")
         }
 
         mutating func finish() {

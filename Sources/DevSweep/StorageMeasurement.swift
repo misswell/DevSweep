@@ -40,6 +40,12 @@ struct StorageMeasurement: Hashable {
     }
 }
 
+/// du 输出的行缓冲。只在 stdout 读取线程上写入，
+/// 执行器返回后由调用线程读取（两者之间有管道收尾的同步保证）。
+private final class DuLineBuffer: @unchecked Sendable {
+    var data = Data()
+}
+
 enum StorageMeasurementService {
     private static let duURL = URL(fileURLWithPath: "/usr/bin/du")
     static let defaultTimeout: TimeInterval = 30
@@ -178,36 +184,22 @@ enum StorageMeasurementService {
         onMeasurement: ((String, StorageMeasurement) -> Void)?
     ) -> [String: StorageMeasurement]? {
         recordDuInvocation()
-        let task = Process()
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-        task.executableURL = duURL
-        task.arguments = ["-sk"] + paths
-        task.standardInput = FileHandle.nullDevice
-        task.standardOutput = outputPipe
-        task.standardError = errorPipe
-
-        guard (try? task.run()) != nil else {
-            outputPipe.fileHandleForReading.closeFile()
-            errorPipe.fileHandleForReading.closeFile()
-            return nil
-        }
-
         let lock = NSLock()
         var parsed: [String: Int64] = [:]
-        var stderrData = Data()
-        let readGroup = DispatchGroup()
+        let lineBuffer = DuLineBuffer()
 
-        readGroup.enter()
-        DispatchQueue.global(qos: .utility).async {
-            var buffer = Data()
-            let handle = outputPipe.fileHandleForReading
-            while true {
-                guard let chunk = try? handle.read(upToCount: 64 * 1024), !chunk.isEmpty else { break }
-                buffer.append(chunk)
-                while let newline = buffer.firstIndex(of: 0x0A) {
-                    let line = buffer[buffer.startIndex..<newline]
-                    buffer.removeSubrange(buffer.startIndex...newline)
+        // du 也在独立进程组里跑：超时整组结束，管道读取有期限，
+        // 不会因为某个子树进程仍握着 stdout 而让整个刷新卡死。
+        let outcome = ProcessGroupExecutor.execute(
+            executable: duURL,
+            arguments: ["-sk"] + paths,
+            environment: nil,
+            timeout: timeout,
+            onStdoutChunk: { chunk in
+                lineBuffer.data.append(chunk)
+                while let newline = lineBuffer.data.firstIndex(of: 0x0A) {
+                    let line = lineBuffer.data[lineBuffer.data.startIndex..<newline]
+                    lineBuffer.data.removeSubrange(lineBuffer.data.startIndex...newline)
                     guard let (path, bytes) = parseDuLine(line) else { continue }
                     lock.lock()
                     parsed[path] = bytes
@@ -215,57 +207,26 @@ enum StorageMeasurementService {
                     onMeasurement?(path, StorageMeasurement(allocatedBytes: bytes))
                 }
             }
-            if let (path, bytes) = parseDuLine(buffer) {
-                lock.lock()
-                parsed[path] = bytes
-                lock.unlock()
-                onMeasurement?(path, StorageMeasurement(allocatedBytes: bytes))
-            }
-            readGroup.leave()
-        }
+        )
+        guard let outcome else { return nil }
 
-        readGroup.enter()
-        DispatchQueue.global(qos: .utility).async {
-            let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        if let (path, bytes) = parseDuLine(lineBuffer.data) {
             lock.lock()
-            stderrData = data
+            parsed[path] = bytes
             lock.unlock()
-            readGroup.leave()
+            onMeasurement?(path, StorageMeasurement(allocatedBytes: bytes))
         }
-
-        let deadline = Date().addingTimeInterval(max(timeout, 0))
-        var cancelled = false
-        var timedOut = false
-        while task.isRunning && Date() < deadline {
-            if isCancelled() {
-                cancelled = true
-                break
-            }
-            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
-        }
-        if task.isRunning {
-            timedOut = !cancelled
-            task.terminate()
-            let terminationDeadline = Date().addingTimeInterval(0.25)
-            while task.isRunning && Date() < terminationDeadline {
-                RunLoop.current.run(until: Date().addingTimeInterval(0.01))
-            }
-            if task.isRunning {
-                kill(task.processIdentifier, SIGKILL)
-            }
-        }
-        task.waitUntilExit()
-        readGroup.wait()
 
         lock.lock()
         let parsedSnapshot = parsed
-        let stderrSnapshot = stderrData
         lock.unlock()
 
+        let cancelled = outcome.cancelled
+        let timedOut = outcome.result.timedOut
         let result = ProcessResult(
-            status: task.terminationStatus,
+            status: outcome.result.status,
             stdout: Data(),
-            stderr: stderrSnapshot,
+            stderr: outcome.result.stderr,
             timedOut: timedOut || cancelled
         )
         let errors = attributeErrors(result, to: paths)

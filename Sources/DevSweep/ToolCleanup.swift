@@ -40,80 +40,357 @@ struct ProcessRunner: ProcessRunning, Sendable {
         environment: [String: String]? = nil,
         timeout: TimeInterval = 30
     ) -> ProcessResult? {
-        let task = Process()
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-        task.executableURL = executable
-        task.arguments = arguments
-        task.standardInput = FileHandle.nullDevice
-        task.standardOutput = outputPipe
-        task.standardError = errorPipe
-        if let environment {
-            var mergedEnvironment = ProcessInfo.processInfo.environment
-            mergedEnvironment.merge(environment) { _, new in new }
-            task.environment = mergedEnvironment
-        }
+        ProcessGroupExecutor.execute(
+            executable: executable,
+            arguments: arguments,
+            environment: environment,
+            timeout: timeout
+        )?.result
+    }
+}
 
-        var stdout = Data()
-        var stderr = Data()
-        let outputLock = NSLock()
-        let readGroup = DispatchGroup()
+/// 一次外部命令执行的结果。`cancelled` 与 `timedOut` 分开保留，
+/// 因为调用方对「等够了」和「被取消」的处理不同。
+struct ProcessGroupOutcome {
+    let result: ProcessResult
+    let cancelled: Bool
+}
 
-        readGroup.enter()
-        DispatchQueue.global(qos: .utility).async {
-            let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
-            outputLock.lock()
-            stdout = data
-            outputLock.unlock()
-            readGroup.leave()
-        }
-        readGroup.enter()
-        DispatchQueue.global(qos: .utility).async {
-            let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
-            outputLock.lock()
-            stderr = data
-            outputLock.unlock()
-            readGroup.leave()
-        }
+/// 外部命令执行器：子进程运行在独立进程组里，超时就结束**整个进程组**，
+/// 管道读取永远带期限。这样「父进程退出但后代进程仍握着 stdout」不会再把调用方卡死。
+enum ProcessGroupExecutor {
+    /// 进程退出后等待管道 EOF 的宽限。超过就强杀仍握着管道的进程，带着部分输出返回。
+    static let drainGrace: TimeInterval = 2
+    /// SIGTERM 之后等它自己退出的宽限。
+    static let terminateGrace: TimeInterval = 0.25
+    /// SIGKILL 之后等回收的宽限。
+    static let killGrace: TimeInterval = 1
 
-        do {
-            try task.run()
-        } catch {
-            outputPipe.fileHandleForReading.closeFile()
-            errorPipe.fileHandleForReading.closeFile()
-            readGroup.wait()
-            return nil
-        }
+    static func execute(
+        executable: URL,
+        arguments: [String],
+        environment: [String: String]? = nil,
+        timeout: TimeInterval,
+        onStdoutChunk: ((Data) -> Void)? = nil,
+        onStderrChunk: ((Data) -> Void)? = nil,
+        isCancelled: (() -> Bool)? = nil
+    ) -> ProcessGroupOutcome? {
+        guard let spawned = ProcessGroupSpawner.spawn(
+            executable: executable,
+            arguments: arguments,
+            environment: environment
+        ) else { return nil }
+
+        let pid = spawned.pid
+
+        // POSIX_SPAWN_SETPGROUP(pgroup: 0) 让子进程用自身 pid 当新进程组 id，
+        // 所以进程组号就是 pid（取不到时按 pid 兜底，规则一致）。
+        let group = getpgid(pid) > 1 ? getpgid(pid) : pid
+
+        let stdoutReader = BoundedPipeReader(fd: spawned.stdoutFD, chunkHandler: onStdoutChunk)
+        let stderrReader = BoundedPipeReader(fd: spawned.stderrFD, chunkHandler: onStderrChunk)
+        stdoutReader.start()
+        stderrReader.start()
 
         let deadline = Date().addingTimeInterval(max(timeout, 0))
-        var timedOut = false
-        while task.isRunning && Date() < deadline {
+        var cancelled = false
+        var waitStatus: Int32 = 0
+        var reaped = false
+
+        while true {
+            if let status = reapIfExited(pid: pid) {
+                waitStatus = status
+                reaped = true
+                break
+            }
+            if isCancelled?() == true {
+                cancelled = true
+                break
+            }
+            if Date() >= deadline { break }
             RunLoop.current.run(until: Date().addingTimeInterval(0.01))
         }
 
-        if task.isRunning {
-            timedOut = true
-            task.terminate()
-            let terminationDeadline = Date().addingTimeInterval(0.25)
-            while task.isRunning && Date() < terminationDeadline {
-                RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        var timedOut = false
+        if !reaped {
+            timedOut = !cancelled
+            // 先礼后兵：SIGTERM 发给整个进程组（孙进程一起收），宽限后整组 SIGKILL。
+            signalGroup(group: group, pid: pid, signal: SIGTERM)
+            if let status = waitForExit(pid: pid, within: terminateGrace) {
+                waitStatus = status
+                reaped = true
+            } else {
+                signalGroup(group: group, pid: pid, signal: SIGKILL)
+                if let status = waitForExit(pid: pid, within: killGrace) {
+                    waitStatus = status
+                    reaped = true
+                }
             }
-            if task.isRunning {
-                kill(task.processIdentifier, SIGKILL)
+            if !reaped {
+                // SIGKILL 之后仍没回收：再发一次整组信号，然后用有界等待收尾，
+                // 绝不为了回收子进程无期限阻塞。
+                signalGroup(group: group, pid: pid, signal: SIGKILL)
+                if let status = waitForExit(pid: pid, within: drainGrace) {
+                    waitStatus = status
+                    reaped = true
+                } else {
+                    waitStatus = SIGKILL
+                }
             }
         }
 
-        task.waitUntilExit()
-        readGroup.wait()
-        outputLock.lock()
-        let result = ProcessResult(
-            status: task.terminationStatus,
-            stdout: stdout,
-            stderr: stderr,
-            timedOut: timedOut
+        // 读取端有明确期限：先给 drainGrace，仍有进程握着管道就打死整组再给一小段收尾，
+        // 最后带着已读到的部分输出返回。
+        let drainDeadline = Date().addingTimeInterval(drainGrace)
+        var stdoutInfo = stdoutReader.finish(until: drainDeadline)
+        var stderrInfo = stderrReader.finish(until: drainDeadline)
+        if !stdoutInfo.drained || !stderrInfo.drained {
+            // 进程已经退出但管道仍没有 EOF：还有后代进程握着写端。整组结束它们，
+            // 再给一小段收尾时间，然后带着已读到的部分输出返回。
+            signalGroup(group: group, pid: pid, signal: SIGKILL)
+            let closeDeadline = Date().addingTimeInterval(0.5)
+            stdoutInfo = stdoutReader.finish(until: closeDeadline)
+            stderrInfo = stderrReader.finish(until: closeDeadline)
+        }
+
+        return ProcessGroupOutcome(
+            result: ProcessResult(
+                status: exitCode(fromWaitStatus: waitStatus),
+                stdout: stdoutInfo.data,
+                stderr: stderrInfo.data,
+                timedOut: timedOut
+            ),
+            cancelled: cancelled
         )
-        outputLock.unlock()
-        return result
+    }
+
+    /// 只回收已退出的子进程；返回 nil 表示还在跑（或无子进程可回收时按已退出处理）。
+    private static func reapIfExited(pid: pid_t) -> Int32? {
+        var status: Int32 = 0
+        let reaped = waitpid(pid, &status, WNOHANG)
+        if reaped == pid { return status }
+        if reaped == -1 && errno != EINTR { return 0 }
+        return nil
+    }
+
+    private static func waitForExit(pid: pid_t, within seconds: TimeInterval) -> Int32? {
+        let deadline = Date().addingTimeInterval(seconds)
+        while true {
+            if let status = reapIfExited(pid: pid) { return status }
+            if Date() >= deadline { return nil }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+    }
+
+    /// 向整个进程组发信号；组号不可用或指向我们自己时退回只打直接子进程。
+    private static func signalGroup(group: pid_t, pid: pid_t, signal: Int32) {
+        guard pid > 1 else { return }
+        if group > 1, group != getpgrp(), group != getpid() {
+            if kill(-group, signal) == 0 { return }
+        }
+        kill(pid, signal)
+    }
+
+    /// 与 `Process.terminationStatus` 保持一致：正常退出给退出码，被信号杀掉给信号编号。
+    private static func exitCode(fromWaitStatus status: Int32) -> Int32 {
+        let signal = status & 0x7f
+        if signal == 0 { return (status >> 8) & 0xff }
+        if signal != 0x7f { return signal }
+        return (status >> 8) & 0xff
+    }
+}
+
+/// 有界管道读取：读取线程用 `poll` 轮询，随时可以被要求收尾；
+/// 调用方等待读取结束时永远带期限，所以不会因为某个后代进程握着写端而卡死。
+final class BoundedPipeReader: @unchecked Sendable {
+    private let fd: Int32
+    private let chunkHandler: ((Data) -> Void)?
+    private let lock = NSLock()
+    private let done = DispatchSemaphore(value: 0)
+    private var buffer = Data()
+    private var drained = false
+    private var stopRequested = false
+
+    init(fd: Int32, chunkHandler: ((Data) -> Void)? = nil) {
+        self.fd = fd
+        self.chunkHandler = chunkHandler
+        let flags = fcntl(fd, F_GETFL, 0)
+        if flags >= 0 {
+            _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+        }
+    }
+
+    func start() {
+        DispatchQueue.global(qos: .utility).async { [self] in
+            readLoop()
+        }
+    }
+
+    /// 有界等待读取结束；超期就先要求收尾，再给一小段收尾时间，最后返回已读到的部分输出。
+    func finish(until deadline: Date) -> (data: Data, drained: Bool) {
+        if !waitDrained(until: deadline) {
+            requestStop()
+            _ = waitDrained(until: Date().addingTimeInterval(0.5))
+        }
+        return snapshot()
+    }
+
+    private func waitDrained(until deadline: Date) -> Bool {
+        while true {
+            lock.lock()
+            let isDrained = drained
+            lock.unlock()
+            if isDrained { return true }
+
+            let remaining = deadline.timeIntervalSinceNow
+            if remaining <= 0 { return false }
+            _ = done.wait(timeout: .now() + min(remaining, 0.02))
+        }
+    }
+
+    private func requestStop() {
+        lock.lock()
+        stopRequested = true
+        lock.unlock()
+    }
+
+    private func shouldStop() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return stopRequested
+    }
+
+    private func snapshot() -> (data: Data, drained: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (buffer, drained)
+    }
+
+    private func readLoop() {
+        var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+        var scratch = [UInt8](repeating: 0, count: 64 * 1024)
+        while true {
+            descriptor.revents = 0
+            let ready = poll(&descriptor, 1, 50)
+            if ready < 0 {
+                if errno == EINTR { continue }
+                break
+            }
+            if ready == 0 {
+                // 没有数据：只有在被要求收尾时才退出，避免把慢命令的尾部输出丢掉。
+                if shouldStop() { break }
+                continue
+            }
+            let count = scratch.withUnsafeMutableBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return -1 }
+                return read(fd, base, raw.count)
+            }
+            if count > 0 {
+                let chunk = Data(scratch[0..<count])
+                lock.lock()
+                buffer.append(chunk)
+                lock.unlock()
+                chunkHandler?(chunk)
+                continue
+            }
+            if count == 0 { break }  // EOF：所有写端都关了
+            if errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR {
+                if shouldStop() { break }
+                continue
+            }
+            break
+        }
+
+        lock.lock()
+        drained = true
+        lock.unlock()
+        done.signal()
+        close(fd)
+    }
+}
+
+/// 用 `posix_spawn` 起子进程，并用 `POSIX_SPAWN_SETPGROUP` 把它放进自己的进程组，
+/// 这样超时能整组结束（孙进程也在组里），而不是只 terminate 直接子进程。
+private enum ProcessGroupSpawner {
+    static func spawn(
+        executable: URL,
+        arguments: [String],
+        environment: [String: String]?
+    ) -> (pid: pid_t, stdoutFD: Int32, stderrFD: Int32)? {
+        var stdoutPipe: [Int32] = [-1, -1]
+        var stderrPipe: [Int32] = [-1, -1]
+        guard pipe(&stdoutPipe) == 0 else { return nil }
+        guard pipe(&stderrPipe) == 0 else {
+            close(stdoutPipe[0])
+            close(stdoutPipe[1])
+            return nil
+        }
+
+        func closeAllDescriptors() {
+            close(stdoutPipe[0])
+            close(stdoutPipe[1])
+            close(stderrPipe[0])
+            close(stderrPipe[1])
+        }
+
+        var fileActions: posix_spawn_file_actions_t?
+        guard posix_spawn_file_actions_init(&fileActions) == 0 else {
+            closeAllDescriptors()
+            return nil
+        }
+        defer { posix_spawn_file_actions_destroy(&fileActions) }
+        posix_spawn_file_actions_addopen(&fileActions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
+        posix_spawn_file_actions_adddup2(&fileActions, stdoutPipe[1], STDOUT_FILENO)
+        posix_spawn_file_actions_adddup2(&fileActions, stderrPipe[1], STDERR_FILENO)
+        // 子进程不保留读端，否则 EOF 语义会依赖父进程是否还握着读取句柄。
+        posix_spawn_file_actions_addclose(&fileActions, stdoutPipe[0])
+        posix_spawn_file_actions_addclose(&fileActions, stderrPipe[0])
+
+        var attributes: posix_spawnattr_t?
+        guard posix_spawnattr_init(&attributes) == 0 else {
+            closeAllDescriptors()
+            return nil
+        }
+        defer { posix_spawnattr_destroy(&attributes) }
+        posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP))
+        // pgroup = 0：子进程以自身 pid 作为新进程组 id。
+        posix_spawnattr_setpgroup(&attributes, 0)
+
+        let path = executable.path
+        var argumentPointers: [UnsafeMutablePointer<CChar>?] = ([path] + arguments).map { strdup($0) }
+        argumentPointers.append(nil)
+        defer { for pointer in argumentPointers { free(pointer) } }
+
+        var environmentPointers: [UnsafeMutablePointer<CChar>?]?
+        if let environment {
+            var merged = ProcessInfo.processInfo.environment
+            merged.merge(environment) { _, new in new }
+            var pointers: [UnsafeMutablePointer<CChar>?] = merged.map { strdup("\($0.key)=\($0.value)") }
+            pointers.append(nil)
+            environmentPointers = pointers
+        }
+        defer {
+            for pointer in environmentPointers ?? [] { free(pointer) }
+        }
+
+        var pid: pid_t = 0
+        let spawnResult: Int32
+        if let environmentPointers {
+            spawnResult = posix_spawn(
+                &pid, path, &fileActions, &attributes, argumentPointers, environmentPointers
+            )
+        } else {
+            spawnResult = posix_spawn(&pid, path, &fileActions, &attributes, argumentPointers, nil)
+        }
+
+        guard spawnResult == 0, pid > 0 else {
+            closeAllDescriptors()
+            return nil
+        }
+
+        close(stdoutPipe[1])
+        close(stderrPipe[1])
+        return (pid, stdoutPipe[0], stderrPipe[0])
     }
 }
 

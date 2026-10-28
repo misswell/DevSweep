@@ -57,8 +57,28 @@ struct TreemapLayoutRequestKey: Hashable {
     let minimumTileArea: CGFloat
 }
 
+/// 布局取消标志。布局跑在 `Task.detached` 里，不继承外层的取消状态，
+/// 所以用一个线程安全的标志把取消直接传进布局的遍历循环，让它尽快停止。
+/// 布局每画一个图块都会读一次，读操作只有一次加锁。
+final class TreemapLayoutCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+}
+
 /// 多层树图的布局协调器。布局在后台线程计算，只接受最新一次请求的结果；
-/// 旧请求被取消后即使算完也不会覆盖当前布局。
+/// 旧请求会被直接取消，布局遍历在下一个图块边界就停下，不会空跑完再丢弃。
 @MainActor
 final class TreemapChartModel: ObservableObject {
     @Published private(set) var layout = NestedTreemapLayoutResult.empty
@@ -71,7 +91,11 @@ final class TreemapChartModel: ObservableObject {
 
     private var currentRequestID = 0
     private var activeTask: Task<Void, Never>?
+    private var activeCancellation: TreemapLayoutCancellation?
     private var lastKey: TreemapLayoutRequestKey?
+
+    /// 正在跑的布局的取消标志，取消外层请求时会被置位；测试据此确认取消已传进布局。
+    var activeLayoutCancellation: TreemapLayoutCancellation? { activeCancellation }
 
     var renderedSegments: [NestedTreemapSegment] { layout.segments }
 
@@ -109,47 +133,51 @@ final class TreemapChartModel: ObservableObject {
 
         currentRequestID += 1
         let requestID = currentRequestID
+        // 旧布局先停：置位共享标志（布局遍历会看到）并取消任务句柄。
+        activeCancellation?.cancel()
         activeTask?.cancel()
+        let cancellation = TreemapLayoutCancellation()
+        activeCancellation = cancellation
         isLayoutRunning = true
         layoutFailure = nil
 
-        activeTask = Task { [weak self] in
-            let result: Result<(NestedTreemapLayoutResult, NestedTreemapRenderData), Error> =
-                await Task.detached(priority: .userInitiated) {
-                    if Task.isCancelled { return .failure(CancellationError()) }
-                    let raw = NestedTreemapLayout.segments(
-                        in: snapshot,
-                        rootIndex: rootIndex,
-                        size: size,
-                        parameters: parameters,
-                        classifier: classifier,
-                        isCancelled: { Task.isCancelled }
-                    )
-                    if Task.isCancelled { return .failure(CancellationError()) }
-                    let layout = NestedTreemapLayoutResult(
-                        segments: raw.segments,
-                        drawnNodeIDs: raw.drawnNodeIDs
-                    )
-                    // 颜色与大小文本也在后台一次算好，绘制和悬停都不再格式化。
-                    let renderData = NestedTreemapRenderData(layout: layout)
-                    if Task.isCancelled { return .failure(CancellationError()) }
-                    return .success((layout, renderData))
-                }.value
-
-            guard let self, self.currentRequestID == requestID else { return }
-            self.isLayoutRunning = false
-            switch result {
-            case .success(let (layout, renderData)):
+        activeTask = Task.detached(priority: .userInitiated) { [weak self] in
+            guard !cancellation.isCancelled else { return }
+            let raw = NestedTreemapLayout.segments(
+                in: snapshot,
+                rootIndex: rootIndex,
+                size: size,
+                parameters: parameters,
+                classifier: classifier,
+                isCancelled: { cancellation.isCancelled }
+            )
+            guard !cancellation.isCancelled else { return }
+            let layout = NestedTreemapLayoutResult(
+                segments: raw.segments,
+                drawnNodeIDs: raw.drawnNodeIDs
+            )
+            // 颜色与大小文本也在后台一次算好，绘制和悬停都不再格式化。
+            let renderData = NestedTreemapRenderData(layout: layout)
+            guard !cancellation.isCancelled else { return }
+            // 结果只在仍然是最新请求时发布；取消或过期都不会覆盖当前布局。
+            await MainActor.run {
+                guard let self,
+                      self.currentRequestID == requestID,
+                      self.activeCancellation === cancellation,
+                      !cancellation.isCancelled
+                else { return }
+                self.activeCancellation = nil
+                self.activeTask = nil
+                self.isLayoutRunning = false
                 self.apply(layout, renderData: renderData)
-            case .failure(let error):
-                if error is CancellationError { return }
-                self.layoutFailure = "布局计算失败：\(error.localizedDescription)"
             }
         }
     }
 
     func cancel() {
         currentRequestID += 1
+        activeCancellation?.cancel()
+        activeCancellation = nil
         activeTask?.cancel()
         activeTask = nil
         isLayoutRunning = false

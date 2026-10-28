@@ -57,13 +57,22 @@ struct DeletionContext {
         self.projectRoots = Self.normalized(projectRoots)
         self.allowedRoots = Self.normalized(allowedRoots)
         self.allowedPaths = Self.normalized(allowedPaths)
-        self.protectedPaths = PathWhitelist.normalized(
+        // 保护路径必须逐个保留：`PathWhitelist.normalized` 会做父子归并，
+        // 而这份名单里第一个就是 "/"，归并后只剩它自己，`~/Documents`、
+        // `~/Library/Caches` 等全部丢失，精确匹配的保护形同虚设。
+        self.protectedPaths = Self.uniqueStandardized(
             protectedPaths ?? DeletionValidator.defaultProtectedPaths(home: home)
         )
     }
 
     private static func normalized(_ paths: [URL]) -> [URL] {
         paths.map(\.standardizedFileURL)
+    }
+
+    /// 去重但**不做**父子归并：保护名单要保留每一条精确路径。
+    private static func uniqueStandardized(_ paths: [URL]) -> [URL] {
+        var seen = Set<String>()
+        return paths.map(\.standardizedFileURL).filter { seen.insert($0.path).inserted }
     }
 }
 
@@ -98,6 +107,20 @@ enum DeletionValidationError: LocalizedError, Equatable {
 
 struct DeletionValidator {
     private static let fileManager = FileManager.default
+
+    /// 允许「保留目录、清空内容」的目录白名单（精确匹配）。
+    ///
+    /// 只包含系统预期目录：`~/Library/Caches`、`~/Library/Logs`、`~/.Trash`、`~/Downloads`。
+    /// 加新目录必须显式改这里——这比「home 下任意目录都允许清空」安全得多，
+    /// 否则一个错误候选项就能清空 `~/Documents`。
+    static func contentsClearableRoots(home: URL = FileManager.default.homeDirectoryForCurrentUser) -> [URL] {
+        [
+            home.appendingPathComponent("Library/Caches"),
+            home.appendingPathComponent("Library/Logs"),
+            home.appendingPathComponent(".Trash"),
+            home.appendingPathComponent("Downloads")
+        ].map(\.standardizedFileURL)
+    }
 
     static func defaultProtectedPaths(
         home: URL = FileManager.default.homeDirectoryForCurrentUser
@@ -172,11 +195,25 @@ struct DeletionValidator {
             throw DeletionValidationError.symbolicLink
         }
 
-        let exactProtectedPaths = context.protectedPaths
-            + context.projectRoots
-            + context.allowedRoots
-        guard !containsExact(standardized, in: exactProtectedPaths) else {
-            throw DeletionValidationError.protectedPath
+        // `.trashContents` 是「保留目录、只清空内容」，因此它要清空的目录本身
+        // 一定出现在保护名单里（~/Library/Caches、~/Downloads…）。这里改用一份
+        // 独立的精确白名单授权：只有明确批准的那几个目录才允许被清空内容，
+        // 其余（含 ~/Documents、~/Library 本身）一律拒绝。
+        if item.kind == .trashContents {
+            guard Self.contentsClearableRoots(home: context.home)
+                .contains(where: { $0.standardizedFileURL.path == standardized.path }) else {
+                throw DeletionValidationError.unsupportedTarget
+            }
+            guard !containsExact(standardized, in: context.projectRoots + context.allowedRoots) else {
+                throw DeletionValidationError.protectedPath
+            }
+        } else {
+            let exactProtectedPaths = context.protectedPaths
+                + context.projectRoots
+                + context.allowedRoots
+            guard !containsExact(standardized, in: exactProtectedPaths) else {
+                throw DeletionValidationError.protectedPath
+            }
         }
 
         if item.kind != .simulatorDevice,

@@ -67,8 +67,23 @@ struct DiscoveryTreeSnapshot {
         return childIndices[start..<end]
     }
 
+    /// 标准化后的根路径。拼接与查找都以它为基准。
+    var standardizedRootPath: String {
+        let path = rootURL.standardizedFileURL.path
+        return path.isEmpty ? "/" : path
+    }
+
+    /// 根前缀：根为 "/" 时前缀就是 "/"，其余情况是「根路径 + 一个斜杠」。
+    /// `path(of:)` 与 `index(ofPath:)` 共用它，根为 "/" 时既不会拼出 "/Users" 之外的
+    /// 双斜杠，也不会把 "//" 当成后代前缀。
+    var rootPathPrefix: String {
+        let rootPath = standardizedRootPath
+        return rootPath == "/" ? "/" : rootPath + "/"
+    }
+
     func path(of index: Int) -> String {
-        guard records.indices.contains(index) else { return rootURL.path }
+        let rootPath = standardizedRootPath
+        guard records.indices.contains(index) else { return rootPath }
         var components: [String] = []
         var cursor = index
         var guardCount = 0
@@ -79,8 +94,8 @@ struct DiscoveryTreeSnapshot {
             cursor = parent
             guardCount += 1
         }
-        guard !components.isEmpty else { return rootURL.path }
-        return rootURL.path + "/" + components.reversed().joined(separator: "/")
+        guard !components.isEmpty else { return rootPath }
+        return rootPathPrefix + components.reversed().joined(separator: "/")
     }
 
     func url(of index: Int) -> URL {
@@ -90,10 +105,11 @@ struct DiscoveryTreeSnapshot {
     /// 从根按名称逐段查找，不为全部节点常驻一份路径字典。
     func index(ofPath path: String) -> Int? {
         let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
-        let rootPath = rootURL.standardizedFileURL.path
+        let rootPath = standardizedRootPath
         if standardized == rootPath { return rootIndex }
-        guard standardized.hasPrefix(rootPath + "/") else { return nil }
-        let components = standardized.dropFirst(rootPath.count + 1).split(separator: "/")
+        let prefix = rootPathPrefix
+        guard standardized.hasPrefix(prefix) else { return nil }
+        let components = standardized.dropFirst(prefix.count).split(separator: "/")
         var cursor = rootIndex
         for component in components {
             let name = String(component)
