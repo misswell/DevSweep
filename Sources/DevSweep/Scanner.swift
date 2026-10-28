@@ -107,6 +107,7 @@ struct CacheScanner {
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         includeSystemCaches: Bool = true,
         xctestActivityInspector: XCTestActivityInspecting = XCTestActivityInspector(),
+        simulatorRuntimeLister: SimulatorRuntimeListing = SimulatorRuntimeLister(),
         progress: @escaping (ScanProgress) -> Void,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> ScanReport {
@@ -180,6 +181,21 @@ struct CacheScanner {
             progress: progress
         )
         items += simulatorItems(home: home, collector: &collector, progress: progress)
+
+        // 模拟器 Runtime 不是普通文件缓存：必须通过 `simctl runtime delete`
+        // 删除，直接删目录会让 CoreSimulator 登记与实际磁盘脱节。
+        progress(ScanProgress(
+            phase: "检查模拟器 Runtime",
+            checkedPaths: collector.checkedPaths,
+            matchedPaths: items.count,
+            skippedPaths: collector.skippedPaths,
+            permissionFailures: collector.permissionFailures
+        ))
+        items += simulatorRuntimeItems(
+            runtimeLister: simulatorRuntimeLister,
+            home: home,
+            collector: &collector
+        )
 
         for root in roots {
             progress(ScanProgress(
@@ -1420,6 +1436,92 @@ struct CacheScanner {
         return items
     }
 
+    /// 把已安装的模拟器 Runtime 变成可清理条目。
+    ///
+    /// 语义和设备不同：
+    /// - 只有 `simctl runtime delete` 能删除，条目只用于展示与选择，删除动作由
+    ///   `SimulatorRuntimeDeleting` 负责；
+    /// - `deletable == false`、或属于「每平台保留最新」的系统内置运行时永远不可勾选；
+    /// - 旧版本默认勾选，最新版本默认不勾选，避免一键清理把唯一可用的 Runtime 删掉；
+    /// - 体积来自 simctl 报告的 disk image 大小，不再 du 挂载点（只读挂载会重复计算）。
+    fileprivate static func simulatorRuntimeItems(
+        runtimeLister: SimulatorRuntimeListing,
+        home: URL,
+        collector: inout ScanCollector
+    ) -> [CacheItem] {
+        let runtimes: [SimulatorRuntimeInfo]
+        do {
+            runtimes = try runtimeLister.runtimes()
+        } catch {
+            collector.skipped(
+                home.appendingPathComponent("Library/Developer/CoreSimulator"),
+                reason: "无法读取模拟器 Runtime 列表：\(error.localizedDescription)；Runtime 不会出现在本次结果里",
+                kind: .unavailable
+            )
+            return []
+        }
+        guard !runtimes.isEmpty else { return [] }
+
+        let policy = SimulatorRuntimeCleaner.removableIdentifiers(runtimes)
+        let kept = Set(policy.kept.map(\.identifier))
+        let removable = Set(policy.removable.map(\.identifier))
+        let blockedReason = Dictionary(
+            policy.blocked.map { ($0.runtime.identifier, $0.reason) },
+            uniquingKeysWith: { first, _ in first }
+        )
+
+        var items: [CacheItem] = []
+        items.reserveCapacity(runtimes.count)
+        for runtime in runtimes {
+            let platform = SimulatorRuntimeCleaner.platformTitle(runtime.platformIdentifier)
+            let displayVersion = runtime.displayVersion
+            let risk: RiskLevel
+            let note: String
+            let statusTitle: String
+            let isSelected: Bool
+            if removable.contains(runtime.identifier) {
+                risk = .review
+                note = "较旧的 Runtime：删除后需要时重新下载；仍在用它的模拟器设备会变得不可用，且不能从废纸篓恢复"
+                statusTitle = "可删除"
+                isSelected = true
+            } else if kept.contains(runtime.identifier) || runtime.deletable != false {
+                risk = .review
+                note = "该平台最新的 Runtime：保留它才能运行模拟器；删除后需要重新下载系统镜像"
+                statusTitle = "保留最新"
+                isSelected = false
+            } else {
+                risk = .manual
+                note = "simctl 标记为不可移除，不能自动清理"
+                statusTitle = "不可移除"
+                isSelected = false
+            }
+            let blocked = blockedReason[runtime.identifier].map { "（\($0)）" } ?? ""
+            // 只读挂载点（/Library/Developer/CoreSimulator/Volumes/...）不是可清理
+            // 路径：删除逻辑只认 identifier，这个 URL 只用于展示与白名单匹配，
+            // 因此按挂载点存在与否选择，避免拿裸 identifier 伪装成本地路径。
+            let displayPath = runtime.mountPath
+                ?? runtime.parentMountPath
+                ?? "/Library/Developer/CoreSimulator/Volumes/\(runtime.displayVersion)"
+            items.append(CacheItem(
+                category: "CoreSimulator",
+                name: "Runtime \(displayVersion) · \(platform)",
+                path: URL(fileURLWithPath: displayPath),
+                size: max(runtime.sizeBytes ?? 0, 0),
+                sizeWarning: runtime.sizeBytes == nil ? "simctl 未报告该 Runtime 的体积，实际占用未知" : nil,
+                details: [runtime.build.map { "build \($0)" }, runtime.identifier]
+                    .compactMap { $0 }
+                    .joined(separator: " · "),
+                risk: risk,
+                kind: .simulatorRuntime,
+                identifier: runtime.identifier,
+                note: note + blocked,
+                statusTitle: statusTitle,
+                isSelected: isSelected
+            ))
+        }
+        return items
+    }
+
     private static func projectArtifacts(
         in root: URL,
         deepScan: Bool,
@@ -2487,7 +2589,8 @@ struct CacheCleaner {
         requestLogCleaner: RequestLogCleaner = RequestLogCleaner(),
         xctestActivityInspector: XCTestActivityInspecting = XCTestActivityInspector(),
         trashExecutor: TrashExecuting = FileManagerTrashExecutor(),
-        simulatorExecutor: SimulatorCleanupExecuting = SimulatorCleanupExecutor()
+        simulatorExecutor: SimulatorCleanupExecuting = SimulatorCleanupExecutor(),
+        simulatorRuntimeExecutor: SimulatorRuntimeDeleting = SimulatorRuntimeDeletingExecutor()
     ) -> CleanupReport {
         var removed: [CacheItem] = []
         var failures: [(CacheItem, String)] = []
@@ -2532,6 +2635,8 @@ struct CacheCleaner {
                     try trashExecutor.trash(item.path)
                 case .simulatorDevice:
                     try simulatorExecutor.delete(item, context: context)
+                case .simulatorRuntime:
+                    try simulatorRuntimeExecutor.delete(item, context: context)
                 case .dockerPrune:
                     guard let rawTarget = item.identifier,
                           let target = DockerCleanupTarget(rawValue: rawTarget) else {

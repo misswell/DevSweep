@@ -106,6 +106,9 @@ enum SidebarDestination: Hashable {
     case whitelist
     case backgroundProcesses
     case storageDiscovery
+    /// Xcode 空间：按 Xcode 自己的存储语义（可重建 / 需确认 / 手动）分 13 类，
+    /// 含模拟器 Runtime 与归档的逐项选择。
+    case xcodeStorage
     case category(String)
 
     /// 侧栏页面决定清理范围：「全部项目」是全量，分类页只有该分类；
@@ -114,7 +117,7 @@ enum SidebarDestination: Hashable {
         switch self {
         case .all: return items
         case .category(let category): return items.filter { $0.category == category }
-        case .quickClean, .whitelist, .backgroundProcesses, .storageDiscovery: return []
+        case .quickClean, .whitelist, .backgroundProcesses, .storageDiscovery, .xcodeStorage: return []
         }
     }
 }
@@ -133,6 +136,7 @@ struct ContentView: View {
     @State private var destination: SidebarDestination = .all
     @StateObject private var backgroundProcesses = BackgroundProcessStore()
     @StateObject private var storageDiscovery = StorageDiscoveryStore()
+    @StateObject private var xcodeRuntimeSource = XcodeRuntimeSource()
     @State private var onlySelected = false
     @State private var onlyQuickClean = false
     @AppStorage("DevSweep.onlyLarge") private var onlyLarge = false
@@ -174,7 +178,7 @@ struct ContentView: View {
     private var showsCacheList: Bool {
         switch destination {
         case .all, .category: return true
-        case .quickClean, .whitelist, .backgroundProcesses, .storageDiscovery: return false
+        case .quickClean, .whitelist, .backgroundProcesses, .storageDiscovery, .xcodeStorage: return false
         }
     }
 
@@ -203,7 +207,8 @@ struct ContentView: View {
         switch destination {
         case .all: return "全部项目"
         case .category(let category): return category
-        case .quickClean, .whitelist, .backgroundProcesses, .storageDiscovery: return "当前页面"
+        case .quickClean, .whitelist, .backgroundProcesses, .storageDiscovery, .xcodeStorage:
+            return "当前页面"
         }
     }
 
@@ -254,6 +259,7 @@ struct ContentView: View {
         case .quickClean: return "常用清理"
         case .whitelist: return "白名单"
         case .backgroundProcesses: return "后台进程"
+        case .xcodeStorage: return "Xcode 空间"
         case .storageDiscovery: return "磁盘发现"
         case .category(let category): return category
         }
@@ -262,6 +268,7 @@ struct ContentView: View {
     private var headerSubtitle: String {
         switch destination {
         case .backgroundProcesses: return backgroundProcesses.status
+        case .xcodeStorage: return "按可重建性分类清理 Xcode 缓存、Runtime 与归档"
         case .storageDiscovery: return "浏览空间去向；仅明确识别的缓存可加入本次清理"
         default: return store.statusMessage
         }
@@ -270,6 +277,7 @@ struct ContentView: View {
     private var isHeaderWorking: Bool {
         switch destination {
         case .backgroundProcesses: return backgroundProcesses.isWorking
+        case .xcodeStorage: return store.isScanning || store.isCleaning || xcodeRuntimeSource.isRefreshing
         case .storageDiscovery: return storageDiscovery.isScanning
         default: return store.isScanning || store.isCleaning
         }
@@ -434,6 +442,13 @@ struct ContentView: View {
                     )
                     .tag(SidebarDestination.backgroundProcesses)
                     SidebarRow(
+                        title: "Xcode 空间",
+                        subtitle: "缓存分类、模拟器 Runtime 与归档",
+                        icon: "hammer",
+                        size: xcodeStorageBytes
+                    )
+                    .tag(SidebarDestination.xcodeStorage)
+                    SidebarRow(
                         title: "磁盘发现",
                         subtitle: "只读发现大目录与文件分布",
                         icon: "externaldrive",
@@ -524,6 +539,17 @@ struct ContentView: View {
                         WhitelistPageView()
                     case .backgroundProcesses:
                         BackgroundProcessesView(store: backgroundProcesses)
+                    case .xcodeStorage:
+                        XcodeStorageView(
+                            store: store,
+                            runtimeSource: xcodeRuntimeSource,
+                            onCleanItems: { items in
+                                store.cleanSelected(ids: Set(items.map(\.id)))
+                            },
+                            onDeleteRuntimes: { identifiers in
+                                deleteSimulatorRuntimes(identifiers)
+                            }
+                        )
                     case .storageDiscovery:
                         StorageDiscoveryView(
                             store: storageDiscovery,
@@ -1044,6 +1070,36 @@ struct ContentView: View {
         .background(.regularMaterial)
         .background {
             Color.clear.devSweepGlassLayer()
+        }
+    }
+
+    /// 侧栏「Xcode 空间」显示的合计：扫描得到的 Xcode/CoreSimulator/XCTest 条目。
+    /// Runtime 条目已在扫描结果里，不重复加。
+    private var xcodeStorageBytes: Int64 {
+        let categories: Set<String> = ["Xcode", "CoreSimulator", "XCTest"]
+        return store.items
+            .filter { categories.contains($0.category) }
+            .reduce(0) { $0 + max(0, $1.size) }
+    }
+
+    /// Runtime 删除：先经过清理内核（删除前复核 + 删后轮询验证），
+    /// 结果回填给 XcodeRuntimeSource 逐条展示失败原因与兜底命令。
+    private func deleteSimulatorRuntimes(_ identifiers: [String]) {
+        guard !identifiers.isEmpty else { return }
+        let source = xcodeRuntimeSource
+        DispatchQueue.global(qos: .userInitiated).async {
+            let outcome = SimulatorRuntimeCleaner.delete(
+                identifiers: identifiers,
+                runner: ProcessRunner.shared
+            )
+            DispatchQueue.main.async {
+                source.record(outcome, submitted: identifiers)
+                // Runtime 消失后设备行也会过期，让主扫描重新对齐。
+                if !outcome.removed.isEmpty {
+                    store.scan()
+                }
+                source.refresh()
+            }
         }
     }
 
@@ -2090,6 +2146,7 @@ private struct CacheItemRow: View {
     private var icon: String {
         switch item.kind {
         case .simulatorDevice: return "iphone.gen3"
+        case .simulatorRuntime: return "shippingbox.and.arrow.backward"
         case .dockerPrune: return "shippingbox"
         case .toolCommand: return "wrench.and.screwdriver"
         case .requestLogTrim: return "cylinder.split.1x2"
@@ -2104,6 +2161,7 @@ private struct CacheItemRow: View {
     private var itemKindTitle: String {
         switch item.kind {
         case .simulatorDevice: return "模拟器设备"
+        case .simulatorRuntime: return "模拟器 Runtime"
         case .dockerPrune: return "Docker 资源"
         case .toolCommand: return "官方清理命令"
         case .requestLogTrim: return "就地裁剪日志"

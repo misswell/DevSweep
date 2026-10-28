@@ -4,6 +4,9 @@ import SwiftUI
 enum CleanupKind: String, Hashable {
     case trash
     case simulatorDevice
+    /// 模拟器 Runtime（iOS/watchOS/tvOS/visionOS 系统镜像）。只能通过
+    /// `xcrun simctl runtime delete` 删除，删除后要重新下载。
+    case simulatorRuntime
     case dockerPrune
     case toolCommand
     case requestLogTrim
@@ -12,7 +15,7 @@ enum CleanupKind: String, Hashable {
         switch self {
         case .trash:
             return false
-        case .simulatorDevice, .dockerPrune, .toolCommand, .requestLogTrim:
+        case .simulatorDevice, .simulatorRuntime, .dockerPrune, .toolCommand, .requestLogTrim:
             return true
         }
     }
@@ -224,7 +227,7 @@ struct CleanupSelection {
     static func isBatchSelectable(_ item: CacheItem) -> Bool {
         guard item.risk != .manual else { return false }
         switch item.kind {
-        case .trash, .simulatorDevice:
+        case .trash, .simulatorDevice, .simulatorRuntime:
             return true
         case .dockerPrune, .toolCommand, .requestLogTrim:
             return false

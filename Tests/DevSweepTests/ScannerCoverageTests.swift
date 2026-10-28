@@ -1045,25 +1045,36 @@ final class ScannerCoverageTests: XCTestCase {
     }
 
     func testArtifactContainerCannotBecomeProjectRoot() throws {
-        let nodeModules = try temporaryDirectory().appendingPathComponent("node_modules")
-        defer { try? fileManager.removeItem(at: nodeModules.deletingLastPathComponent()) }
+        let base = try temporaryDirectory()
+        defer { try? fileManager.removeItem(at: base) }
 
+        let nodeModules = base.appendingPathComponent("node_modules")
         let dist = nodeModules.appendingPathComponent("fake-package/dist")
         try fileManager.createDirectory(at: dist, withIntermediateDirectories: true)
         try Data("{}".utf8).write(to: nodeModules.appendingPathComponent("fake-package/package.json"))
         try Data(repeating: 0xA5, count: 1_100_000).write(to: dist.appendingPathComponent("bundle.js"))
 
+        // 一定要用独立的 home：这里以前复用 base，而 `temporaryDirectory()` 在
+        // macOS 上就在 ~/Library/Developer/CoreSimulator/Devices 里面，真实扫描会
+        // 把该目录当成模拟器数据源码，测试结果随本机环境变化。
+        let home = base.appendingPathComponent("home")
+        try fileManager.createDirectory(at: home, withIntermediateDirectories: true)
+
+        // 模拟器 Runtime 属于系统状态，与「项目生成物容器」无关；这里注入空清单，
+        // 让测试只断言它要断言的规则，不随本机装了哪些 Runtime 变化。
         let report = CacheScanner.scan(
             projectRoots: [nodeModules],
             deepScan: true,
-            home: nodeModules.deletingLastPathComponent().appendingPathComponent("home"),
+            home: home,
             includeSystemCaches: false,
+            simulatorRuntimeLister: EmptySimulatorRuntimeListing(),
             progress: { _ in },
             environment: [:]
         )
 
-        XCTAssertTrue(report.items.isEmpty)
-        XCTAssertTrue(report.diagnostics.contains { $0.reason.contains("生成物容器") })
+        XCTAssertTrue(report.items.isEmpty, "items: \(report.items.map(\.path))")
+        XCTAssertTrue(report.diagnostics.contains { $0.reason.contains("生成物容器") },
+                      "diagnostics: \(report.diagnostics.map(\.reason))")
     }
 
     func testNormalNodeProjectStillFindsNodeModules() throws {
@@ -1248,4 +1259,9 @@ final class ScannerCoverageTests: XCTestCase {
         try fileManager.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data(repeating: 0xA5, count: 1_100_000).write(to: file)
     }
+}
+
+/// 扫描测试用：不读取本机真实 Runtime 清单。
+struct EmptySimulatorRuntimeListing: SimulatorRuntimeListing {
+    func runtimes() throws -> [SimulatorRuntimeInfo] { [] }
 }

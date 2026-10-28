@@ -7,6 +7,23 @@ struct SimulatorCleanupDevice: Decodable {
     let dataPath: String?
 }
 
+/// 扫描阶段只需要「装了哪些 Runtime」，删除动作不在这里发生。
+///
+/// 必须走 `xcrun simctl runtime list`：Runtime 以 disk image 形式挂载，
+/// 只有 CoreSimulator 自己知道哪个版本占用多少空间、哪个版本还能删。
+/// 用协议注入是为了让扫描测试不依赖真实 Xcode 环境。
+protocol SimulatorRuntimeListing: Sendable {
+    func runtimes() throws -> [SimulatorRuntimeInfo]
+}
+
+struct SimulatorRuntimeLister: SimulatorRuntimeListing {
+    var runner: any ProcessRunning & Sendable = ProcessRunner.shared
+
+    func runtimes() throws -> [SimulatorRuntimeInfo] {
+        try SimulatorRuntimeCleaner.installedRuntimes(runner: runner)
+    }
+}
+
 enum SimulatorCleanupError: LocalizedError {
     case unavailable
     case missing
@@ -107,5 +124,108 @@ struct SimulatorCleanupExecutor: SimulatorCleanupInspecting, SimulatorCleanupExe
             environment: nil, timeout: executable == "/bin/ps" ? 5 : 30
         ), !result.timedOut, result.status == 0 else { throw SimulatorCleanupError.unavailable }
         return result
+    }
+}
+
+/// Runtime 删除动作。和模拟器设备一样：只认 simctl 标识符，永远不直接删目录。
+protocol SimulatorRuntimeDeleting: Sendable {
+    func delete(_ item: CacheItem, context: DeletionContext) throws
+}
+
+/// 单个 Runtime 的删除执行器。
+///
+/// 顺序刻意保守：
+/// 1. 校验 kind / identifier（只接受单一路径组件，拒绝 `--help` 之类的参数注入）；
+/// 2. 白名单优先，命中即拒绝；
+/// 3. 重新列一次真实清单。已经消失 = 视为成功；这段时间里它变成了本平台
+///    最新版本、或被 simctl 标记为不可删除，都拒绝执行（扫描结果可能已过期）；
+/// 4. 交给 `SimulatorRuntimeCleaner.delete` 做「先 list、再删、删后轮询验证」；
+/// 5. 失败时把逐条原因包装成用户可读错误，绝不静默吞掉。
+struct SimulatorRuntimeDeletingExecutor: SimulatorRuntimeDeleting {
+    var runner: any ProcessRunning & Sendable = ProcessRunner.shared
+    /// 删除后等待 CoreSimulator 真正卸载镜像的最长时间；超时才算失败。
+    var verificationTimeout: TimeInterval = 120
+    var pollInterval: TimeInterval = 2
+    var sleep: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }
+
+    func delete(_ item: CacheItem, context: DeletionContext) throws {
+        guard item.kind == .simulatorRuntime,
+              let identifier = item.identifier,
+              Self.isValidIdentifier(identifier) else {
+            throw SimulatorRuntimeLookupError.invalidTarget
+        }
+        guard !PathWhitelist.contains(item.path, in: context.whitelistedPaths) else {
+            throw DeletionValidationError.whitelisted
+        }
+
+        let installed: [SimulatorRuntimeInfo]
+        do {
+            installed = try SimulatorRuntimeCleaner.installedRuntimes(runner: runner)
+        } catch let error as SimulatorRuntimeCleanupError {
+            throw SimulatorRuntimeLookupError.listFailed(error.localizedDescription)
+        }
+        guard let current = installed.first(where: { $0.identifier == identifier }) else {
+            // 已经不存在等于已经清理完成。
+            return
+        }
+        let label = current.displayName
+        let candidates = SimulatorRuntimeCleaner.removableIdentifiers(installed)
+        guard candidates.removable.contains(where: { $0.identifier == identifier }) else {
+            let reason = candidates.blocked.first(where: { $0.runtime.identifier == identifier })?.reason
+            throw SimulatorRuntimeLookupError.stillProtected(
+                runtime: label,
+                reason: reason ?? "它是所在平台的最新版本，删除后该平台将没有可用模拟器；如需删除请先安装更高版本"
+            )
+        }
+
+        let outcome = SimulatorRuntimeCleaner.delete(
+            identifiers: [identifier],
+            runner: runner,
+            verificationTimeout: verificationTimeout,
+            pollInterval: pollInterval,
+            sleep: sleep
+        )
+        guard outcome.isSuccess else {
+            let detail = outcome.failures.first?.message
+                ?? "删除后仍在运行：运行时列表里仍能看到它"
+            throw SimulatorRuntimeLookupError.deletionFailed(
+                runtime: label,
+                detail: detail,
+                remaining: outcome.remaining
+            )
+        }
+    }
+
+    /// simctl 既接受 UUID 也接受 SimRuntime bundle id；两者都必须是单一路径组件，
+    /// 且不能以 `-` 开头（否则会被 simctl 当成选项）。
+    static func isValidIdentifier(_ identifier: String) -> Bool {
+        guard !identifier.isEmpty, identifier.count <= 200, !identifier.hasPrefix("-") else {
+            return false
+        }
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_")
+        return identifier.unicodeScalars.allSatisfy { allowed.contains($0) }
+    }
+}
+
+/// Runtime 删除的用户可见错误。每条都说清「哪个 Runtime、为什么、下一步做什么」，
+/// 不做静默失败；失败信息可以直接展示在清理结果里。
+enum SimulatorRuntimeLookupError: LocalizedError, Equatable {
+    case invalidTarget
+    case listFailed(String)
+    case stillProtected(runtime: String, reason: String)
+    case deletionFailed(runtime: String, detail: String, remaining: [String])
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidTarget:
+            return "缺少可用的 Runtime 标识符，已拒绝删除"
+        case let .listFailed(detail):
+            return "清理前无法确认模拟器 Runtime 列表：\(detail)"
+        case let .stillProtected(runtime, reason):
+            return "Runtime \(runtime) 已跳过：\(reason)"
+        case let .deletionFailed(runtime, detail, remaining):
+            let left = remaining.isEmpty ? "" : "；仍存在的 Runtime：\(remaining.joined(separator: ", "))"
+            return "Runtime \(runtime) 删除失败：\(detail)\(left)。可以复制兜底命令到终端重试"
+        }
     }
 }
