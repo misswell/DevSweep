@@ -304,6 +304,9 @@ struct XcodeRuntimeGroup: Identifiable, Equatable {
 struct XcodeDiskSnapshot: Equatable {
     let totalBytes: Int64
     let availableBytes: Int64
+    /// APFS 可清除空间（purgeable）。系统在需要时会自动回收，
+    /// 因此它既不是「可用」，也不该被当成「已用」来吓人。
+    let purgeableBytes: Int64
 
     var usedBytes: Int64 { max(0, totalBytes - availableBytes) }
 
@@ -312,10 +315,14 @@ struct XcodeDiskSnapshot: Equatable {
         return Double(usedBytes) / Double(totalBytes) * 100
     }
 
-    /// `磁盘：53.1 GB 可用 | 已用 95%`
+    /// `磁盘：53.1 GB 可用 | 已用 95%`，有可清除空间时追加 `| 可清除 158.6 GB`。
     var headline: String {
-        "磁盘：" + availableBytes.devSweepFileSize + " 可用 | 已用 "
+        var text = "磁盘：" + availableBytes.devSweepFileSize + " 可用 | 已用 "
             + XcodeStorageMetrics.formatPercent(usedPercent)
+        if purgeableBytes > 0 {
+            text += " | 可清除 " + purgeableBytes.devSweepFileSize
+        }
+        return text
     }
 }
 
@@ -336,9 +343,27 @@ struct XcodeDiskInspector {
               total.int64Value > 0,
               available.int64Value >= 0
         else { return nil }
+
+        // APFS 可清除空间 = volumeAvailableCapacityForImportantUsage 与
+        // volumeAvailableCapacity 的差额（前者把系统愿意立刻回收的空间也算进来）。
+        // 拿不到就按 0 处理，绝不编造数字。
+        let url = URL(fileURLWithPath: path)
+        var purgeable: Int64 = 0
+        if let values = try? url.resourceValues(forKeys: [
+            .volumeAvailableCapacityKey,
+            .volumeAvailableCapacityForImportantUsageKey
+        ]),
+           let immediate = values.volumeAvailableCapacity,
+           let important = values.volumeAvailableCapacityForImportantUsage,
+           important > immediate {
+            purgeable = Int64(important) - Int64(immediate)
+        }
+
+        let availableBytes = min(available.int64Value, total.int64Value)
         return XcodeDiskSnapshot(
             totalBytes: total.int64Value,
-            availableBytes: min(available.int64Value, total.int64Value)
+            availableBytes: availableBytes,
+            purgeableBytes: max(0, min(purgeable, total.int64Value - availableBytes))
         )
     }
 }

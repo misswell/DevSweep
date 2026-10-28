@@ -29,6 +29,8 @@ DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcod
 - 参考 PureMac 与 dusty 补齐扫描盲区：Safari / Brave / Arc 浏览器缓存，Slack / Discord / Signal / Telegram / Teams / Zoom / Spotify / Obsidian 的可重建缓存与更新安装包，Unity 导入缓存，以及 `~/Library/Mail Downloads` 邮件附件；Spotify 离线缓存与邮件附件标为「建议确认」，不默认勾选。Go 模块缓存仍由既有 `go/pkg/mod` 规则整体覆盖。
 - 新增「清空内容」清理语义：`~/Library/Caches`、`~/Library/Logs`、`~/.Trash`、`~/Downloads` 以清空子项的方式处理，目录本身保留，子项逐个移入废纸篓；一律默认不勾选，执行前重新核验目录身份与白名单，身份变化或目标不是目录时拒绝。
 - Time Machine 本地快照：扫描 `tmutil listlocalsnapshots`，逐条列出并可用 `tmutil deletelocalsnapshots` 删除；只处理 `com.apple.TimeMachine.*`，`com.apple.os.update-*` 更新回滚点永不进入候选；删除后重新列举确认真正消失（tmutil 可能返回 0 却没删），日期参数严格校验，永不默认勾选。
+- 展示 APFS 可清除空间：磁盘栏在「可用 / 已用」后追加「可清除 X GB」（`volumeAvailableCapacityForImportantUsage` 与 `volumeAvailableCapacity` 的差额），这类空间由系统按需回收，只做展示、不参与清理。
+- 新增只读的大文件 / 旧文件发现：按大小阈值与「超过 N 天未修改」两个独立条件筛选，跳过系统目录与废纸篓、不跟随符号链接、有数量上限并可取消；结果只供用户逐项确认，永不默认勾选、不进定时清理。
 - 动态发现 Electron / Chromium 系应用缓存：扫描 `~/Library/Application Support/<App>/{Cache, Code Cache, GPUCache, DawnGraphiteCache, DawnWebGPUCache, ShaderCache}`（含 `session/` 子目录），覆盖 QQ、钉钉、飞书、网盘、各类桌面客户端等无统一命名的应用；`Local Storage`、`IndexedDB`、`Session Storage`、`databases`、`Service Worker` 一律不碰，IDE 宿主与系统容器目录跳过。
 - 覆盖 Edge、Firefox、Google 应用、媒体分析、剪映和自定义 Chromium 资料目录缓存；跨 Caches、Application Support、Containers、Group Containers、HTTPStorages 和临时目录识别 Sparkle/Squirrel 等软件升级残留，系统级位置仅展示为手动项；存在项目标志时识别项目运行日志与 Nacos 日志。
 - 项目扫描覆盖 `.terragrunt-cache`、`.astro`、`zig-out`、`.cxx`、项目内 DerivedData、monorepo marker 和有效 `CACHEDIR.TAG`；如果扫描根自身是 `node_modules`、`target`、`build`、`dist`、`vendor` 等生成物容器，会跳过其内部项目发现。对 Composer `vendor`、.NET `bin`/`obj` 和通用 `build` 必须先验证项目标志，避免按同名目录误报源码或运行时文件。
