@@ -254,6 +254,13 @@ struct CacheScanner {
 
     static func nonOverlappingItems(_ items: [CacheItem]) -> [CacheItem] {
         var kept: [CacheItem] = []
+        // 「清空内容」的根目录（~/Library/Caches 等）必须与其中的叶子项共存：
+        // 根条目代表「清空全部」，叶子条目代表「只清其中某项」，两者都由用户自己选。
+        // 因此这类条目不做子树折叠，也不能把同名的叶子项裁掉。
+        let rootsNotPruning = Set(
+            items.filter { $0.kind == .trashContents }
+                .map { $0.path.standardizedFileURL.path }
+        )
         let candidates = items.enumerated()
             .sorted {
                 let leftDepth = $0.element.path.standardizedFileURL.pathComponents.count
@@ -272,6 +279,7 @@ struct CacheScanner {
             let itemPath = item.path.standardizedFileURL.path
             let isCovered = kept.contains { existing in
                 let existingPath = existing.path.standardizedFileURL.path
+                guard !rootsNotPruning.contains(existingPath) else { return false }
                 return itemPath == existingPath || itemPath.hasPrefix(existingPath + "/")
             }
             if !isCovered {
@@ -565,6 +573,46 @@ struct CacheScanner {
         }
     }
 
+    /// 需要「清空内容、保留目录」的根目录。
+    ///
+    /// 这些是系统预期的目录：整目录丢进废纸篓会破坏结构（`~/Library/Caches` 缺失
+    /// 会让应用创建失败，`~/Downloads` 缺失会打乱 Finder 快捷访问）。因此它们不是
+    /// 普通缓存条目，而是 `kind = .trashContents`：删的是里面的子项，目录本身保留。
+    /// 一律默认不勾选，必须用户逐项确认——里面可能混着他还没处理的东西。
+    private struct ContentsRule {
+        let category: String
+        let name: String
+        let relativePath: String
+        let note: String
+    }
+
+    private static let contentsRuleTemplates: [ContentsRule] = [
+        ContentsRule(
+            category: "应用缓存",
+            name: "用户缓存目录（清空内容）",
+            relativePath: "Library/Caches",
+            note: "清空 ~/Library/Caches 里的全部子项，目录本身保留；应用会在需要时重建缓存。默认不勾选，请先确认没有正在运行的应用依赖其中的数据"
+        ),
+        ContentsRule(
+            category: "项目日志",
+            name: "用户日志目录（清空内容）",
+            relativePath: "Library/Logs",
+            note: "清空 ~/Library/Logs 里的全部子项，目录本身保留；仅为日志与崩溃记录，删除后无法再排查历史问题"
+        ),
+        ContentsRule(
+            category: "应用缓存",
+            name: "废纸篓（清空）",
+            relativePath: ".Trash",
+            note: "清空废纸篓里的全部项目；文件将从废纸篓永久移除，不能再次恢复"
+        ),
+        ContentsRule(
+            category: "应用缓存",
+            name: "下载目录（清空内容）",
+            relativePath: "Downloads",
+            note: "清空 ~/Downloads 里的全部文件与子目录，目录本身保留；请先确认没有未处理的下载，安装包与文档会被一并移入废纸篓"
+        )
+    ]
+
     private static func fixedItems(
         home: URL,
         collector: inout ScanCollector,
@@ -583,6 +631,25 @@ struct CacheScanner {
                 note: rule.note,
                 collector: &collector,
                 progress: progress
+            ) {
+                items.append(item)
+            }
+        }
+
+        for rule in contentsRuleTemplates {
+            let path = home.appendingPathComponent(rule.relativePath)
+            if let item = makeItem(
+                category: rule.category,
+                name: rule.name,
+                path: path,
+                risk: .review,
+                note: rule.note,
+                collector: &collector,
+                progress: progress,
+                isSelected: false,
+                kind: .trashContents,
+                statusTitle: "清空内容",
+                omitFromNonOverlapPruning: true
             ) {
                 items.append(item)
             }
@@ -2443,7 +2510,8 @@ struct CacheScanner {
         identifier: String? = nil,
         toolAction: ToolCleanupAction? = nil,
         statusTitle: String? = nil,
-        measurement: StorageMeasurement? = nil
+        measurement: StorageMeasurement? = nil,
+        omitFromNonOverlapPruning: Bool = false
     ) -> CacheItem? {
         let standardized = path.standardizedFileURL
         guard fileManager.fileExists(atPath: standardized.path) else { return nil }
@@ -2592,6 +2660,26 @@ struct CacheScanner {
 
 protocol TrashExecuting {
     func trash(_ url: URL) throws
+    /// 清空目录内容、保留目录本身。返回成功移入废纸篓的子项数量。
+    /// 默认实现基于 `trash(_:)`，测试替身只需实现 `trash(_:)` 即可。
+    func trashContents(keepingDirectory url: URL) throws -> Int
+}
+
+extension TrashExecuting {
+    func trashContents(keepingDirectory url: URL) throws -> Int {
+        let fileManager = FileManager.default
+        let children = try fileManager.contentsOfDirectory(
+            at: url,
+            includingPropertiesForKeys: [.isSymbolicLinkKey],
+            options: []
+        )
+        var trashed = 0
+        for child in children {
+            try trash(child)
+            trashed += 1
+        }
+        return trashed
+    }
 }
 
 /// cargo 构建期间拒绝清理 target 产物的原因。
@@ -2664,6 +2752,15 @@ struct CacheCleaner {
                 case .trash:
                     try DeletionValidator.validate(item: item, context: context)
                     try trashExecutor.trash(item.path)
+                case .trashContents:
+                    // 校验的是「目录本身」：必须是同一身份的真实目录、不在白名单/
+                    // 保护路径里。随后逐个把子项移入废纸篓，目录保留。
+                    try DeletionValidator.validate(item: item, context: context)
+                    guard let identity = item.expectedFileIdentity,
+                          identity.kind == .directory else {
+                        throw DeletionValidationError.unsupportedTarget
+                    }
+                    _ = try trashExecutor.trashContents(keepingDirectory: item.path)
                 case .simulatorDevice:
                     try simulatorExecutor.delete(item, context: context)
                 case .simulatorRuntime:

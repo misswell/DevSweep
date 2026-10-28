@@ -130,7 +130,12 @@ struct DeletionValidator {
         item: CacheItem,
         context: DeletionContext
     ) throws {
-        guard item.kind == .trash || item.kind == .toolCommand || item.kind == .simulatorDevice else {
+        // `.trashContents` 校验的是「要被清空的目录」：它必须是真实目录、不在白名单/
+        // 保护路径里、身份未变；真正删除的是它的子项（由 CacheCleaner 逐个移入废纸篓）。
+        guard item.kind == .trash
+            || item.kind == .trashContents
+            || item.kind == .toolCommand
+            || item.kind == .simulatorDevice else {
             throw DeletionValidationError.unsupportedTarget
         }
 

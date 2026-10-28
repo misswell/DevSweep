@@ -7,6 +7,10 @@ enum CleanupKind: String, Hashable {
     /// 模拟器 Runtime（iOS/watchOS/tvOS/visionOS 系统镜像）。只能通过
     /// `xcrun simctl runtime delete` 删除，删除后要重新下载。
     case simulatorRuntime
+    /// 「清空内容、保留目录本身」：用于 `~/Library/Caches`、`~/Library/Logs`、
+    /// `~/.Trash`、`~/Downloads` 这类系统预期的根目录。直接丢进废纸篓会破坏
+    /// 目录结构，因此逐个把子项移入废纸篓，目录本身保留。
+    case trashContents
     case dockerPrune
     case toolCommand
     case requestLogTrim
@@ -17,6 +21,9 @@ enum CleanupKind: String, Hashable {
             return false
         case .simulatorDevice, .simulatorRuntime, .dockerPrune, .toolCommand, .requestLogTrim:
             return true
+        case .trashContents:
+            // 子项各自进废纸篓，仍可从废纸篓恢复。
+            return false
         }
     }
 }
@@ -229,6 +236,8 @@ struct CleanupSelection {
         switch item.kind {
         case .trash, .simulatorDevice, .simulatorRuntime:
             return true
+        case .trashContents:
+            return false
         case .dockerPrune, .toolCommand, .requestLogTrim:
             return false
         }

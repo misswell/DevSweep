@@ -272,7 +272,13 @@ final class StorageMeasurementTests: XCTestCase {
         let item = try XCTUnwrap(report.items.first { $0.path == cache.standardizedFileURL })
         XCTAssertNotNil(item.sizeWarning)
         XCTAssertTrue(item.sizeText.hasPrefix("≥ "))
-        XCTAssertEqual(report.incompleteMeasurements, 1)
+        // 报告的问题数会包含同一棵树下其它不完整项（例如新增的
+        // ~/Library/Caches「清空内容」根条目，它同样读不到 locked 子目录）。
+        // 这里断言「至少包含这一项」，而不是总数恰好为 1，避免新增根目录时误报。
+        XCTAssertGreaterThanOrEqual(report.incompleteMeasurements, 1)
+        XCTAssertNotNil(report.items.first {
+            $0.path == cache.standardizedFileURL && $0.sizeWarning != nil
+        })
     }
 
     func testEmptyDirectoryIsCompleteAndDistinctFromFailedMeasurement() throws {
