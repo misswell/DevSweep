@@ -606,8 +606,33 @@ struct SimulatorRuntimeProtection: Equatable, Sendable {
         home: URL = FileManager.default.homeDirectoryForCurrentUser
     ) {
         self.protectedIdentifiers = protectedIdentifiers
-        self.protectedRoots = (protectedRoots ?? DeletionValidator.defaultProtectedPaths(home: home))
+        self.protectedRoots = (protectedRoots ?? Self.defaultProtectedRoots(home: home))
             .map(\.standardizedFileURL)
+    }
+
+    /// Runtime 的保护根目录。
+    ///
+    /// 不能直接复用 `DeletionValidator.defaultProtectedPaths()`：那份名单里含 `/Library`
+    /// 和 `~/Library/Developer`，而 Runtime 的磁盘映像恰好挂在
+    /// `/Library/Developer/CoreSimulator/Volumes/...` 下，套用后每个 Runtime 都会
+    /// 被判成「挂在受保护路径下」，勾选框全被禁用。
+    ///
+    /// 也绝对不能把 `/` 放进这份名单：`isProtected` 对 `/` 做前缀匹配会命中一切路径。
+    /// Runtime 的保护对象是「不要误删系统文件」，它自身只经 `simctl runtime delete`
+    /// 删除、从不按路径删，所以这里只列真正不该被 Runtime 挂载/父挂载覆盖的位置。
+    static func defaultProtectedRoots(
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> [URL] {
+        [
+            URL(fileURLWithPath: "/System/Volumes/Data/System"),
+            URL(fileURLWithPath: "/private/etc"),
+            URL(fileURLWithPath: "/private/var/db"),
+            home.appendingPathComponent(".Trash"),
+            home.appendingPathComponent("Desktop"),
+            home.appendingPathComponent("Documents"),
+            home.appendingPathComponent("Downloads"),
+            home.appendingPathComponent("Library")
+        ]
     }
 }
 

@@ -495,6 +495,39 @@ final class SimulatorRuntimeCleanupTests: XCTestCase {
         XCTAssertFalse(withBad.removableIdentifiers.contains("bad-version"))
     }
 
+    /// 回归：默认保护名单里含 `/Library`（甚至曾经含 `/`），而 Runtime 的挂载点就在
+    /// `/Library/Developer/CoreSimulator/Volumes/...`，导致所有 Runtime 被判
+    /// 「挂在受保护路径下」，勾选框全部不可点。这里用真实挂载路径断言默认保护不误伤。
+    func testDefaultProtectionDoesNotBlockRealRuntimeMountPaths() throws {
+        let defaultProtection = SimulatorRuntimeProtection()
+
+        let old = makeRuntime(
+            "10DA06ED-69CE-43AC-BC36-998873EBD095",
+            version: "26.5",
+            runtimeIdentifier: "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
+            mountPath: "/Library/Developer/CoreSimulator/Volumes/iOS_23F77",
+            parentMountPath: "/System/Library/AssetsV2/com_apple_MobileAsset_iOSSimulatorRuntime/12fe/AssetData"
+        )
+        let new = makeRuntime(
+            "C921E11F-A3CA-49B7-B19A-1B3250611292",
+            version: "27.0",
+            runtimeIdentifier: "com.apple.CoreSimulator.SimRuntime.iOS-27-0",
+            mountPath: "/Library/Developer/CoreSimulator/Volumes/iOS_24A5370g",
+            parentMountPath: "/System/Library/AssetsV2/com_apple_MobileAsset_iOSSimulatorRuntime/12fe/AssetData"
+        )
+
+        let plan = SimulatorRuntimeCleaner.removableIdentifiers([old, new], protection: defaultProtection)
+        XCTAssertTrue(plan.blocked.isEmpty,
+                      "默认保护不应拦真实挂载路径：\(plan.blocked.map { $0.reason })")
+        XCTAssertEqual(plan.removableIdentifiers, [old.identifier],
+                       "旧版本必须可勾选删除")
+
+        // 默认初始化（不传 protectedRoots）也必须放行，防止以后又把 /Library 加回去。
+        let defaultPlan = SimulatorRuntimeCleaner.removableIdentifiers([old, new])
+        XCTAssertTrue(defaultPlan.blocked.isEmpty, "\(defaultPlan.blocked.map { $0.reason })")
+        XCTAssertEqual(defaultPlan.removableIdentifiers, [old.identifier])
+    }
+
     func testProtectedIdentifierAndNonReadyStateBlockRemoval() {
         let old = makeRuntime("iOS-26-5", version: "26.5")
         let new = makeRuntime("iOS-27-0", version: "27.0")
