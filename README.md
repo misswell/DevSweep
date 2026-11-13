@@ -2,7 +2,7 @@
 
 DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcode、Rust/Tauri、Node、SwiftPM、Cargo、Gradle、Maven、Python、Go、Flutter、VS Code、Cursor 以及 OpenAI Codex、OpenCode、Claude Code、Goose 等 AI agent 开发环境。
 
-当前版本：0.1.67
+当前版本：0.1.68
 
 ## 当前功能
 
@@ -25,7 +25,7 @@ DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcod
 - 增加 Claude Code Router 请求日志分类：识别 `~/.claude-code-router/app-data` 下按 UUID 分片的 `request-log-bodies` 和 `request-logs.sqlite`，按 24 小时保留窗口就地裁剪——删除过期日志行及其正文、清理已无任何日志引用的残留正文，并执行 VACUUM 回收 SQLite 空闲页和 WAL；不把目录整体移入废纸篓，最近 24 小时的日志和仍被引用的正文都会保留，默认不勾选且不能从废纸篓恢复。
 - 补充 npx、Ruby/Bundler、node-gyp、VS Code/Cursor 扩展安装包、前端工具链、云 CLI、Terraform/Helm、Cypress/Selenium 和多平台 Xcode DeviceSupport；系统级 CoreSimulator/Xcode 缓存只读展示为手动处理。
 - 补充 nvm、Volta、SonarQube、pnpm registry 元数据、SwiftPM XDG/旧缓存、Scala/sbt/Ivy/Coursier/Metals，以及 Instruments、SourceKitService 和 Xcode Previews 缓存；同时覆盖 Lingma、Trae CN、Windsurf、Zed、OpenCode Desktop、Nova 等开发工具的明确缓存叶子，并识别 NVM_DIR、VOLTA_HOME、SONAR_USER_HOME、COURSIER_CACHE 和 CocoaPods 自定义目录。
-- 新增「Xcode 空间」页：按 Xcode 自己的存储语义把十三类占用分成可重建 / 需确认 / 手动三档，每类带独立开关与逐项选择；可直接清理 DerivedData、各类 Xcode/模拟器/SwiftPM 缓存与日志，归档与 DeviceSupport 逐项勾选后移入废纸篓。模拟器 Runtime 经由 `xcrun simctl runtime delete` 删除，按平台保留最新版本、删除前重新核对清单、删除后轮询验证，失败逐条给出原因并可复制兜底命令；启动前检查 Xcode / 构建 / 测试进程，运行中只提示不阻断开。
+- 新增「Xcode 空间」页：按 Xcode 自己的存储语义把十三类占用分成可重建 / 需确认 / 手动三档，每类带独立开关与逐项选择；开关、子项复选框与底部「已选」共用同一条判定（开关打开即整组勾选，取消最后一个子项时开关自动关闭，没有可勾选条目的分类开关置灰），不会再出现「开关是开、子项没勾」或「勾着却不计入已选」。可直接清理 DerivedData、各类 Xcode/模拟器/SwiftPM 缓存与日志，归档与 DeviceSupport 逐项勾选后移入废纸篓。模拟器 Runtime 经由 `xcrun simctl runtime delete` 删除，按平台保留最新版本并在行内提前说明，删除前重新核对清单、删除后轮询验证，失败逐条给出原因并可复制兜底命令；启动前检查 Xcode / 构建 / 测试进程，运行中只提示不阻断开。
 - 参考 PureMac 与 dusty 补齐扫描盲区：Safari / Brave / Arc 浏览器缓存，Slack / Discord / Signal / Telegram / Teams / Zoom / Spotify / Obsidian 的可重建缓存与更新安装包，Unity 导入缓存，以及 `~/Library/Mail Downloads` 邮件附件；Spotify 离线缓存与邮件附件标为「建议确认」，不默认勾选。Go 模块缓存仍由既有 `go/pkg/mod` 规则整体覆盖。
 - 新增「清空内容」清理语义：`~/Library/Caches`、`~/Library/Logs`、`~/.Trash`、`~/Downloads` 以清空子项的方式处理，目录本身保留，子项逐个移入废纸篓；一律默认不勾选，执行前重新核验目录身份与白名单，身份变化或目标不是目录时拒绝。
 - Time Machine 本地快照：扫描 `tmutil listlocalsnapshots`，逐条列出并可用 `tmutil deletelocalsnapshots` 删除；只处理 `com.apple.TimeMachine.*`，`com.apple.os.update-*` 更新回滚点永不进入候选；删除后重新列举确认真正消失（tmutil 可能返回 0 却没删），日期参数严格校验，永不默认勾选。

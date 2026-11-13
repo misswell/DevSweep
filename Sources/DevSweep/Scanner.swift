@@ -3161,7 +3161,13 @@ final class DevSweepStore: ObservableObject {
     private var cachedCategoryIndex: CategoryIndex?
     private var cachedCategoryIndexGeneration: Int = -1
     /// `items` 每次整体替换时递增；用于让派生缓存失效，避免比较整个数组。
+    ///
+    /// 页面也可以读它来判断「条目已经换过一轮」：`CacheItem.id` 每次扫描都会重新生成，
+    /// 只看条目数/总字节不足以发现内容替换。
     private var itemsGeneration: Int = 0
+
+    /// 供需要按「条目批次」缓存派生数据的页面使用（如 Xcode 空间快照）。
+    var itemsRevision: Int { itemsGeneration }
 
     struct CategoryIndex {
         let totalBytes: Int64

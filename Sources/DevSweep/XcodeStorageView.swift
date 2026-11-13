@@ -101,6 +101,26 @@ final class XcodeRuntimeSource: ObservableObject {
 
     private var cachedBlockedReasons: [String: String]?
 
+    /// 「每平台保留最新版本」的说明。
+    ///
+    /// 这些条目仍然可勾选（平台只剩一个版本时也要能选），但删除前复核一定会保留它们。
+    /// 让用户在勾选的当下就看到结果，而不是点了「立即清理」才收到失败。
+    var retentionWarnings: [String: String] {
+        if let cachedRetentionWarnings, cachedPolicyToken == runtimes {
+            return cachedRetentionWarnings
+        }
+        let computed = Dictionary(
+            policy.kept.map {
+                ($0.identifier, "所属平台的最新版本，删除前会被保留；如需清理请先安装更高版本")
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
+        cachedRetentionWarnings = computed
+        return computed
+    }
+
+    private var cachedRetentionWarnings: [String: String]?
+
     /// 按平台分组的 Runtime，平台内版本从新到旧。
     var runtimeGroups: [XcodeRuntimeGroup] {
         let grouped = Dictionary(grouping: runtimes) {
@@ -218,6 +238,16 @@ final class XcodeRuntimeSource: ObservableObject {
         } else {
             selectedRuntimeIdentifiers.removeAll()
         }
+        persistSelection()
+    }
+
+    /// 只勾选这一条：分类开关原本关着、用户直接点某个子项时用。
+    ///
+    /// 勾选记忆跨启动保留，直接插入会把上一次的其它勾选一起「继承」过来，
+    /// 看起来就像「只点了一个，却整列都勾上了」。
+    func selectOnlyRuntime(_ identifier: String) {
+        guard selectableRuntimeIdentifiers.contains(identifier) else { return }
+        selectedRuntimeIdentifiers = [identifier]
         persistSelection()
     }
 
@@ -437,8 +467,13 @@ struct XcodeStorageSelection: Equatable {
         enabledCategories.contains(category)
     }
 
-    /// 分类开关的三态。文件分类只看「分类开关 + 本轮逐项取消」；Runtime 分类由
-    /// `XcodeRuntimeSource` 的逐条勾选决定，开关只代表「是否参与本次清理」。
+    /// 分类开关的三态，与子项复选框、清理计划共用 `isItemSelected(_:in:)` 这一条判定。
+    ///
+    /// 之前的写法在这里埋了两处错位：
+    /// - Runtime 分类在「可勾选数 == 0」时回落到持久化的分类开关，于是出现
+    ///   「开关是开、子项一个都没勾」（每平台最新版本被保留时必然如此）；
+    /// - 文件分类只数逐项取消记录，不看分类开关，于是「开关关掉过、子项仍算已勾」，
+    ///   开关看起来是开、计划里却没有它。
     func categoryState(
         _ category: XcodeStorageCategory,
         row: XcodeStorageRow,
@@ -447,26 +482,21 @@ struct XcodeStorageSelection: Equatable {
         runtimeSelectableCount: Int
     ) -> XcodeCategorySelectionState {
         if category == .runtimes {
-            guard runtimeSelectableCount > 0 else {
-                return isCategoryEnabled(category) ? .on : .off
-            }
+            // 只看真正可勾选的 Runtime：被保留策略挡下的条目既不可勾也不能撑住「开」。
+            guard runtimeSelectableCount > 0 else { return .off }
             if runtimeSelectedCount == 0 { return .off }
-            if runtimeSelectedCount == runtimeSelectableCount { return .on }
+            if runtimeSelectedCount >= runtimeSelectableCount { return .on }
             return .mixed
         }
-        guard !row.isEmpty else {
+        let resolved = row.itemIDs.compactMap { itemsByID[$0] }
+        guard !resolved.isEmpty else {
             return isCategoryEnabled(category) ? .on : .off
         }
-        let total = row.itemIDs.filter { itemsByID[$0] != nil }.count
-        guard total > 0 else {
-            return isCategoryEnabled(category) ? .on : .off
-        }
-        let chosen = row.itemIDs.filter { id in
-            guard let item = itemsByID[id] else { return false }
-            return isItemIncluded(path: SelectionMemory.key(for: item.path))
+        let chosen = resolved.filter {
+            isItemSelected(SelectionMemory.key(for: $0.path), in: category)
         }.count
         if chosen == 0 { return .off }
-        if chosen == total { return .on }
+        if chosen == resolved.count { return .on }
         return .mixed
     }
 
@@ -506,15 +536,45 @@ struct XcodeStorageSelection: Equatable {
         persistExcluded()
     }
 
+    /// 逐项勾选记录本身（不含分类开关）。
     func isItemIncluded(path: String) -> Bool {
         !excludedItemPaths.contains(path)
     }
 
-    mutating func setItemIncluded(path: String, included: Bool) {
-        if included {
+    /// 真正会进入清理计划的判定：分类开关打开 **且** 该项没有被逐项取消。
+    ///
+    /// 分类开关、子项复选框、`XcodeCleanupPlan` 三处都只认这一个函数，
+    /// 才不会出现「开关/复选框是勾着的，但计划里算 0 字节」。
+    func isItemSelected(_ path: String, in category: XcodeStorageCategory) -> Bool {
+        isCategoryEnabled(category) && isItemIncluded(path: path)
+    }
+
+    /// 勾/取消单个子项，并同步分类开关。
+    ///
+    /// - 勾选时若分类开关原本是关的：先打开分类，再把同分类其它子项记为取消。
+    ///   否则「只勾这一项」会因为开关打开而把所有兄弟项一起变成勾选。
+    /// - 取消时若同分类已经没有勾选项：把分类开关关掉。否则开关会停在「开」，
+    ///   而计划里其实什么都没有。
+    mutating func setItemSelected(
+        _ selected: Bool,
+        path: String,
+        in category: XcodeStorageCategory,
+        siblings: [String]
+    ) {
+        if selected {
+            if !enabledCategories.contains(category) {
+                setCategory(category, enabled: true)
+                for sibling in siblings where sibling != path {
+                    excludedItemPaths.insert(sibling)
+                }
+            }
             excludedItemPaths.remove(path)
         } else {
             excludedItemPaths.insert(path)
+            let anyLeft = siblings.contains { $0 != path && !excludedItemPaths.contains($0) }
+            if !anyLeft {
+                setCategory(category, enabled: false)
+            }
         }
         persistExcluded()
     }
@@ -565,12 +625,14 @@ struct XcodeCleanupPlan: Equatable {
             guard let category = XcodeStorageCategory.allCases.first(where: {
                 XcodeStorageClassifier.rowID(for: $0) == row.id
             }) else { continue }
-            guard selection.isCategoryEnabled(category) else { continue }
             let wanted = Set(row.itemIDs)
             for item in items where wanted.contains(item.id) {
                 // 手动项也允许被选择：安全由「逐项勾选 + 执行器自身复核」保证，
                 // 而不是在这里静默剔除，否则用户勾了却删不掉、或者根本点不动。
-                guard selection.isItemIncluded(path: SelectionMemory.key(for: item.path)) else { continue }
+                // 是否进入计划只看 `isItemSelected`，与开关/复选框显示完全一致。
+                guard selection.isItemSelected(
+                    SelectionMemory.key(for: item.path), in: category
+                ) else { continue }
                 chosen.append(item)
             }
         }
@@ -632,7 +694,13 @@ enum XcodeCleanSchedule: String, CaseIterable, Identifiable, Hashable {
 // MARK: - 页面
 
 /// 快照缓存键：只包含会影响派生结果的输入，避免每次 body 都重新分类全部条目。
+///
+/// `itemsRevision` 是必需的：`CacheItem.id` 每次扫描都会重新生成，
+/// 「条目数 + 总字节」相同但条目已经换了一轮时（清理后立刻重扫很常见），
+/// 只有这两个字段会觉得什么都没变，于是 rows / itemsByID 继续指向旧 UUID，
+/// 展开分类看不到子项，开关点下去也改不到真正的条目。
 struct XcodeSnapshotKey: Equatable {
+    let itemsRevision: Int
     let itemCount: Int
     let itemBytes: Int64
     let runtimeIdentifiers: [String]
@@ -672,6 +740,7 @@ struct XcodeStorageView: View {
         )
         _snapshot = State(initialValue: initialSnapshot)
         _snapshotKey = State(initialValue: XcodeSnapshotKey(
+            itemsRevision: store.itemsRevision,
             itemCount: store.items.count,
             itemBytes: store.items.reduce(0) { $0 + $1.size },
             runtimeIdentifiers: runtimeSource.runtimes.map(\.identifier),
@@ -755,6 +824,7 @@ struct XcodeStorageView: View {
 
     private var inputKey: XcodeSnapshotKey {
         XcodeSnapshotKey(
+            itemsRevision: store.itemsRevision,
             itemCount: store.items.count,
             itemBytes: store.items.reduce(0) { $0 + $1.size },
             runtimeIdentifiers: runtimeSource.runtimes.map(\.identifier),
@@ -787,12 +857,46 @@ struct XcodeStorageView: View {
     /// 分类三态判定要用的 id → 条目映射，随快照一起算好。
     private var itemsByID: [UUID: CacheItem] { snapshot.itemsByID }
 
-    /// 可删除的 Runtime 数量；`selected == true` 时只数其中已被勾选的。
+    /// 可勾选的 Runtime 数量；`selected == true` 时只数其中已被勾选的。
+    ///
+    /// 必须用 `selectableRuntimeIdentifiers`（复选框实际允许勾的集合），不能用
+    /// `removableIdentifiers`（保留策略，天生不含每平台最新版本）。两者不一致时
+    /// 开关会按「可清理 0 条」回落到持久化状态，出现「开关是开、子项没勾」。
     private func selectableRuntimeCount(selected: Bool) -> Int {
-        let removable = runtimeSource.removableIdentifiers
-        guard selected else { return removable.count }
-        let chosen = runtimeSource.selectedRuntimeIdentifiers
-        return removable.filter { chosen.contains($0) }.count
+        let selectable = runtimeSource.selectableRuntimeIdentifiers
+        guard selected else { return selectable.count }
+        return selectable.intersection(runtimeSource.selectedRuntimeIdentifiers).count
+    }
+
+    /// 分类开关是否可点：忙时、空分类、以及「没有可勾选 Runtime」时都不能点。
+    private func isCategoryToggleEnabled(
+        _ category: XcodeStorageCategory,
+        row: XcodeStorageRow
+    ) -> Bool {
+        guard !isBusy else { return false }
+        if category == .runtimes {
+            return selectableRuntimeCount(selected: false) > 0
+        }
+        return !row.isEmpty
+    }
+
+    /// 勾/取消单条 Runtime，并同步「模拟器 Runtime」分类开关，语义与文件子项一致。
+    private func setRuntimeSelected(_ identifier: String, selected: Bool) {
+        if selected {
+            if selection.isCategoryEnabled(.runtimes) {
+                runtimeSource.setRuntimeSelected(identifier, selected: true)
+            } else {
+                // 开关原本是关的：只勾这一条，避免记忆里的其它勾选被一起带出来。
+                selection.setCategory(.runtimes, enabled: true)
+                runtimeSource.selectOnlyRuntime(identifier)
+            }
+            return
+        }
+        runtimeSource.setRuntimeSelected(identifier, selected: false)
+        // 一条都不剩时把开关也关掉，避免开关停在「开」但计划为空。
+        if runtimeSource.selectedRuntimeIdentifiers.isEmpty {
+            selection.setCategory(.runtimes, enabled: false)
+        }
     }
 
     private var runtimeBytesByIdentifier: [String: Int64] {
@@ -1021,6 +1125,7 @@ struct XcodeStorageView: View {
                             emptyHint: emptyHint(for: category),
                             runtimeSource: runtimeSource,
                             isBusy: isBusy,
+                            isToggleEnabled: isCategoryToggleEnabled(category, row: row),
                             onToggleCategory: { enabled in
                                 // 打开 = 该分类整组参与清理；关闭 = 整组退出，并撤销逐项取消记录。
                                 selection.setCategory(category, enabled: enabled)
@@ -1038,9 +1143,27 @@ struct XcodeStorageView: View {
                                     expanded.insert(row.id)
                                 }
                             },
-                            isItemIncluded: { path in selection.isItemIncluded(path: path) },
-                            onToggleItem: { path, included in
-                                selection.setItemIncluded(path: path, included: included)
+                            isItemSelected: { path in
+                                selection.isItemSelected(path, in: category)
+                            },
+                            onToggleItem: { path, selected in
+                                selection.setItemSelected(
+                                    selected,
+                                    path: path,
+                                    in: category,
+                                    siblings: items(for: row).map {
+                                        SelectionMemory.key(for: $0.path)
+                                    }
+                                )
+                            },
+                            isRuntimeSelected: { identifier in
+                                // Runtime 的勾选同样要过分类开关：开关关掉后即使
+                                // identifier 还在记忆里，也不该显示成已勾。
+                                selection.isCategoryEnabled(.runtimes)
+                                    && runtimeSource.selectedRuntimeIdentifiers.contains(identifier)
+                            },
+                            onToggleRuntime: { identifier, selected in
+                                setRuntimeSelected(identifier, selected: selected)
                             }
                         )
                     }
@@ -1201,10 +1324,14 @@ private struct XcodeStorageCategoryRow: View {
     let emptyHint: String
     @ObservedObject var runtimeSource: XcodeRuntimeSource
     let isBusy: Bool
+    /// 开关能否点：空分类、没有可勾选 Runtime、正在忙时为 false。
+    let isToggleEnabled: Bool
     let onToggleCategory: (Bool) -> Void
     let onToggleExpanded: () -> Void
-    let isItemIncluded: (String) -> Bool
+    let isItemSelected: (String) -> Bool
     let onToggleItem: (String, Bool) -> Void
+    let isRuntimeSelected: (String) -> Bool
+    let onToggleRuntime: (String, Bool) -> Void
 
     private var isRuntimeRow: Bool { category == .runtimes }
 
@@ -1217,6 +1344,15 @@ private struct XcodeStorageCategoryRow: View {
 
     private var canExpand: Bool { childCount > 0 }
 
+    private var toggleHelp: String {
+        guard isToggleEnabled else {
+            if isBusy { return "正在扫描或清理，稍后再调整" }
+            if isRuntimeRow { return "当前没有可勾选的 Runtime（每平台最新版本默认保留）" }
+            return "该分类当前没有内容"
+        }
+        return "打开后在「立即清理」时处理这一分类"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 12) {
@@ -1227,8 +1363,8 @@ private struct XcodeStorageCategoryRow: View {
                 .labelsHidden()
                 .toggleStyle(.switch)
                 .controlSize(.small)
-                .disabled(row.isEmpty || isBusyForToggle)
-                .help(row.isEmpty ? "该分类当前没有内容" : "打开后在「立即清理」时处理这一分类")
+                .disabled(!isToggleEnabled)
+                .help(toggleHelp)
 
                 Image(systemName: icon)
                     .font(.title3)
@@ -1243,7 +1379,7 @@ private struct XcodeStorageCategoryRow: View {
                             .font(.subheadline.weight(.semibold))
                             .lineLimit(1)
                         XcodeRiskBadge(title: row.risk.title, color: row.risk.color)
-                        if isRuntimeRow, state == .mixed {
+                        if state == .mixed {
                             XcodeRiskBadge(title: "部分选中", color: .orange)
                         }
                         if !row.allowsAutomaticClean {
@@ -1306,9 +1442,10 @@ private struct XcodeStorageCategoryRow: View {
                             XcodeRuntimeRow(
                                 runtime: runtime,
                                 blockReason: runtimeSource.blockedReasons[runtime.identifier],
+                                retentionWarning: runtimeSource.retentionWarnings[runtime.identifier],
                                 isSelected: Binding(
-                                    get: { runtimeSource.selectedRuntimeIdentifiers.contains(runtime.identifier) },
-                                    set: { runtimeSource.setRuntimeSelected(runtime.identifier, selected: $0) }
+                                    get: { isRuntimeSelected(runtime.identifier) },
+                                    set: { onToggleRuntime(runtime.identifier, $0) }
                                 ),
                                 isBusy: isBusy
                             )
@@ -1323,7 +1460,7 @@ private struct XcodeStorageCategoryRow: View {
                     XcodeStorageItemRow(
                         item: item,
                         included: Binding(
-                            get: { isItemIncluded(SelectionMemory.key(for: item.path)) },
+                            get: { isItemSelected(SelectionMemory.key(for: item.path)) },
                             set: { onToggleItem(SelectionMemory.key(for: item.path), $0) }
                         ),
                         isBusy: isBusy
@@ -1333,8 +1470,6 @@ private struct XcodeStorageCategoryRow: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
-
-    private var isBusyForToggle: Bool { isBusy }
 
     private var subtitle: String {
         if isRuntimeRow, state == .mixed, category == .runtimes {
@@ -1376,6 +1511,8 @@ private struct XcodeStorageCategoryRow: View {
 private struct XcodeRuntimeRow: View {
     let runtime: SimulatorRuntimeInfo
     let blockReason: String?
+    /// 「每平台保留最新版本」的提示：仍可勾选，但删除时会被保留，先告诉用户。
+    let retentionWarning: String?
     @Binding var isSelected: Bool
     let isBusy: Bool
 
@@ -1419,6 +1556,11 @@ private struct XcodeRuntimeRow: View {
                     Text("删除后需重新下载；使用该版本的模拟器设备会变得不可用，不可从废纸篓恢复")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
+                }
+                if let retentionWarning, blockReason == nil {
+                    Text(retentionWarning)
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
                 }
                 if let mount = runtime.mountPath, !mount.isEmpty {
                     Text(URL(fileURLWithPath: mount).devSweepDisplayPath)

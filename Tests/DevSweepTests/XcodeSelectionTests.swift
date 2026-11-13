@@ -56,7 +56,8 @@ final class XcodeSelectionTests: XCTestCase {
         XCTAssertEqual(plan.items.count, 1, "手动项被分类开关包含时应进入计划")
 
         // 用户显式取消 → 必须真的从计划里消失（这是曾经点不动的那个问题）。
-        selection.setItemIncluded(path: SelectionMemory.key(for: item.path), included: false)
+        let key = SelectionMemory.key(for: item.path)
+        selection.setItemSelected(false, path: key, in: category, siblings: [key])
         plan = XcodeCleanupPlan.make(
             items: [item], selection: selection, rows: [row],
             selectedRuntimeIdentifiers: [], runtimeBytesByIdentifier: [:]
@@ -69,6 +70,149 @@ final class XcodeSelectionTests: XCTestCase {
             runtimeSelectedCount: 0, runtimeSelectableCount: 0
         )
         XCTAssertEqual(state, .off, "取消全部子项后分类应显示为关")
+    }
+
+    // MARK: - 分类开关与子项复选框同步
+
+    private func makeItem(
+        _ name: String,
+        path: String,
+        size: Int64,
+        risk: RiskLevel = .review
+    ) -> CacheItem {
+        CacheItem(
+            category: "Xcode",
+            name: name,
+            path: URL(fileURLWithPath: path),
+            size: size,
+            risk: risk
+        )
+    }
+
+    private func makeRow(_ category: XcodeStorageCategory, items: [CacheItem]) -> XcodeStorageRow {
+        XcodeStorageRow(
+            id: XcodeStorageClassifier.rowID(for: category),
+            title: category.title,
+            subtitle: category.subtitle,
+            risk: category.risk,
+            sizeBytes: items.reduce(0) { $0 + max(0, $1.size) },
+            itemIDs: items.map(\.id),
+            runtimeIdentifiers: [],
+            isGroup: true,
+            allowsAutomaticClean: category.allowsAutomaticClean
+        )
+    }
+
+    /// 开关、复选框、清理计划必须始终是同一件事：用户看到的勾选 == 会被处理的条目。
+    func testSwitchChildrenAndPlanStayInSync() {
+        makeSelection()
+        var selection = XcodeStorageSelection(defaults: UserDefaults(suiteName: defaultsSuite)!)
+        let first = makeItem("First.xcarchive", path: "/tmp/DevSweep/First.xcarchive", size: 10)
+        let second = makeItem("Second.xcarchive", path: "/tmp/DevSweep/Second.xcarchive", size: 20)
+        let row = makeRow(.archives, items: [first, second])
+        let itemsByID = [first.id: first, second.id: second]
+        let keys = [SelectionMemory.key(for: first.path), SelectionMemory.key(for: second.path)]
+
+        func state() -> XcodeCategorySelectionState {
+            selection.categoryState(
+                .archives, row: row, itemsByID: itemsByID,
+                runtimeSelectedCount: 0, runtimeSelectableCount: 0
+            )
+        }
+        func checkedCount() -> Int {
+            keys.filter { selection.isItemSelected($0, in: .archives) }.count
+        }
+        func planCount() -> Int {
+            XcodeCleanupPlan.make(
+                items: [first, second], selection: selection, rows: [row],
+                selectedRuntimeIdentifiers: [], runtimeBytesByIdentifier: [:]
+            ).items.count
+        }
+
+        // 「归档」默认关闭：开关关、子项都不显示为已勾、计划为空。
+        XCTAssertFalse(selection.isCategoryEnabled(.archives))
+        XCTAssertEqual(state(), .off)
+        XCTAssertEqual(checkedCount(), 0, "开关关着时子项不能显示为已勾")
+        XCTAssertEqual(planCount(), 0, "显示为未勾的条目不能进入计划")
+
+        // 打开开关 → 子项全部勾上，计划同步。
+        selection.setCategory(.archives, enabled: true)
+        selection.setAllItems(in: [.archives], included: true, rows: [row], itemsByID: itemsByID)
+        XCTAssertEqual(state(), .on)
+        XCTAssertEqual(checkedCount(), 2)
+        XCTAssertEqual(planCount(), 2)
+
+        // 取消一个 → 部分选中，计划只剩一个。
+        selection.setItemSelected(false, path: keys[0], in: .archives, siblings: keys)
+        XCTAssertEqual(state(), .mixed)
+        XCTAssertEqual(checkedCount(), 1)
+        XCTAssertEqual(planCount(), 1)
+
+        // 再取消最后一个 → 开关必须回到关，计划为空（不能停在「开」）。
+        selection.setItemSelected(false, path: keys[1], in: .archives, siblings: keys)
+        XCTAssertEqual(state(), .off)
+        XCTAssertEqual(checkedCount(), 0)
+        XCTAssertEqual(planCount(), 0)
+        XCTAssertFalse(selection.isCategoryEnabled(.archives), "全部取消后分类开关也要关掉")
+    }
+
+    /// 分类开关关着时直接点某个子项：只勾这一项，不能把同分类其它项一起带成勾选。
+    func testCheckingOneChildOfDisabledCategoryChecksOnlyThatChild() {
+        makeSelection()
+        var selection = XcodeStorageSelection(defaults: UserDefaults(suiteName: defaultsSuite)!)
+        let first = makeItem("First.xcarchive", path: "/tmp/DevSweep/First.xcarchive", size: 10)
+        let second = makeItem("Second.xcarchive", path: "/tmp/DevSweep/Second.xcarchive", size: 20)
+        let row = makeRow(.archives, items: [first, second])
+        let keys = [SelectionMemory.key(for: first.path), SelectionMemory.key(for: second.path)]
+
+        selection.setItemSelected(true, path: keys[0], in: .archives, siblings: keys)
+
+        XCTAssertTrue(selection.isCategoryEnabled(.archives))
+        XCTAssertTrue(selection.isItemSelected(keys[0], in: .archives))
+        XCTAssertFalse(selection.isItemSelected(keys[1], in: .archives), "兄弟项不能被一起勾上")
+
+        let plan = XcodeCleanupPlan.make(
+            items: [first, second], selection: selection, rows: [row],
+            selectedRuntimeIdentifiers: [], runtimeBytesByIdentifier: [:]
+        )
+        XCTAssertEqual(plan.items.map(\.id), [first.id], "计划里只能有用户勾的那一项")
+        let state = selection.categoryState(
+            .archives, row: row, itemsByID: [first.id: first, second.id: second],
+            runtimeSelectedCount: 0, runtimeSelectableCount: 0
+        )
+        XCTAssertEqual(state, .mixed)
+    }
+
+    // MARK: - Runtime 开关只看可勾选集合
+
+    /// 每平台最新版本会被保留策略挡下（可勾选数为 0），此时开关必须是关；
+    /// 以前会回落到「Runtime 分类默认打开」，于是出现开关开、子项一个没勾。
+    func testRuntimeSwitchStateUsesSelectableRuntimesOnly() {
+        makeSelection()
+        let selection = XcodeStorageSelection(defaults: UserDefaults(suiteName: defaultsSuite)!)
+        let row = XcodeStorageRow(
+            id: XcodeStorageClassifier.rowID(for: .runtimes),
+            title: XcodeStorageCategory.runtimes.title,
+            subtitle: XcodeStorageCategory.runtimes.subtitle,
+            risk: .manual,
+            sizeBytes: 8_000_000_000,
+            itemIDs: [],
+            runtimeIdentifiers: ["R1"],
+            isGroup: true,
+            allowsAutomaticClean: false
+        )
+
+        func state(selected: Int, selectable: Int) -> XcodeCategorySelectionState {
+            selection.categoryState(
+                .runtimes, row: row, itemsByID: [:],
+                runtimeSelectedCount: selected, runtimeSelectableCount: selectable
+            )
+        }
+
+        XCTAssertEqual(state(selected: 0, selectable: 0), .off, "没有可勾选的 Runtime 时开关必须关")
+        XCTAssertEqual(state(selected: 0, selectable: 1), .off, "有可勾选但没勾时开关必须关")
+        XCTAssertEqual(state(selected: 1, selectable: 1), .on)
+        XCTAssertEqual(state(selected: 1, selectable: 2), .mixed)
     }
 
     // MARK: - Runtime 最新版本也可选
@@ -128,6 +272,40 @@ final class XcodeSelectionTests: XCTestCase {
         XCTAssertFalse(source.selectableRuntimeIdentifiers.contains(locked.identifier))
         source.setRuntimeSelected(locked.identifier, selected: true)
         XCTAssertTrue(source.selectedRuntimeIdentifiers.isEmpty, "simctl 标记不可移除的不能勾选")
+    }
+
+    /// 开关原本关着时直接点某一条 Runtime：只勾这一条，
+    /// 不能把上次启动留下的其它勾选一起带出来。
+    func testSelectOnlyRuntimeDropsEarlierSelections() {
+        let source = XcodeRuntimeSource(
+            defaults: UserDefaults(suiteName: defaultsSuite)!,
+            runner: NeverRunner()
+        )
+        func runtime(_ identifier: String, version: String) -> SimulatorRuntimeInfo {
+            SimulatorRuntimeInfo(
+                identifier: identifier,
+                runtimeIdentifier: "com.apple.CoreSimulator.SimRuntime.iOS-" + version.replacingOccurrences(of: ".", with: "-"),
+                platformIdentifier: "com.apple.platform.iphonesimulator",
+                version: version,
+                build: nil,
+                deletable: true,
+                sizeBytes: 1_000_000,
+                mountPath: "/Library/Developer/CoreSimulator/Volumes/\(identifier)",
+                parentMountPath: nil,
+                state: "Ready",
+                lastUsedAt: nil,
+                runtimeBundlePath: nil
+            )
+        }
+        let older = runtime("OLD-RUNTIME", version: "26.4")
+        let newest = runtime("NEW-RUNTIME", version: "27.0")
+        source.installForTesting([older, newest])
+
+        source.setAllRuntimesSelected(true)
+        XCTAssertEqual(source.selectedRuntimeIdentifiers, ["OLD-RUNTIME", "NEW-RUNTIME"])
+
+        source.selectOnlyRuntime("NEW-RUNTIME")
+        XCTAssertEqual(source.selectedRuntimeIdentifiers, ["NEW-RUNTIME"])
     }
 }
 
