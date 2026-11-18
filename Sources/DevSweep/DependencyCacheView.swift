@@ -252,7 +252,8 @@ private struct DependencyCacheView: View {
     }
 
     private func addSelectedToWhitelist(_ packages: Set<String>) {
-        let count = store.addDependencyProtectionRules(.forPackages(packages, manager: repository.manager))
+        let rules = DependencyProtectionRule.forPackages(packages, manager: repository.manager)
+        let count = store.addDependencyProtectionRules(rules)
         guard count > 0 else { return }
         outcome = "已将 \(count) 个包加入白名单"
         failures = []
