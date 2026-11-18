@@ -117,7 +117,10 @@ struct CacheScanner {
         let roots = normalizedRoots(projectRoots)
 
         progress(ScanProgress(phase: "扫描固定开发者缓存"))
-        var items = fixedItems(home: home, collector: &collector, progress: progress)
+        var items = DependencyRepository.configured(home: home, environment: environment).compactMap {
+            dependencyRepositoryItem($0, collector: &collector, progress: progress)
+        }
+        items += fixedItems(home: home, collector: &collector, progress: progress)
         if includeSystemCaches {
             items += systemItems(collector: &collector, progress: progress)
         }
@@ -246,7 +249,7 @@ struct CacheScanner {
         // 体积未知的特殊操作项（Time Machine 快照不报告单个体积）不能因为
         // size == 0 就被丢掉：它连 UI 都进不去，功能等于不存在。
         let uniqueItems = nonOverlappingItems(candidates)
-        .filter { $0.size >= minimumItemSize || $0.kind.isSizeAgnostic }
+        .filter { $0.size >= minimumItemSize || $0.kind.isSizeAgnostic || $0.dependencyRepository != nil }
         .sorted {
             if $0.size == $1.size { return $0.name.localizedStandardCompare($1.name) == .orderedAscending }
             return $0.size > $1.size
@@ -276,6 +279,7 @@ struct CacheScanner {
 
     static func nonOverlappingItems(_ items: [CacheItem]) -> [CacheItem] {
         var kept: [CacheItem] = []
+        let repositoryRoots = items.compactMap { $0.dependencyRepository?.root }
         // 「清空内容」的根目录（~/Library/Caches 等）必须与其中的叶子项共存：
         // 根条目代表「清空全部」，叶子条目代表「只清其中某项」，两者都由用户自己选。
         // 因此这类条目不做子树折叠，也不能把同名的叶子项裁掉。
@@ -305,6 +309,10 @@ struct CacheScanner {
             .map(\.element)
 
         for item in candidates {
+            if item.dependencyRepository == nil, item.kind == .trash || item.kind == .toolCommand,
+               PathWhitelist.overlaps(item.path, protectedPaths: repositoryRoots) {
+                continue
+            }
             let itemPath = item.path.standardizedFileURL.path
             let isCovered = kept.contains { existing in
                 let existingPath = existing.path.standardizedFileURL.path
@@ -370,9 +378,6 @@ struct CacheScanner {
         CacheRule(category: "包管理器", name: "npm（旧路径）", relativePath: ".npm-cache-user/_cacache", risk: .safe, note: "npm 会重新下载依赖"),
         CacheRule(category: "包管理器", name: "tnpm 下载缓存", relativePath: ".tnpm/_cacache", risk: .safe, note: "tnpm 会重新下载依赖"),
         CacheRule(category: "包管理器", name: "tnpm 日志", relativePath: ".tnpm/_logs", risk: .safe, note: "仅为 tnpm 日志"),
-        CacheRule(category: "包管理器", name: "Yarn", relativePath: "Library/Caches/Yarn", risk: .safe, note: "Yarn 会重新下载依赖"),
-        CacheRule(category: "包管理器", name: "Yarn（旧缓存）", relativePath: ".cache/yarn", risk: .safe, note: "Yarn 会重新下载依赖"),
-        CacheRule(category: "包管理器", name: "Yarn 离线缓存", relativePath: ".yarn/cache", risk: .review, note: "Yarn 会重新下载依赖；离线环境下请保留"),
         CacheRule(category: "包管理器", name: "pnpm 元数据缓存", relativePath: "Library/Caches/pnpm", risk: .safe, note: "pnpm 会重新获取 registry 元数据"),
         CacheRule(category: "包管理器", name: "Bun", relativePath: ".bun/install/cache", risk: .safe, note: "Bun 会重新下载依赖"),
         CacheRule(category: "包管理器", name: "Deno", relativePath: "Library/Caches/deno", risk: .safe, note: "Deno 会重新下载依赖和工具"),
@@ -423,7 +428,6 @@ struct CacheScanner {
         CacheRule(category: "JVM", name: "Gradle caches", relativePath: ".gradle/caches", risk: .safe, note: "Gradle 会重新下载依赖"),
         CacheRule(category: "JVM", name: "Gradle wrapper distributions", relativePath: ".gradle/wrapper/dists", risk: .safe, note: "Gradle wrapper 会重新下载发行版"),
         CacheRule(category: "JVM", name: "Gradle daemon", relativePath: ".gradle/daemon", risk: .review, note: "建议停止 Gradle 构建后清理"),
-        CacheRule(category: "JVM", name: "Maven repository", relativePath: ".m2/repository", risk: .review, note: "Maven 会重新下载依赖"),
         CacheRule(category: "JVM", name: "Maven wrapper distributions", relativePath: ".m2/wrapper/dists", risk: .safe, note: "Maven Wrapper 会重新下载发行版"),
         CacheRule(category: "JVM", name: "sbt boot 缓存", relativePath: ".sbt/boot", risk: .review, note: "Scala/sbt 工具组件会重新下载；请确认后清理"),
         CacheRule(category: "JVM", name: "sbt launcher 缓存", relativePath: ".sbt/launchers", risk: .review, note: "sbt 启动器会重新下载；请确认后清理"),
@@ -591,7 +595,13 @@ struct CacheScanner {
     static func knownCacheLocations(
         home: URL = FileManager.default.homeDirectoryForCurrentUser
     ) -> [KnownCacheLocation] {
-        fixedRuleTemplates.map {
+        let dependencyLocations = DependencyRepository.configured(
+            home: home, environment: ProcessInfo.processInfo.environment
+        ).map {
+            KnownCacheLocation(url: $0.root, category: $0.category, name: $0.name,
+                               risk: .manual, note: "从缓存扫描结果选择「按包清理」")
+        }
+        return dependencyLocations + fixedRuleTemplates.map {
             KnownCacheLocation(
                 url: home.appendingPathComponent($0.relativePath),
                 category: $0.category,
@@ -780,9 +790,6 @@ struct CacheScanner {
         if let value = environment["NPM_CONFIG_CACHE"], let path = expandedPath(value, home: home) {
             add("包管理器", "npm 自定义缓存", path, .safe, "来自 NPM_CONFIG_CACHE，npm 会重新下载依赖")
         }
-        if let value = environment["YARN_CACHE_FOLDER"], let path = expandedPath(value, home: home) {
-            add("包管理器", "Yarn 自定义缓存", path, .safe, "来自 YARN_CACHE_FOLDER，Yarn 会重新下载依赖")
-        }
         if let value = environment["PNPM_STORE_PATH"], let path = expandedPath(value, home: home) {
             add("包管理器", "pnpm 自定义 store", path, .review, "来自 PNPM_STORE_PATH；优先通过 pnpm store prune 清理，直接删除会影响离线开发")
         }
@@ -829,7 +836,6 @@ struct CacheScanner {
             add("JVM", "Gradle 自定义 wrapper", gradleHome.appendingPathComponent("wrapper/dists"), .safe, "来自 GRADLE_USER_HOME，Gradle wrapper 会重新下载")
         }
         if let value = environment["MAVEN_USER_HOME"], let mavenHome = expandedPath(value, home: home) {
-            add("JVM", "Maven 自定义 repository", mavenHome.appendingPathComponent("repository"), .review, "来自 MAVEN_USER_HOME，Maven 会重新下载依赖")
             add("JVM", "Maven 自定义 wrapper", mavenHome.appendingPathComponent("wrapper/dists"), .safe, "来自 MAVEN_USER_HOME，Maven Wrapper 会重新下载")
         }
         if let value = environment["NUGET_PACKAGES"], let path = expandedPath(value, home: home) {
@@ -1857,6 +1863,14 @@ struct CacheScanner {
                 continue
             }
 
+            if let repository = DependencyRepository.projectYarn(at: url) {
+                if let item = dependencyRepositoryItem(repository, collector: &collector, progress: progress) {
+                    items.append(item)
+                }
+                enumerator.skipDescendants()
+                continue
+            }
+
             guard let generatedRule = generatedRule(for: url) else { continue }
 
             // cargo 的 target/ 是几百 GB 的容器，整块只报一条既看不出哪里最占空间，
@@ -2283,9 +2297,6 @@ struct CacheScanner {
         if url.lastPathComponent == "Build" && url.deletingLastPathComponent().lastPathComponent == "Carthage" {
             return GeneratedRule(category: "Apple 项目", risk: .review, note: "Carthage 构建产物，会重新下载或构建")
         }
-        if url.lastPathComponent == "cache" && url.deletingLastPathComponent().lastPathComponent == ".yarn" {
-            return GeneratedRule(category: "Node.js 项目", risk: .review, note: "Yarn 离线缓存，会重新下载依赖")
-        }
         if url.lastPathComponent.hasPrefix("cmake-build-") {
             return GeneratedRule(category: "项目生成物", risk: .review, note: "CMake 构建产物，可按需重新生成")
         }
@@ -2642,6 +2653,26 @@ struct CacheScanner {
         names.contains { fileManager.fileExists(atPath: directory.appendingPathComponent($0).path) }
     }
 
+    private static func dependencyRepositoryItem(
+        _ repository: DependencyRepository,
+        collector: inout ScanCollector,
+        progress: @escaping (ScanProgress) -> Void
+    ) -> CacheItem? {
+        guard DependencyFile.isDirectory(repository.root), DependencyFile.hasUnredirectedPath(repository.root)
+        else { return nil }
+        return makeItem(
+            category: repository.category,
+            name: repository.name,
+            path: repository.root,
+            risk: .manual,
+            note: "查看各版本的占用与保护状态",
+            collector: &collector,
+            progress: progress,
+            statusTitle: "按包清理",
+            dependencyRepository: repository
+        )
+    }
+
     private static func makeItem(
         category: String,
         name: String,
@@ -2656,7 +2687,8 @@ struct CacheScanner {
         identifier: String? = nil,
         toolAction: ToolCleanupAction? = nil,
         statusTitle: String? = nil,
-        measurement: StorageMeasurement? = nil
+        measurement: StorageMeasurement? = nil,
+        dependencyRepository: DependencyRepository? = nil
     ) -> CacheItem? {
         let standardized = path.standardizedFileURL
         guard fileManager.fileExists(atPath: standardized.path) else { return nil }
@@ -2682,7 +2714,7 @@ struct CacheScanner {
 
         // cargo target 拆分时会用一次 du 批量测量所有子目录，避免硬链接被重复计算。
         let measured = measurement ?? StorageMeasurementService.measure(standardized)
-        guard measured.allocatedBytes >= minimumItemSize else { return nil }
+        guard measured.allocatedBytes >= minimumItemSize || dependencyRepository != nil else { return nil }
         return CacheItem(
             category: category,
             name: name,
@@ -2696,7 +2728,8 @@ struct CacheScanner {
             toolAction: toolAction,
             note: note,
             statusTitle: statusTitle,
-            isSelected: isSelected ?? defaultSelection(for: standardized, risk: risk, kind: kind)
+            isSelected: isSelected ?? defaultSelection(for: standardized, risk: risk, kind: kind),
+            dependencyRepository: dependencyRepository
         )
     }
 
@@ -3043,6 +3076,7 @@ final class DevSweepStore: ObservableObject {
     private static let projectRootsKey = "DevSweep.projectRoots"
     private static let selectionStatesKey = "DevSweep.selectionStates"
     private static let whitelistedPathsKey = "DevSweep.whitelistedPaths"
+    private static let dependencyProtectionRulesKey = "DevSweep.dependencyProtectionRules"
     private static let quickCleanEntriesKey = "DevSweep.quickCleanEntries"
     private static let quickCleanSortKey = "DevSweep.quickCleanSort"
 
@@ -3064,6 +3098,7 @@ final class DevSweepStore: ObservableObject {
     @Published private(set) var transientNotice: TransientNotice?
     @Published var projectRoots: [URL]
     @Published private(set) var whitelistedPaths: [URL]
+    @Published private(set) var dependencyProtectionRules: [DependencyProtectionRule]
     @Published var deepScan = true
     private var selectionStates: [String: Bool]
     /// Scanner 本次发现的完整候选条目；白名单等用户规则在 rebuildItems() 中套用。
@@ -3111,6 +3146,8 @@ final class DevSweepStore: ObservableObject {
         }
         let savedWhitelist = defaults.array(forKey: Self.whitelistedPathsKey) as? [String] ?? []
         whitelistedPaths = PathWhitelist.normalized(savedWhitelist.map { URL(fileURLWithPath: $0) })
+        let savedDependencyRules = defaults.array(forKey: Self.dependencyProtectionRulesKey) ?? []
+        dependencyProtectionRules = DependencyProtectionRule.load(savedDependencyRules)
         if let data = defaults.data(forKey: Self.selectionStatesKey),
            let savedStates = try? JSONDecoder().decode([String: Bool].self, from: data) {
             selectionStates = savedStates
@@ -3298,11 +3335,13 @@ final class DevSweepStore: ObservableObject {
         statusMessage = rawScanItems.isEmpty ? "正在扫描开发者缓存…" : "重新扫描中…"
         let roots = projectRoots
         let deepScan = self.deepScan
+        let home = self.home
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let report = CacheScanner.scan(
                 projectRoots: roots,
-                deepScan: deepScan
+                deepScan: deepScan,
+                home: home
             ) { progress in
                 DispatchQueue.main.async {
                     guard let self else { return }
@@ -3348,12 +3387,57 @@ final class DevSweepStore: ObservableObject {
         let mergedItems = (rawScanItems + discoveryCleanupItems).filter { item in
             seenPaths.insert(SelectionMemory.key(for: item.path)).inserted
         }
-        let visibleItems = mergedItems.filter { !PathWhitelist.contains($0.path, in: whitelist) }
+        let visibleItems = mergedItems.filter { item in
+            if item.dependencyRepository != nil {
+                return !PathWhitelist.contains(item.path, in: whitelist)
+            }
+            return !PathWhitelist.overlaps(item.path, protectedPaths: whitelist)
+        }
         items = SelectionMemory.restore(visibleItems, from: selectionStates)
     }
 
     func isQuickClean(_ item: CacheItem) -> Bool {
         QuickCleanRegistry.contains(item.path, in: quickCleanEntries)
+    }
+
+    private var scannedDependencyRepositories: [DependencyRepository] {
+        rawScanItems.compactMap(\.dependencyRepository)
+    }
+
+    func addDependencyProtectionRule(_ rule: DependencyProtectionRule) {
+        guard !isCleaning, !dependencyProtectionRules.contains(rule) else { return }
+        dependencyProtectionRules.append(rule)
+        dependencyProtectionRules.sort { $0.id < $1.id }
+        persistDependencyProtectionRules()
+    }
+
+    func removeDependencyProtectionRule(_ rule: DependencyProtectionRule) {
+        guard !isCleaning else { return }
+        dependencyProtectionRules.removeAll { $0 == rule }
+        persistDependencyProtectionRules()
+    }
+
+    func cleanDependencyCache(preview: DependencyCachePreview, ids: Set<String>, includeReview: Bool,
+                              completion: @escaping (DependencyCacheCleanupReport) -> Void) {
+        guard !isCleaning, !isScanning,
+              items.contains(where: { $0.dependencyRepository == preview.repository }) else { return }
+        let selected = preview.entries.filter { ids.contains($0.id) }
+        guard !selected.isEmpty else { return }
+        isCleaning = true
+        let rules = dependencyProtectionRules
+        let context = DeletionContext(whitelistedPaths: whitelistedPaths, projectRoots: projectRoots,
+                                      home: home, allowedPaths: selected.map(\.path),
+                                      dependencyRepositories: scannedDependencyRepositories)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let report = DependencyCacheCleaner.clean(preview: preview, entries: selected,
+                                                      includeReview: includeReview, rules: rules, context: context)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isCleaning = false
+                if !report.removed.isEmpty { self.cleanupGeneration += 1 }
+                completion(report)
+            }
+        }
     }
 
     func setSelected(_ id: UUID, selected: Bool) {
@@ -3566,7 +3650,8 @@ final class DevSweepStore: ObservableObject {
             whitelistedPaths: whitelistedPaths,
             projectRoots: projectRoots,
             home: home,
-            allowedPaths: [node.path]
+            allowedPaths: [node.path],
+            dependencyRepositories: scannedDependencyRepositories
         )
         do {
             try DeletionValidator.validate(item: item, context: validationContext)
@@ -3782,6 +3867,7 @@ final class DevSweepStore: ObservableObject {
         let whitelist = whitelistedPaths
         let roots = projectRoots
         let home = home
+        let repositories = scannedDependencyRepositories
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             // 执行前重新读取磁盘状态，生成刚刚捕获 FileIdentity 的执行条目；
@@ -3791,7 +3877,8 @@ final class DevSweepStore: ObservableObject {
                 whitelistedPaths: whitelist,
                 projectRoots: roots,
                 home: home,
-                allowedPaths: freshItems.map(\.path)
+                allowedPaths: freshItems.map(\.path),
+                dependencyRepositories: repositories
             )
             let report = CacheCleaner.clean(freshItems, context: context)
             DispatchQueue.main.async {
@@ -3854,7 +3941,8 @@ final class DevSweepStore: ObservableObject {
             whitelistedPaths: whitelistedPaths,
             projectRoots: projectRoots,
             home: home,
-            allowedPaths: items.map(\.path)
+            allowedPaths: items.map(\.path),
+            dependencyRepositories: scannedDependencyRepositories
         )
         statusMessage = includesNonRecoverable ? "正在执行选中项目的清理…" : "正在把选中项目移入废纸篓…"
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -3909,6 +3997,11 @@ final class DevSweepStore: ObservableObject {
 
     private func persistWhitelist() {
         defaults.set(whitelistedPaths.map(\.path), forKey: Self.whitelistedPathsKey)
+    }
+
+    private func persistDependencyProtectionRules() {
+        defaults.set(dependencyProtectionRules.map { ["manager": $0.manager.rawValue, "value": $0.value] },
+                     forKey: Self.dependencyProtectionRulesKey)
     }
 
     private func persistSelectionStates() {

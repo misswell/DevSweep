@@ -2,7 +2,7 @@
 
 DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcode、Rust/Tauri、Node、SwiftPM、Cargo、Gradle、Maven、Python、Go、Flutter、VS Code、Cursor 以及 OpenAI Codex、OpenCode、Claude Code、Goose 等 AI agent 开发环境。
 
-当前版本：0.1.68
+当前版本：0.1.69
 
 ## 当前功能
 
@@ -47,6 +47,7 @@ DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcod
 - 普通目录清理前会重新检查目标是否仍存在、是否发生 symlink/路径替换、是否落在危险根目录或当前白名单中；检查失败只记录该项失败并继续处理其他项目。
 - GitHub CLI、pnpm 和 uv 优先使用官方清理命令，并在执行前检查工具进程、白名单、缓存根目录和超时；命令型清理不会进入废纸篓，默认不勾选。
 - 每个项目都提供操作下拉菜单，可加入白名单/常用清理、在 Finder 中打开目录、复制完整路径或单独清理；加入白名单后条目立即从当前结果消失并清除勾选状态，不需要重新扫描；移出白名单会立即从最近一次扫描结果恢复；长路径可悬浮查看。
+- Yarn 和 Maven 缓存通过「按包清理」预览每个版本。在「白名单 → 依赖保护规则」添加 Yarn scope（`@company`）或包名（`@company/ui`），也可以添加 Maven groupId（`com.company`，含子组）或坐标（`com.company:sdk`）。规则覆盖今后下载的各版本。Maven 本地安装的制品及 Git 跟踪的依赖自动保留；来源待确认的版本默认不勾选。只处理确认选中的版本，执行时复核白名单、文件身份、Git 跟踪和包管理器活动状态。
 - 「常用清理」区分收藏与清理授权：node_modules、DerivedData 等可再生成目录、已识别的软件更新安装包及 Rust 编译输出可长期授权移入废纸篓；清理后同一路径重新生成仍可一键清理，每次执行前重新捕获 FileIdentity。模拟器设备可按 UDID 收藏，每次必须单独确认永久删除；不会进入「一键清理缓存」，删除前重新核验设备登记、目录身份、关机状态及构建/测试活动，状态不明时跳过。设备删除后收藏保留并标记失效，同名新设备不会继承授权。系统级模拟器和 Xcode 文档缓存仅收藏供查看及手动处理，不会自动提权或清理。白名单与常用清理互斥，加入白名单会自动退出常用清理。
 - 侧栏新增「概览」（全部项目 / 常用清理 / 白名单）与分类两级导航；白名单拥有独立页面，可逐条移出；常用清理页面无需完整扫描即可即时刷新快照。刷新默认按占用大小排序（可切回按加入时间，选择会记住），还没量到的行排在最后，逐批到达时只补大小不变的顺序，列表不会反复跳动；目录占用合并成少量 `du` 调用、单个文件直接读属性，可清理项先发布、模拟器登记在其后查询，15 秒内重复进入不重新遍历目录树；刷新只是核对磁盘占用，删除自己会重新核验路径与身份，因此刷新或普通扫描进行中清理按钮依旧可用。
 - 常用清理支持扫描识别的软件更新安装包（例如 `update.zip` 和 updater 目录中的版本化 ZIP），以及已确认 Cargo target/profile 中的编译输出文件：只授权所选文件的完整路径，不清理整个父目录；同一路径重新生成可继续清理；安装包升级导致版本号变化时，会自动匹配同一更新目录中唯一的新版本文件（父目录必须一致，多个候选时不自动选择，旧文件仍存在时保持精确路径）。普通文档、数据库和其他未识别文件不支持加入，旧目录授权不会自动扩展到文件。
@@ -75,6 +76,8 @@ git push origin v<version>
 ```
 
 `scripts/build_app.sh` 默认拒绝没有 Developer ID 的构建，避免误把临时签名包上传到 Release。发布前必须确认 `codesign` 显示 `Developer ID Application`、`spctl` 通过且 `xcrun stapler validate` 成功。在线更新要求 Release 资产使用 `DevSweep-<version>-macos.zip` 文件名，并保留 GitHub 自动生成的 SHA-256 digest。包含在线更新功能的首个版本之前，旧安装需要手动安装一次。
+
+依赖缓存回归可用 `swift test --filter DependencyCacheCleanupTests`。覆盖使用同一个前缀的相邻命名空间、未来版本、本地安装或缺少下载记录的 Maven 制品、预览后变更的下载状态、Git 跟踪变化、活动进程和包含白名单子项的整目录删除。测试只使用临时仓库；真实私有仓库和已安装版本升级需另行验证。
 
 正式 Release 使用 `.github/workflows/release.yml` 在 GitHub Actions 上完成，不依赖发布电脑的钥匙串。该 workflow 复用现有项目的仓库 Secrets：`APPLE_CERTIFICATE_P12`、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_ID`、`APPLE_APP_SPECIFIC_PASSWORD`、`APPLE_DEVELOPER_ID` 和 `APPLE_TEAM_ID`。推送符合版本格式的 tag 后，Actions 会自动测试、签名、公证、装订票据、校验并创建 Release。
 

@@ -60,6 +60,9 @@ struct DiscoveryClassifier {
                 location.note
             ], candidate)
         }
+        if DependencyRepository.coversProjectYarn(url) {
+            return (.knownCache, .verified, ["Yarn 项目缓存，按包清理"], nil)
+        }
         if isDirectory, let model = aiModelEvidence(for: url) {
             return (.aiModel, model.confidence, [model.evidence], nil)
         }

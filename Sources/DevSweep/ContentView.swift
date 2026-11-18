@@ -1501,6 +1501,7 @@ private struct WhitelistPageView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
+            DependencyProtectionRulesView()
             HStack(spacing: 14) {
                 Image(systemName: "checkmark.shield.fill")
                     .font(.title3)
@@ -1533,7 +1534,7 @@ private struct WhitelistPageView: View {
                     Image(systemName: "checkmark.shield")
                         .font(.system(size: 42))
                         .foregroundStyle(.secondary)
-                    Text("白名单是空的")
+                    Text("没有受保护的路径")
                         .font(.headline)
                     Text("在扫描结果的 ⋯ 菜单中选择「加入白名单」，被保护的目录会立即从清理结果中消失。")
                         .font(.subheadline)
@@ -1957,6 +1958,10 @@ private struct MiniItemRow: View {
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
+            if let repository = item.dependencyRepository {
+                DependencyCacheButton(repository: repository)
+                    .controlSize(.small)
+            }
         }
         .padding(.horizontal, 9)
         .padding(.vertical, 7)
@@ -2103,6 +2108,9 @@ private struct CacheItemRow: View {
                     .foregroundStyle(.tertiary)
             }
             .frame(minWidth: 92, alignment: .trailing)
+            if let repository = item.dependencyRepository {
+                DependencyCacheButton(repository: repository)
+            }
             Menu {
                 if isQuickClean {
                     Button {
@@ -2187,6 +2195,7 @@ private struct CacheItemRow: View {
     }
 
     private var itemKindTitle: String {
+        if item.dependencyRepository != nil { return "依赖缓存" }
         switch item.kind {
         case .simulatorDevice: return "模拟器设备"
         case .simulatorRuntime: return "模拟器 Runtime"

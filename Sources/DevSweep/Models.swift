@@ -187,6 +187,7 @@ struct CacheItem: Identifiable, Hashable {
     let kind: CleanupKind
     let identifier: String?
     let toolAction: ToolCleanupAction?
+    let dependencyRepository: DependencyRepository?
     let expectedFileIdentity: FileIdentity?
     let note: String
     /// 风险徽章文字覆盖：XCTest clone 等动态状态项需要显示
@@ -208,7 +209,8 @@ struct CacheItem: Identifiable, Hashable {
         expectedFileIdentity: FileIdentity? = nil,
         note: String = "",
         statusTitle: String? = nil,
-        isSelected: Bool? = nil
+        isSelected: Bool? = nil,
+        dependencyRepository: DependencyRepository? = nil
     ) {
         self.id = UUID()
         self.category = category
@@ -221,6 +223,7 @@ struct CacheItem: Identifiable, Hashable {
         self.kind = kind
         self.identifier = identifier
         self.toolAction = toolAction
+        self.dependencyRepository = dependencyRepository
         self.expectedFileIdentity = expectedFileIdentity ?? FileIdentity.capture(path)
         self.note = note
         self.statusTitle = statusTitle
@@ -286,6 +289,22 @@ struct SelectionMemory {
 }
 
 struct PathWhitelist {
+    static func protectionKey(_ path: URL) -> String {
+        path.standardizedFileURL.path.precomposedStringWithCanonicalMapping.lowercased()
+    }
+
+    static func overlaps(_ target: URL, protectedPaths: [URL]) -> Bool {
+        let targetKey = protectionKey(target)
+        return protectedPaths.contains { path in
+            let protectedKey = protectionKey(path)
+            return isInside(targetKey, of: protectedKey) || isInside(protectedKey, of: targetKey)
+        }
+    }
+
+    private static func isInside(_ path: String, of root: String) -> Bool {
+        path == root || path.hasPrefix(root == "/" ? root : root + "/")
+    }
+
     static func normalized(_ paths: [URL]) -> [URL] {
         let candidates = paths
             .map(\.standardizedFileURL)

@@ -43,6 +43,7 @@ struct DeletionContext {
     let allowedRoots: [URL]
     let allowedPaths: [URL]
     let protectedPaths: [URL]
+    let dependencyRepositories: [DependencyRepository]
 
     init(
         whitelistedPaths: [URL],
@@ -50,13 +51,19 @@ struct DeletionContext {
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         allowedRoots: [URL] = [],
         allowedPaths: [URL] = [],
-        protectedPaths: [URL]? = nil
+        protectedPaths: [URL]? = nil,
+        dependencyRepositories: [DependencyRepository] = []
     ) {
         self.home = home.standardizedFileURL
-        self.whitelistedPaths = PathWhitelist.normalized(whitelistedPaths)
+        self.whitelistedPaths = PathWhitelist.normalized(
+            whitelistedPaths + whitelistedPaths.map { $0.resolvingSymlinksInPath() }
+        )
         self.projectRoots = Self.normalized(projectRoots)
         self.allowedRoots = Self.normalized(allowedRoots)
         self.allowedPaths = Self.normalized(allowedPaths)
+        self.dependencyRepositories = Array(Set(dependencyRepositories + DependencyRepository.configured(
+            home: home, environment: ProcessInfo.processInfo.environment
+        )))
         // 保护路径必须逐个保留：`PathWhitelist.normalized` 会做父子归并，
         // 而这份名单里第一个就是 "/"，归并后只剩它自己，`~/Documents`、
         // `~/Library/Caches` 等全部丢失，精确匹配的保护形同虚设。
@@ -84,6 +91,7 @@ enum DeletionValidationError: LocalizedError, Equatable {
     case outsideAllowedScope
     case pathChanged
     case unsupportedTarget
+    case dependencyRepository
 
     var errorDescription: String? {
         switch self {
@@ -101,6 +109,8 @@ enum DeletionValidationError: LocalizedError, Equatable {
             return "目标在扫描后发生变化，已拒绝清理"
         case .unsupportedTarget:
             return "目标类型不支持自动清理"
+        case .dependencyRepository:
+            return "目标涉及 Yarn 或 Maven 仓库，请使用「按包清理」"
         }
     }
 }
@@ -153,6 +163,20 @@ struct DeletionValidator {
         item: CacheItem,
         context: DeletionContext
     ) throws {
+        try validate(item: item, context: context, repository: nil)
+    }
+
+    static func validateDependencyPackage(item: CacheItem, repository: DependencyRepository,
+                                          context: DeletionContext) throws {
+        guard item.kind == .trash, item.path.path != repository.root.path,
+              PathWhitelist.contains(item.path, in: [repository.root]) else {
+            throw DeletionValidationError.outsideAllowedScope
+        }
+        try validate(item: item, context: context, repository: repository)
+    }
+
+    private static func validate(item: CacheItem, context: DeletionContext,
+                                 repository: DependencyRepository?) throws {
         // `.trashContents` 校验的是「要被清空的目录」：它必须是真实目录、不在白名单/
         // 保护路径里、身份未变；真正删除的是它的子项（由 CacheCleaner 逐个移入废纸篓）。
         guard item.kind == .trash
@@ -221,10 +245,16 @@ struct DeletionValidator {
             throw DeletionValidationError.unsupportedTarget
         }
 
-        guard !PathWhitelist.contains(standardized, in: context.whitelistedPaths),
-              !PathWhitelist.contains(physical, in: context.whitelistedPaths)
+        guard !PathWhitelist.overlaps(standardized, protectedPaths: context.whitelistedPaths),
+              !PathWhitelist.overlaps(physical, protectedPaths: context.whitelistedPaths)
         else {
             throw DeletionValidationError.whitelisted
+        }
+
+        if item.kind != .simulatorDevice,
+           DependencyRepository.conflicts(with: standardized, repositories: context.dependencyRepositories,
+                                          permitting: repository) {
+            throw DeletionValidationError.dependencyRepository
         }
 
         guard isWithinAuthorizedScope(
@@ -252,8 +282,12 @@ struct DeletionValidator {
     /// 这里不放宽任何现有保护。
     static func validateQuickCleanRegistration(path: URL, allowRegularFile: Bool = false) throws {
         let standardized = path.standardizedFileURL
+        let home = fileManager.homeDirectoryForCurrentUser
+        guard !DependencyRepository.conflicts(with: standardized, repositories: DependencyRepository.configured(
+            home: home, environment: ProcessInfo.processInfo.environment
+        )) else { throw DeletionValidationError.dependencyRepository }
         guard !QuickCleanInspector.isReservedPath(
-            standardized, home: fileManager.homeDirectoryForCurrentUser
+            standardized, home: home
         ) else { throw DeletionValidationError.unsupportedTarget }
         guard fileManager.fileExists(atPath: standardized.path) else {
             throw DeletionValidationError.pathMissing
