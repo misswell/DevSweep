@@ -21,13 +21,24 @@ struct DependencyCacheEntry: Identifiable, Equatable {
     var id: String { path.path }
     var name: String { package ?? path.lastPathComponent }
 
-    func status(in repository: DependencyRepository, rules: [DependencyProtectionRule],
-                paths: [URL]) -> DependencyCacheStatus {
-        if PathWhitelist.overlaps(path, protectedPaths: paths)
-            || package.map({ name in rules.contains { $0.matches(name, manager: repository.manager) } }) == true {
+    func status(protection: DependencyProtectionIndex, paths: [URL]) -> DependencyCacheStatus {
+        if package.map(protection.contains) == true
+            || (!paths.isEmpty && PathWhitelist.overlaps(path, protectedPaths: paths)) {
             return .protected
         }
         return status
+    }
+
+    func permitsCleanup(status: DependencyCacheStatus, includeReview: Bool) -> Bool {
+        status == .cleanable || (status == .review && includeReview && canManuallySelect)
+    }
+
+    func permitsSelection(status: DependencyCacheStatus) -> Bool {
+        status != .protected && (package != nil || permitsCleanup(status: status, includeReview: true))
+    }
+
+    func protectionRule(manager: DependencyManager) -> DependencyProtectionRule? {
+        package.flatMap { DependencyProtectionRule(manager: manager, value: $0) }
     }
 }
 

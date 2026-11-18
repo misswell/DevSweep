@@ -12,6 +12,7 @@ enum DependencyCacheCleaner {
                       gitRunner: ProcessRunning = ProcessRunner.shared,
                       trash: TrashExecuting = FileManagerTrashExecutor()) -> DependencyCacheCleanupReport {
         let repository = preview.repository
+        let protection = DependencyProtectionIndex(manager: repository.manager, rules: rules)
         let pattern = repository.manager == .maven
             ? #"(org[.]codehaus[.]plexus[.]classworlds|org[.]apache[.]maven|(^|[ /])(mvn|mvnw|mvnd)([[:space:]]|$))"#
             : #"(^|[ /])(yarn([.]js|[.]cjs)?|yarn-[^ /]+[.]cjs|yarnpkg)([[:space:]]|$)|corepack.*[[:space:]]yarn"#
@@ -42,16 +43,16 @@ enum DependencyCacheCleaner {
                       stamp.identity.device == preview.rootIdentity.device else {
                     throw DependencyCacheError.changed
                 }
-                guard canSelect(entry, repository: repository, includeReview: includeReview,
-                                rules: rules, paths: context.whitelistedPaths) else {
+                guard canSelect(entry, protection: protection, includeReview: includeReview,
+                                paths: context.whitelistedPaths) else {
                     throw DependencyCacheError.protected
                 }
                 let current = DependencyCacheInspector.inspect(URL(fileURLWithPath: entry.path.path),
                                                                repository: repository, git: git, measure: false)
                 guard current.package == entry.package, current.version == entry.version, current.stamp == stamp,
                       current.status == entry.status, current.reason == entry.reason,
-                      canSelect(current, repository: repository, includeReview: includeReview,
-                                rules: rules, paths: context.whitelistedPaths) else {
+                      canSelect(current, protection: protection, includeReview: includeReview,
+                                paths: context.whitelistedPaths) else {
                     throw DependencyCacheError.changed
                 }
 
@@ -67,13 +68,9 @@ enum DependencyCacheCleaner {
         return report
     }
 
-    static func canSelect(_ entry: DependencyCacheEntry, repository: DependencyRepository, includeReview: Bool,
-                          rules: [DependencyProtectionRule], paths: [URL]) -> Bool {
-        switch entry.status(in: repository, rules: rules, paths: paths) {
-        case .cleanable: return true
-        case .review: return includeReview && entry.canManuallySelect
-        case .protected: return false
-        }
+    private static func canSelect(_ entry: DependencyCacheEntry, protection: DependencyProtectionIndex,
+                                  includeReview: Bool, paths: [URL]) -> Bool {
+        entry.permitsCleanup(status: entry.status(protection: protection, paths: paths), includeReview: includeReview)
     }
 
     private static func rejected(_ entries: [DependencyCacheEntry], because error: Error) -> DependencyCacheCleanupReport {

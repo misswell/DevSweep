@@ -3405,10 +3405,18 @@ final class DevSweepStore: ObservableObject {
     }
 
     func addDependencyProtectionRule(_ rule: DependencyProtectionRule) {
-        guard !isCleaning, !dependencyProtectionRules.contains(rule) else { return }
-        dependencyProtectionRules.append(rule)
-        dependencyProtectionRules.sort { $0.id < $1.id }
+        addDependencyProtectionRules([rule])
+    }
+
+    @discardableResult
+    func addDependencyProtectionRules(_ rules: Set<DependencyProtectionRule>) -> Int {
+        guard !isCleaning else { return 0 }
+        let existing = Set(dependencyProtectionRules)
+        let additions = rules.subtracting(existing)
+        guard !additions.isEmpty else { return 0 }
+        dependencyProtectionRules = existing.union(additions).sorted { $0.id < $1.id }
         persistDependencyProtectionRules()
+        return additions.count
     }
 
     func removeDependencyProtectionRule(_ rule: DependencyProtectionRule) {

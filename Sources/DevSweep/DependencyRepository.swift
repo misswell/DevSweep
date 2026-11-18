@@ -35,16 +35,8 @@ struct DependencyProtectionRule: Hashable, Identifiable {
 
     var id: String { manager.rawValue + ":" + value }
 
-    func matches(_ package: String, manager: DependencyManager) -> Bool {
-        guard self.manager == manager else { return false }
-        if value == package { return true }
-        switch manager {
-        case .yarn:
-            return value.hasPrefix("@") && !value.contains("/") && package.hasPrefix(value + "/")
-        case .maven:
-            guard !value.contains(":"), let group = package.split(separator: ":").first else { return false }
-            return group == value || group.hasPrefix(value + ".")
-        }
+    static func forPackages(_ packages: Set<String>, manager: DependencyManager) -> Set<Self> {
+        Set(packages.compactMap { Self(manager: manager, value: $0) })
     }
 
     static func load(_ entries: [Any]) -> [Self] {
@@ -55,6 +47,34 @@ struct DependencyProtectionRule: Hashable, Identifiable {
             return Self(manager: manager, value: value)
         }
         return Set(rules).sorted { $0.id < $1.id }
+    }
+}
+
+struct DependencyProtectionIndex {
+    private let manager: DependencyManager
+    private let values: Set<String>
+
+    init(manager: DependencyManager, rules: [DependencyProtectionRule]) {
+        self.manager = manager
+        values = Set(rules.lazy.filter { $0.manager == manager }.map(\.value))
+    }
+
+    func contains(_ package: String) -> Bool {
+        if values.contains(package) { return true }
+        guard !values.isEmpty else { return false }
+        switch manager {
+        case .yarn:
+            guard package.hasPrefix("@"), let slash = package.firstIndex(of: "/") else { return false }
+            return values.contains(String(package[..<slash]))
+        case .maven:
+            guard let colon = package.firstIndex(of: ":") else { return false }
+            var group = package[..<colon]
+            while true {
+                if values.contains(String(group)) { return true }
+                guard let dot = group.lastIndex(of: ".") else { return false }
+                group = group[..<dot]
+            }
+        }
     }
 }
 

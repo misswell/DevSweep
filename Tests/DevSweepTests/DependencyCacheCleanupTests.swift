@@ -5,15 +5,49 @@ import XCTest
 final class DependencyCacheCleanupTests: XCTestCase {
     func testRuleMatchingUsesPackageBoundariesAndCoversFutureVersions() throws {
         let yarn = try XCTUnwrap(DependencyProtectionRule(manager: .yarn, value: " @my-company "))
-        XCTAssertTrue(yarn.matches("@my-company/ui", manager: .yarn))
-        XCTAssertFalse(yarn.matches("@my-company-tools/ui", manager: .yarn))
         let maven = try XCTUnwrap(DependencyProtectionRule(manager: .maven, value: "com.mycompany"))
-        XCTAssertTrue(maven.matches("com.mycompany.tools:sdk", manager: .maven))
-        XCTAssertFalse(maven.matches("com.mycompany2:sdk", manager: .maven))
-        let exact = try XCTUnwrap(DependencyProtectionRule(manager: .maven, value: "com.mycompany:sdk"))
-        XCTAssertTrue(exact.matches("com.mycompany:sdk", manager: .maven))
-        XCTAssertFalse(exact.matches("com.mycompany:sdk-extra", manager: .maven))
+        let exact = try XCTUnwrap(DependencyProtectionRule(manager: .maven, value: "org.example:sdk"))
+        let rules = [yarn, maven, exact]
+        let yarnIndex = DependencyProtectionIndex(manager: .yarn, rules: rules)
+        XCTAssertTrue(yarnIndex.contains("@my-company/ui"))
+        XCTAssertFalse(yarnIndex.contains("@my-company-tools/ui"))
+        let mavenIndex = DependencyProtectionIndex(manager: .maven, rules: rules)
+        XCTAssertTrue(mavenIndex.contains("com.mycompany.tools:sdk"))
+        XCTAssertFalse(mavenIndex.contains("com.mycompany2:sdk"))
+        XCTAssertTrue(mavenIndex.contains("org.example:sdk"))
+        XCTAssertFalse(mavenIndex.contains("org.example:sdk-extra"))
+        XCTAssertFalse(mavenIndex.contains("@my-company"))
         XCTAssertNil(DependencyProtectionRule(manager: .yarn, value: "../foo"))
+    }
+
+    @MainActor
+    func testBatchWhitelistsRecognizedPackagesOnceAcrossVersions() throws {
+        let home = try temporaryDirectory()
+        let suite = "DevSweep.DependencyCacheBatchTests.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set([], forKey: "DevSweep.projectRoots")
+        let root = home.appendingPathComponent(".m2/repository")
+        _ = try mavenVersion("com/company/sdk/1.0", artifact: "sdk", origin: nil, at: root)
+        _ = try mavenVersion("com/company/sdk/2.0", artifact: "sdk", origin: nil, at: root)
+        _ = try mavenVersion("com/company/ui/1.0", artifact: "ui", origin: "corp", at: root)
+        let repository = DependencyRepository(manager: .maven, root: root)
+        let preview = try DependencyCacheInspector.preview(repository)
+        let selected = preview.entries.filter { $0.permitsSelection(status: $0.status) }
+        XCTAssertEqual(selected.count, 3)
+        XCTAssertEqual(selected.filter { $0.permitsCleanup(status: $0.status, includeReview: true) }.map(\.name),
+                       ["com.company:ui"])
+        XCTAssertTrue(selected.allSatisfy { !$0.permitsCleanup(status: $0.status, includeReview: false) })
+        let rules = DependencyProtectionRule.forPackages(Set(selected.compactMap(\.package)), manager: .maven)
+        let store = DevSweepStore(defaults: defaults, home: home)
+        XCTAssertEqual(store.addDependencyProtectionRules(rules), 2)
+        XCTAssertEqual(store.addDependencyProtectionRules(rules), 0)
+        let reloaded = DevSweepStore(defaults: defaults, home: home)
+        XCTAssertEqual(Set(reloaded.dependencyProtectionRules.map(\.value)), ["com.company:sdk", "com.company:ui"])
+        let protection = DependencyProtectionIndex(manager: .maven, rules: reloaded.dependencyProtectionRules)
+        XCTAssertTrue(preview.entries.allSatisfy {
+            $0.status(protection: protection, paths: []) == .protected
+        })
     }
 
     @MainActor

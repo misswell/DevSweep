@@ -16,18 +16,25 @@ struct DependencyCacheButton: View {
 }
 
 private struct DependencyCacheView: View {
+    private struct CleanupPlan {
+        let entries: [DependencyCacheEntry]
+        let reviewCount: Int
+        let retainedCount: Int
+    }
+
     @EnvironmentObject private var store: DevSweepStore
     @Environment(\.dismiss) private var dismiss
     @State private var preview: DependencyCachePreview?
     @State private var entriesByStatus: [DependencyCacheStatus: [DependencyCacheEntry]] = [:]
+    @State private var statusByID: [String: DependencyCacheStatus] = [:]
     @State private var status: DependencyCacheStatus = .cleanable
     @State private var query = ""
     @State private var selected: Set<String> = []
     @State private var showSelectedOnly = false
-    @State private var includeReview = false
     @State private var loading = true
     @State private var revision = 0
     @State private var showingConfirmation = false
+    @State private var pendingCleanup: CleanupPlan?
     @State private var loadError: String?
     @State private var outcome: String?
     @State private var failures: [String] = []
@@ -49,6 +56,14 @@ private struct DependencyCacheView: View {
     }
 
     var body: some View {
+        let visible = visibleEntries
+        let currentIDs = Set(visible.filter(isSelectable).map(\.id))
+        let allCurrentSelected = !currentIDs.isEmpty && currentIDs.isSubset(of: selected)
+        let selection = self.selection
+        let packages = Set(selection.compactMap(\.package))
+        let cleanupEntries = selection.filter {
+            $0.permitsCleanup(status: effectiveStatus($0), includeReview: true)
+        }
         VStack(alignment: .leading, spacing: 14) {
             HStack {
                 VStack(alignment: .leading, spacing: 5) {
@@ -89,77 +104,87 @@ private struct DependencyCacheView: View {
                 }
             }
 
-            HStack {
+            HStack(spacing: 10) {
                 TextField("搜索包名、版本或来源", text: $query)
                     .textFieldStyle(.roundedBorder)
                     .disabled(showSelectedOnly)
-                Button("全选可清理") {
-                    selected.formUnion(visibleEntries.map(\.id))
+                Button(allCurrentSelected ? "取消选择当前结果" : "全选当前结果") {
+                    if allCurrentSelected {
+                        selected.subtract(currentIDs)
+                    } else {
+                        selected.formUnion(currentIDs)
+                    }
                 }
-                .disabled(loading || store.isCleaning || showSelectedOnly || status != .cleanable || visibleEntries.isEmpty)
-                Button("取消全部勾选") { selected.removeAll() }
-                    .disabled(selected.isEmpty || store.isCleaning)
+                .disabled(loading || store.isCleaning || showSelectedOnly || currentIDs.isEmpty)
                 Toggle("只看已选", isOn: $showSelectedOnly)
+                    .disabled(selected.isEmpty)
             }
 
-            if status == .review && !showSelectedOnly {
-                HStack {
-                    Toggle("允许选择来源待确认的包", isOn: $includeReview)
-                    Spacer()
-                    Button("全选待确认") {
-                        selected.formUnion(visibleEntries.filter(\.canManuallySelect).map(\.id))
-                    }
-                    .disabled(!includeReview || loading || store.isCleaning
-                              || !visibleEntries.contains(where: \.canManuallySelect))
-                }
-                .disabled(store.isCleaning)
-                Text("先将需要保留的私有包加入白名单，再勾选确认可重新下载的版本。")
+            if status != .protected || showSelectedOnly {
+                Text("勾选包后可批量加入白名单。同一个包只添加一条规则，保护所有版本。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
-            List(visibleEntries) { entry in
+            List(visible) { entry in
                 entryRow(entry)
             }
             .overlay {
                 if loading {
                     ProgressView("正在检查缓存…")
-                } else if visibleEntries.isEmpty, loadError == nil {
+                } else if visible.isEmpty, loadError == nil {
                     Text("没有匹配的条目").foregroundStyle(.secondary)
                 }
             }
 
             HStack {
-                Text("已选 \(selection.count) 项 · \(totalSize(selection))")
+                Text("已选 \(selection.count) 个版本 · \(totalSize(selection))")
                     .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
+                if !selected.isEmpty {
+                    Button("清空") { selected.removeAll() }
+                        .buttonStyle(.borderless)
+                        .disabled(store.isCleaning)
+                }
                 Spacer()
                 Button("关闭") { dismiss() }
                     .keyboardShortcut(.cancelAction)
                     .disabled(store.isCleaning)
-                Button("移入废纸篓…", role: .destructive) { showingConfirmation = true }
-                    .disabled(loading || store.isCleaning || store.isScanning || selection.isEmpty)
+                Button(packages.isEmpty ? "加入白名单" : "加入白名单（\(packages.count) 个包）") {
+                    addSelectedToWhitelist(packages)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(loading || store.isCleaning || packages.isEmpty)
+                Button("移入废纸篓…", role: .destructive) {
+                    pendingCleanup = CleanupPlan(
+                        entries: cleanupEntries,
+                        reviewCount: cleanupEntries.filter { effectiveStatus($0) == .review }.count,
+                        retainedCount: selection.count - cleanupEntries.count
+                    )
+                    showingConfirmation = true
+                }
+                .disabled(loading || store.isCleaning || store.isScanning || cleanupEntries.isEmpty)
             }
         }
         .padding(20)
         .frame(minWidth: 660, idealWidth: 740, minHeight: 475, idealHeight: 560)
         .interactiveDismissDisabled(store.isCleaning)
-        .confirmationDialog("将选中的 \(selection.count) 个版本移入废纸篓？",
-                            isPresented: $showingConfirmation, titleVisibility: .visible) {
-            Button("移入废纸篓", role: .destructive, action: clean)
+        .confirmationDialog("确认移入废纸篓？", isPresented: $showingConfirmation,
+                            titleVisibility: .visible, presenting: pendingCleanup) { plan in
+            Button("移入废纸篓", role: .destructive) { clean(plan) }
             Button("取消", role: .cancel) {}
-        } message: {
-            Text("已选 \(totalSize(selection))。DevSweep 会再次检查白名单、Git 跟踪状态与文件身份。")
+        } message: { plan in
+            Text(cleanupMessage(plan))
         }
         .task(id: revision) { await refresh() }
         .onChange(of: store.dependencyProtectionRules) { _ in updateStatuses() }
         .onChange(of: store.whitelistedPaths) { _ in updateStatuses() }
-        .onChange(of: includeReview) { _ in updateStatuses() }
+        .onChange(of: selected.isEmpty) { if $0 { showSelectedOnly = false } }
     }
 
     @ViewBuilder
     private func entryRow(_ entry: DependencyCacheEntry) -> some View {
-        let effectiveStatus = showSelectedOnly ? entry.status : status
+        let effectiveStatus = effectiveStatus(entry)
         HStack(spacing: 10) {
             Toggle("选择 \(entry.name)", isOn: Binding(
                 get: { selected.contains(entry.id) },
@@ -169,8 +194,7 @@ private struct DependencyCacheView: View {
             ))
             .labelsHidden()
             .toggleStyle(.checkbox)
-            .disabled(store.isCleaning || loading || effectiveStatus == .protected
-                      || (effectiveStatus == .review && (!includeReview || !entry.canManuallySelect)))
+            .disabled(store.isCleaning || loading || !isSelectable(entry))
             VStack(alignment: .leading, spacing: 3) {
                 Text(entry.name).font(.body.weight(.medium))
                 Text([entry.version, effectiveStatus != entry.status ? "白名单保护" : entry.reason]
@@ -181,10 +205,10 @@ private struct DependencyCacheView: View {
             .help(entry.path.devSweepDisplayPath)
             Spacer()
             Text(entry.size.devSweepFileSize).monospacedDigit().foregroundStyle(.secondary)
-            if let name = entry.package, let rule = DependencyProtectionRule(manager: repository.manager, value: name) {
+            if let rule = entry.protectionRule(manager: repository.manager) {
                 Menu {
-                    Button("保护 \(name)") { store.addDependencyProtectionRule(rule) }
-                    if let groupRule = namespaceRule(for: name) {
+                    Button("保护 \(rule.value)") { store.addDependencyProtectionRule(rule) }
+                    if let groupRule = namespaceRule(for: rule.value) {
                         Button("保护 \(groupRule.value) 下的所有包") { store.addDependencyProtectionRule(groupRule) }
                     }
                 } label: {
@@ -205,18 +229,33 @@ private struct DependencyCacheView: View {
     }
 
     private func totalSize(_ entries: [DependencyCacheEntry]) -> String {
-        entries.reduce(Int64(0)) { $0 + $1.size }.devSweepFileSize
+        let size = entries.reduce(Int64(0)) { $0 + $1.size }
+        return size == 0 ? "0 KB" : size.devSweepFileSize
+    }
+
+    private func effectiveStatus(_ entry: DependencyCacheEntry) -> DependencyCacheStatus {
+        statusByID[entry.id] ?? entry.status
+    }
+
+    private func isSelectable(_ entry: DependencyCacheEntry) -> Bool {
+        entry.permitsSelection(status: effectiveStatus(entry))
     }
 
     private func updateStatuses() {
-        let rules = store.dependencyProtectionRules
+        let protection = DependencyProtectionIndex(manager: repository.manager, rules: store.dependencyProtectionRules)
         let paths = store.whitelistedPaths
         let entries = preview?.entries ?? []
-        entriesByStatus = Dictionary(grouping: entries) { $0.status(in: repository, rules: rules, paths: paths) }
-        let eligible = entriesByStatus[.cleanable, default: []] +
-            (includeReview ? entriesByStatus[.review, default: []].filter(\.canManuallySelect) : [])
-        selected.formIntersection(Set(eligible.map(\.id)))
-        if selected.isEmpty { showSelectedOnly = false }
+        let statuses = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0.status(protection: protection, paths: paths)) })
+        statusByID = statuses
+        entriesByStatus = Dictionary(grouping: entries) { statuses[$0.id] ?? $0.status }
+        selected = selected.filter { statuses[$0] != nil && statuses[$0] != .protected }
+    }
+
+    private func addSelectedToWhitelist(_ packages: Set<String>) {
+        let count = store.addDependencyProtectionRules(.forPackages(packages, manager: repository.manager))
+        guard count > 0 else { return }
+        outcome = "已将 \(count) 个包加入白名单"
+        failures = []
     }
 
     private func refresh() async {
@@ -250,9 +289,20 @@ private struct DependencyCacheView: View {
         loading = false
     }
 
-    private func clean() {
+    private func cleanupMessage(_ plan: CleanupPlan) -> String {
+        var message = "将移入废纸篓 \(plan.entries.count) 个版本，共 \(totalSize(plan.entries))。"
+        if plan.reviewCount > 0 {
+            message += "其中 \(plan.reviewCount) 个版本的来源待确认。请确认仍可重新下载。"
+        }
+        if plan.retainedCount > 0 {
+            message += "另外 \(plan.retainedCount) 个所选版本会保留。"
+        }
+        return message
+    }
+
+    private func clean(_ plan: CleanupPlan) {
         guard let preview else { return }
-        store.cleanDependencyCache(preview: preview, ids: selected, includeReview: includeReview) { report in
+        store.cleanDependencyCache(preview: preview, ids: Set(plan.entries.map(\.id)), includeReview: plan.reviewCount > 0) { report in
             outcome = "已移入废纸篓 \(report.removed.count) 项 · \(totalSize(report.removed))"
             failures = report.failures.map { "\($0.0.name) \($0.0.version ?? "") · \($0.1)" }
             revision += 1
