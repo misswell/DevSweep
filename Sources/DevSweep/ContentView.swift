@@ -506,12 +506,19 @@ struct ContentView: View {
                             .pickerStyle(.inline)
                         } label: {
                             Image(systemName: "arrow.up.arrow.down")
-                                .font(.caption)
+                                .font(.system(size: 10, weight: .semibold))
+                                .imageScale(.small)
+                                .symbolRenderingMode(.monochrome)
+                                .foregroundStyle(.secondary)
+                                .frame(width: 18, height: 16)
+                                .contentShape(Rectangle())
                         }
                         .menuStyle(.borderlessButton)
                         .menuIndicator(.hidden)
+                        .controlSize(.mini)
                         .fixedSize()
                         .help("切换分类排序：按可清理容量或默认顺序")
+                        .accessibilityLabel("分类排序")
                     }
                 }
             }
