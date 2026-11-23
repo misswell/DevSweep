@@ -970,9 +970,11 @@ enum XcodeLaunchPreflight {
 
     static func preflight(
         activity: XcodeActivityLike,
-        targets: [CacheItem]
+        targets: [CacheItem],
+        extraCategories: Set<XcodeStorageCategory> = []
     ) -> PreflightVerdict {
         let categories = Set(targets.map { XcodeStorageClassifier.category(for: $0) })
+            .union(extraCategories)
         // 目标为空时也要给出一致的结论（不禁用按钮）。
         let hasBuildSensitive = !categories.isDisjoint(with: buildSensitiveCategories)
         let hasTargets = !targets.isEmpty

@@ -556,6 +556,21 @@ enum QuickCleanSort: String, CaseIterable, Codable, Identifiable {
     }
 }
 
+/// 侧栏分类的排序方式。默认按可清理容量，把真正能腾出空间的分类排在前面。
+enum CategorySortOrder: String, CaseIterable, Identifiable {
+    case cleanable
+    case standard
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .cleanable: return "按可清理容量"
+        case .standard: return "默认顺序"
+        }
+    }
+}
+
 /// 一行常用清理：长期授权条目加上它当前的磁盘状态；状态为空表示还没量过。
 struct QuickCleanRow: Identifiable, Equatable {
     let entry: QuickCleanEntry

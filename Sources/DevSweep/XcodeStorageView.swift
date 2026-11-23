@@ -709,6 +709,12 @@ struct XcodeSnapshotKey: Equatable {
 }
 
 struct XcodeStorageView: View {
+    private struct DirectCleanup {
+        let title: String
+        let plan: XcodeCleanupPlan
+        let verdict: PreflightVerdict
+    }
+
     @ObservedObject private var store: DevSweepStore
     @ObservedObject private var runtimeSource: XcodeRuntimeSource
     private let onCleanItems: ([CacheItem]) -> Void
@@ -719,6 +725,7 @@ struct XcodeStorageView: View {
     @State private var disk: XcodeDiskSnapshot?
     @State private var pendingVerdict: PreflightVerdict?
     @State private var showingPreflight = false
+    @State private var directCleanup: DirectCleanup?
     @State private var lastCheckedAt: Date?
     @AppStorage(XcodeCleanSchedule.storageKey) private var scheduleRaw = XcodeCleanSchedule.off.rawValue
 
@@ -799,6 +806,23 @@ struct XcodeStorageView: View {
         } message: {
             Text(verbatim: confirmMessageText)
         }
+        .confirmationDialog(
+            directCleanup?.title ?? "确认清理？",
+            isPresented: Binding(
+                get: { directCleanup != nil },
+                set: { if !$0 { directCleanup = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: directCleanup
+        ) { request in
+            Button("继续清理", role: .destructive) {
+                execute(request.plan)
+                directCleanup = nil
+            }
+            Button("取消", role: .cancel) { directCleanup = nil }
+        } message: { request in
+            Text(verbatim: directMessage(request))
+        }
     }
 
     /// 先拼成局部字符串再交给 Text：直接内联会让 SwiftUI 的类型检查超时。
@@ -876,6 +900,18 @@ struct XcodeStorageView: View {
         guard !isBusy else { return false }
         if category == .runtimes {
             return selectableRuntimeCount(selected: false) > 0
+        }
+        return !row.isEmpty
+    }
+
+    /// 分类行「清理这一项」是否可用：Runtime 只对可实际删除的版本开放。
+    private func canCleanCategory(
+        _ category: XcodeStorageCategory,
+        row: XcodeStorageRow
+    ) -> Bool {
+        guard !isBusy else { return false }
+        if category == .runtimes {
+            return !runtimeSource.removableIdentifiers.isEmpty
         }
         return !row.isEmpty
     }
@@ -1126,6 +1162,7 @@ struct XcodeStorageView: View {
                             runtimeSource: runtimeSource,
                             isBusy: isBusy,
                             isToggleEnabled: isCategoryToggleEnabled(category, row: row),
+                            canCleanCategory: canCleanCategory(category, row: row),
                             onToggleCategory: { enabled in
                                 // 打开 = 该分类整组参与清理；关闭 = 整组退出，并撤销逐项取消记录。
                                 selection.setCategory(category, enabled: enabled)
@@ -1135,6 +1172,9 @@ struct XcodeStorageView: View {
                                 if category == .runtimes {
                                     runtimeSource.setAllRuntimesSelected(enabled)
                                 }
+                            },
+                            onCleanCategory: {
+                                requestCategoryCleanup(row: row, category: category)
                             },
                             onToggleExpanded: {
                                 if expanded.contains(row.id) {
@@ -1156,6 +1196,9 @@ struct XcodeStorageView: View {
                                     }
                                 )
                             },
+                            onCleanItem: { item in
+                                requestDirectItemCleanup(item)
+                            },
                             isRuntimeSelected: { identifier in
                                 // Runtime 的勾选同样要过分类开关：开关关掉后即使
                                 // identifier 还在记忆里，也不该显示成已勾。
@@ -1164,6 +1207,9 @@ struct XcodeStorageView: View {
                             },
                             onToggleRuntime: { identifier, selected in
                                 setRuntimeSelected(identifier, selected: selected)
+                            },
+                            onDeleteRuntime: { runtime in
+                                requestRuntimeCleanup(runtime)
                             }
                         )
                     }
@@ -1300,16 +1346,103 @@ struct XcodeStorageView: View {
         }
     }
 
+    /// 分类行 / 子项行的「清理这一项」：不依赖分类开关或勾选状态，
+    /// 但始终先展示确认框，避免单击即删除。
+    private func requestDirectCleanup(
+        title: String,
+        plan: XcodeCleanupPlan,
+        extraCategories: Set<XcodeStorageCategory> = []
+    ) {
+        guard !plan.isEmpty else { return }
+        let verdict = XcodeLaunchPreflight.preflight(
+            activity: runtimeSource.activityLike,
+            targets: plan.items,
+            extraCategories: extraCategories
+        )
+        guard !verdict.isBlocked else {
+            pendingVerdict = verdict
+            showingPreflight = true
+            return
+        }
+        directCleanup = DirectCleanup(title: title, plan: plan, verdict: verdict)
+    }
+
+    private func requestCategoryCleanup(row: XcodeStorageRow, category: XcodeStorageCategory) {
+        if category == .runtimes {
+            let identifiers = runtimeSource.removableIdentifiers
+            guard !identifiers.isEmpty else { return }
+            let bytes = identifiers.reduce(Int64(0)) { total, identifier in
+                total + max(runtimeSource.runtimes.first { $0.identifier == identifier }?.sizeBytes ?? 0, 0)
+            }
+            requestDirectCleanup(
+                title: "确认清理「\(row.title)」？",
+                plan: XcodeCleanupPlan(
+                    items: [], runtimeIdentifiers: identifiers, runtimeBytes: bytes
+                ),
+                extraCategories: [.runtimes]
+            )
+            return
+        }
+        let targets = items(for: row)
+        guard !targets.isEmpty else { return }
+        requestDirectCleanup(
+            title: "确认清理「\(row.title)」？",
+            plan: XcodeCleanupPlan(items: targets, runtimeIdentifiers: [], runtimeBytes: 0),
+            extraCategories: [category]
+        )
+    }
+
+    private func requestDirectItemCleanup(_ item: CacheItem) {
+        requestDirectCleanup(
+            title: "确认清理「\(item.name)」？",
+            plan: XcodeCleanupPlan(items: [item], runtimeIdentifiers: [], runtimeBytes: 0)
+        )
+    }
+
+    private func requestRuntimeCleanup(_ runtime: SimulatorRuntimeInfo) {
+        guard runtimeSource.removableIdentifiers.contains(runtime.identifier) else { return }
+        requestDirectCleanup(
+            title: "确认删除「\(runtime.displayName)」？",
+            plan: XcodeCleanupPlan(
+                items: [],
+                runtimeIdentifiers: [runtime.identifier],
+                runtimeBytes: max(runtime.sizeBytes ?? 0, 0)
+            ),
+            extraCategories: [.runtimes]
+        )
+    }
+
     private func performCleanup(verdict: PreflightVerdict) {
         guard verdict.canProceed else { return }
-        let current = plan
-        guard !current.isEmpty else { return }
-        if !current.items.isEmpty {
-            onCleanItems(current.items)
+        execute(plan)
+    }
+
+    private func execute(_ plan: XcodeCleanupPlan) {
+        guard !plan.isEmpty else { return }
+        if !plan.items.isEmpty {
+            onCleanItems(plan.items)
         }
-        if !current.runtimeIdentifiers.isEmpty {
-            onDeleteRuntimes(current.runtimeIdentifiers)
+        if !plan.runtimeIdentifiers.isEmpty {
+            onDeleteRuntimes(plan.runtimeIdentifiers)
         }
+    }
+
+    private func directMessage(_ request: DirectCleanup) -> String {
+        var lines = [request.verdict.text]
+        if !request.plan.items.isEmpty {
+            let size = request.plan.items.reduce(Int64(0)) { $0 + max(0, $1.size) }
+            lines.append("将清理 \(request.plan.items.count) 项，合计 \(size.devSweepFileSize)。")
+            if request.plan.items.contains(where: { $0.kind.isNonRecoverable }) {
+                lines.append("包含不可从废纸篓恢复的项目。")
+            } else {
+                lines.append("普通目录会移入废纸篓，可恢复。")
+            }
+        }
+        if !request.plan.runtimeIdentifiers.isEmpty {
+            lines.append("将删除 \(request.plan.runtimeIdentifiers.count) 个模拟器 Runtime，"
+                + "合计 \(request.plan.runtimeBytes.devSweepFileSize)，删除后需重新下载，不能从废纸篓恢复。")
+        }
+        return lines.joined(separator: "\n\n")
     }
 }
 
@@ -1326,12 +1459,17 @@ private struct XcodeStorageCategoryRow: View {
     let isBusy: Bool
     /// 开关能否点：空分类、没有可勾选 Runtime、正在忙时为 false。
     let isToggleEnabled: Bool
+    /// 分类行「清理这一项」是否可用：Runtime 只对可实际删除的版本开放。
+    let canCleanCategory: Bool
     let onToggleCategory: (Bool) -> Void
+    let onCleanCategory: () -> Void
     let onToggleExpanded: () -> Void
     let isItemSelected: (String) -> Bool
     let onToggleItem: (String, Bool) -> Void
+    let onCleanItem: (CacheItem) -> Void
     let isRuntimeSelected: (String) -> Bool
     let onToggleRuntime: (String, Bool) -> Void
+    let onDeleteRuntime: (SimulatorRuntimeInfo) -> Void
 
     private var isRuntimeRow: Bool { category == .runtimes }
 
@@ -1402,6 +1540,21 @@ private struct XcodeStorageCategoryRow: View {
                     .foregroundStyle(row.isEmpty ? Color.secondary : Color.primary)
                     .frame(minWidth: 84, alignment: .trailing)
 
+                Menu {
+                    Button(role: .destructive, action: onCleanCategory) {
+                        Label("清理这一项", systemImage: "trash")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .disabled(!canCleanCategory || isBusy)
+                .help(canCleanCategory
+                    ? "直接清理「\(row.title)」中的全部条目（会再次确认）"
+                    : (isBusy ? "正在扫描或清理，稍后再试" : emptyHint))
+                .accessibilityLabel("清理 \(row.title)")
+
                 Button(action: onToggleExpanded) {
                     Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                         .font(.caption.weight(.semibold))
@@ -1447,7 +1600,8 @@ private struct XcodeStorageCategoryRow: View {
                                     get: { isRuntimeSelected(runtime.identifier) },
                                     set: { onToggleRuntime(runtime.identifier, $0) }
                                 ),
-                                isBusy: isBusy
+                                isBusy: isBusy,
+                                onDelete: { onDeleteRuntime(runtime) }
                             )
                         }
                     }
@@ -1463,7 +1617,8 @@ private struct XcodeStorageCategoryRow: View {
                             get: { isItemSelected(SelectionMemory.key(for: item.path)) },
                             set: { onToggleItem(SelectionMemory.key(for: item.path), $0) }
                         ),
-                        isBusy: isBusy
+                        isBusy: isBusy,
+                        onClean: { onCleanItem(item) }
                     )
                 }
             }
@@ -1515,10 +1670,21 @@ private struct XcodeRuntimeRow: View {
     let retentionWarning: String?
     @Binding var isSelected: Bool
     let isBusy: Bool
+    let onDelete: () -> Void
 
     private var sizeText: String {
         if let size = runtime.sizeBytes, size > 0 { return size.devSweepFileSize }
         return "体积未知"
+    }
+
+    private var canDelete: Bool {
+        blockReason == nil && retentionWarning == nil
+    }
+
+    private var deleteHelp: String {
+        if let blockReason { return blockReason }
+        if retentionWarning != nil { return "该平台最新版本会保留，无法直接删除" }
+        return "删除这个 Runtime（会再次确认，不能从废纸篓恢复）"
     }
 
     var body: some View {
@@ -1576,6 +1742,13 @@ private struct XcodeRuntimeRow: View {
                 .font(.callout.monospacedDigit().weight(.medium))
                 .foregroundStyle(runtime.sizeBytes == nil ? Color.secondary : Color.primary)
                 .frame(minWidth: 92, alignment: .trailing)
+            Button(role: .destructive, action: onDelete) {
+                Image(systemName: "trash")
+            }
+            .buttonStyle(.borderless)
+            .disabled(!canDelete || isBusy)
+            .help(deleteHelp)
+            .accessibilityLabel("删除 \(runtime.displayName)")
         }
         .padding(.vertical, 4)
     }
@@ -1585,6 +1758,7 @@ private struct XcodeStorageItemRow: View {
     let item: CacheItem
     @Binding var included: Bool
     let isBusy: Bool
+    let onClean: () -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -1624,6 +1798,13 @@ private struct XcodeStorageItemRow: View {
             Text(item.sizeText)
                 .font(.callout.monospacedDigit().weight(.medium))
                 .frame(minWidth: 92, alignment: .trailing)
+            Button(role: .destructive, action: onClean) {
+                Image(systemName: "trash")
+            }
+            .buttonStyle(.borderless)
+            .disabled(isBusy)
+            .help("直接清理这一项（会再次确认）")
+            .accessibilityLabel("清理 \(item.name)")
         }
         .padding(.vertical, 4)
     }

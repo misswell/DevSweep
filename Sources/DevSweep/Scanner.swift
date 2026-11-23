@@ -3195,6 +3195,21 @@ final class DevSweepStore: ObservableObject {
         return order.filter(present.contains) + present.subtracting(order).sorted()
     }
 
+    /// 按指定顺序排列当前存在的分类。可清理容量只统计非手动项；
+    /// 容量相同时保持上面的固定分类顺序，避免每次扫描后同容量分类来回跳。
+    func categories(orderedBy order: CategorySortOrder) -> [String] {
+        let base = categories
+        guard order == .cleanable else { return base }
+        let positions = Dictionary(uniqueKeysWithValues: base.enumerated().map { ($1, $0) })
+        let index = categoryIndex
+        return base.sorted { lhs, rhs in
+            let lhsBytes = index.cleanableBytesByCategory[lhs] ?? 0
+            let rhsBytes = index.cleanableBytesByCategory[rhs] ?? 0
+            if lhsBytes != rhsBytes { return lhsBytes > rhsBytes }
+            return (positions[lhs] ?? .max) < (positions[rhs] ?? .max)
+        }
+    }
+
     var totalSize: Int64 { categoryIndex.totalBytes }
 
     /// 分类汇总索引：侧栏每个分类都要问一次「多大、几项」，
@@ -3225,21 +3240,33 @@ final class DevSweepStore: ObservableObject {
         let totalBytes: Int64
         let bytesByCategory: [String: Int64]
         let countByCategory: [String: Int]
+        /// 「可清理」= 非手动处理项；手动项只能查看或按系统要求手动处理。
+        let cleanableBytesByCategory: [String: Int64]
+        let cleanableCountByCategory: [String: Int]
 
         init(items: [CacheItem]) {
             var bytes: [String: Int64] = [:]
             var counts: [String: Int] = [:]
+            var cleanableBytes: [String: Int64] = [:]
+            var cleanableCounts: [String: Int] = [:]
             var total: Int64 = 0
             bytes.reserveCapacity(16)
             counts.reserveCapacity(16)
+            cleanableBytes.reserveCapacity(16)
+            cleanableCounts.reserveCapacity(16)
             for item in items {
                 bytes[item.category, default: 0] += item.size
                 counts[item.category, default: 0] += 1
                 total += item.size
+                guard item.risk != .manual else { continue }
+                cleanableBytes[item.category, default: 0] += item.size
+                cleanableCounts[item.category, default: 0] += 1
             }
             self.totalBytes = total
             self.bytesByCategory = bytes
             self.countByCategory = counts
+            self.cleanableBytesByCategory = cleanableBytes
+            self.cleanableCountByCategory = cleanableCounts
         }
     }
 
@@ -3250,6 +3277,15 @@ final class DevSweepStore: ObservableObject {
 
     func categoryCount(_ category: String) -> Int {
         categoryIndex.countByCategory[category] ?? 0
+    }
+
+    /// 分类里可以被本应用清理的容量（不包含手动处理项）。
+    func categoryCleanableSize(_ category: String) -> Int64 {
+        categoryIndex.cleanableBytesByCategory[category] ?? 0
+    }
+
+    func categoryCleanableCount(_ category: String) -> Int {
+        categoryIndex.cleanableCountByCategory[category] ?? 0
     }
 
     /// 全 App 唯一的清理候选计算入口；过滤器和 Mini 模式都不再各自计算清理范围。
@@ -4045,8 +4081,20 @@ final class DevSweepStore: ObservableObject {
         }
     }
 
+    /// 批量清理入口：手动项永远不进入勾选清理。
     func cleanSelected(ids: Set<UUID>) {
-        let selected = items.filter { ids.contains($0.id) && $0.risk != .manual }
+        cleanItems(ids: ids, allowManual: false)
+    }
+
+    /// 显式逐项清理入口（Xcode 空间）：用户已经在展开列表里单独确认了某一项，
+    /// 因此允许 manual 条目进入执行；白名单、FileIdentity、路径和删除安全规则
+    /// 仍由 DeletionValidator 与 CacheCleaner 逐项复核。
+    func cleanExplicitItems(ids: Set<UUID>) {
+        cleanItems(ids: ids, allowManual: true)
+    }
+
+    private func cleanItems(ids: Set<UUID>, allowManual: Bool) {
+        let selected = items.filter { ids.contains($0.id) && (allowManual || $0.risk != .manual) }
         guard !selected.isEmpty, !isCleaning else { return }
         isCleaning = true
         lastError = nil

@@ -143,6 +143,7 @@ struct ContentView: View {
     @State private var onlyQuickClean = false
     @AppStorage("DevSweep.onlyLarge") private var onlyLarge = false
     @AppStorage("DevSweep.largeThresholdMB") private var largeThresholdMB = 1_024
+    @AppStorage("DevSweep.categorySortOrder") private var categorySortOrderRaw = CategorySortOrder.cleanable.rawValue
     @State private var showingConfirmation = false
     @State private var showingQuickCleanHint = false
     @State private var showingError = false
@@ -175,6 +176,14 @@ struct ContentView: View {
     private var largeThresholdLabel: String {
         Self.largeThresholdOptions.first { $0.megabytes == largeThresholdMB }?.label
             ?? "\(largeThresholdMB) MB"
+    }
+
+    private var categorySortOrder: CategorySortOrder {
+        CategorySortOrder(rawValue: categorySortOrderRaw) ?? .cleanable
+    }
+
+    private var sortedCategories: [String] {
+        store.categories(orderedBy: categorySortOrder)
     }
 
     private var showsCacheList: Bool {
@@ -477,15 +486,36 @@ struct ContentView: View {
                     .tag(SidebarDestination.storageDiscovery)
                 }
 
-                Section("分类") {
-                    ForEach(store.categories, id: \.self) { category in
+                Section {
+                    ForEach(sortedCategories, id: \.self) { category in
                         SidebarRow(
                             title: category,
                             subtitle: categorySubtitle(category),
                             icon: categoryIcon(category),
-                            size: store.categorySize(category)
+                            size: store.categoryCleanableSize(category)
                         )
                         .tag(SidebarDestination.category(category))
+                        .help("右侧为可清理容量，手动处理项不计入")
+                    }
+                } header: {
+                    HStack(spacing: 8) {
+                        Text("分类")
+                        Spacer(minLength: 0)
+                        Menu {
+                            Picker("分类排序", selection: $categorySortOrderRaw) {
+                                ForEach(CategorySortOrder.allCases) { order in
+                                    Text(order.title).tag(order.rawValue)
+                                }
+                            }
+                            .pickerStyle(.inline)
+                        } label: {
+                            Image(systemName: "arrow.up.arrow.down")
+                                .font(.caption)
+                        }
+                        .menuStyle(.borderlessButton)
+                        .menuIndicator(.hidden)
+                        .fixedSize()
+                        .help("切换分类排序：按可清理容量或默认顺序")
                     }
                 }
             }
@@ -567,7 +597,9 @@ struct ContentView: View {
                             store: store,
                             runtimeSource: xcodeRuntimeSource,
                             onCleanItems: { items in
-                                store.cleanSelected(ids: Set(items.map(\.id)))
+                                // Xcode 空间允许逐项选择 DeviceSupport/归档等 manual 条目；
+                                // 这条显式入口不做批量勾选的 risk 过滤，删除前仍逐项复核。
+                                store.cleanExplicitItems(ids: Set(items.map(\.id)))
                             },
                             onDeleteRuntimes: { identifiers in
                                 deleteSimulatorRuntimes(identifiers)
@@ -1140,7 +1172,10 @@ struct ContentView: View {
 
     private func categorySubtitle(_ category: String) -> String {
         // 走 store 的缓存索引：之前每个分类都全量 filter 一次，36 个分类就是 36 趟。
-        "\(store.categoryCount(category)) 项"
+        let count = store.categoryCount(category)
+        let cleanableCount = store.categoryCleanableCount(category)
+        guard cleanableCount != count else { return "\(count) 项" }
+        return "\(count) 项 · 可清理 \(cleanableCount) 项"
     }
 
     private func categoryIcon(_ category: String) -> String {

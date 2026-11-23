@@ -2,7 +2,7 @@
 
 DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcode、Rust/Tauri、Node、SwiftPM、Cargo、Gradle、Maven、Python、Go、Flutter、VS Code、Cursor 以及 OpenAI Codex、OpenCode、Claude Code、Goose 等 AI agent 开发环境。
 
-当前版本：0.1.71
+当前版本：0.1.72
 
 ## 当前功能
 
@@ -26,6 +26,7 @@ DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcod
 - 补充 npx、Ruby/Bundler、node-gyp、VS Code/Cursor 扩展安装包、前端工具链、云 CLI、Terraform/Helm、Cypress/Selenium 和多平台 Xcode DeviceSupport；系统级 CoreSimulator/Xcode 缓存只读展示为手动处理。
 - 补充 nvm、Volta、SonarQube、pnpm registry 元数据、SwiftPM XDG/旧缓存、Scala/sbt/Ivy/Coursier/Metals，以及 Instruments、SourceKitService 和 Xcode Previews 缓存；同时覆盖 Lingma、Trae CN、Windsurf、Zed、OpenCode Desktop、Nova 等开发工具的明确缓存叶子，并识别 NVM_DIR、VOLTA_HOME、SONAR_USER_HOME、COURSIER_CACHE 和 CocoaPods 自定义目录。
 - 新增「Xcode 空间」页：按 Xcode 自己的存储语义把十三类占用分成可重建 / 需确认 / 手动三档，每类带独立开关与逐项选择；开关、子项复选框与底部「已选」共用同一条判定（开关打开即整组勾选，取消最后一个子项时开关自动关闭，没有可勾选条目的分类开关置灰），不会再出现「开关是开、子项没勾」或「勾着却不计入已选」。可直接清理 DerivedData、各类 Xcode/模拟器/SwiftPM 缓存与日志，归档与 DeviceSupport 逐项勾选后移入废纸篓。模拟器 Runtime 经由 `xcrun simctl runtime delete` 删除，按平台保留最新版本并在行内提前说明，删除前重新核对清单、删除后轮询验证，失败逐条给出原因并可复制兜底命令；启动前检查 Xcode / 构建 / 测试进程，运行中只提示不阻断开。
+- Xcode 空间的每个分类行和展开后的每个缓存条目都提供「清理这一项」直接操作：分类行清理该分类全部条目，子项只清理当前条目，Runtime 只删除可实际删除的版本；所有直接操作先经过 Xcode / 构建 / 测试预检并再次确认，再走原有 FileIdentity、白名单和专用删除路径。DeviceSupport、归档等手动条目也能通过显式逐项操作清理，不会再出现勾选后被批量入口静默丢弃的情况。
 - 参考 PureMac 与 dusty 补齐扫描盲区：Safari / Brave / Arc 浏览器缓存，Slack / Discord / Signal / Telegram / Teams / Zoom / Spotify / Obsidian 的可重建缓存与更新安装包，Unity 导入缓存，以及 `~/Library/Mail Downloads` 邮件附件；Spotify 离线缓存与邮件附件标为「建议确认」，不默认勾选。Go 模块缓存仍由既有 `go/pkg/mod` 规则整体覆盖。
 - 新增「清空内容」清理语义：`~/Library/Caches`、`~/Library/Logs`、`~/.Trash`、`~/Downloads` 以清空子项的方式处理，目录本身保留，子项逐个移入废纸篓；一律默认不勾选，执行前重新核验目录身份与白名单，身份变化或目标不是目录时拒绝。
 - Time Machine 本地快照：扫描 `tmutil listlocalsnapshots`，逐条列出并可用 `tmutil deletelocalsnapshots` 删除；只处理 `com.apple.TimeMachine.*`，`com.apple.os.update-*` 更新回滚点永不进入候选；删除后重新列举确认真正消失（tmutil 可能返回 0 却没删），日期参数严格校验，永不默认勾选。
@@ -51,6 +52,7 @@ DevSweep 是一个原生 SwiftUI macOS 开发者缓存清理工具，面向 Xcod
 - 批量保护依赖时，搜索包名或下载来源，点击「全选当前结果」和「加入白名单」。同一包的多个版本合并成一条规则。「待确认」中已识别的包也能加入白名单，清理仍需单独确认。
 - 「常用清理」区分收藏与清理授权：node_modules、DerivedData 等可再生成目录、已识别的软件更新安装包及 Rust 编译输出可长期授权移入废纸篓；清理后同一路径重新生成仍可一键清理，每次执行前重新捕获 FileIdentity。模拟器设备可按 UDID 收藏，每次必须单独确认永久删除；不会进入「一键清理缓存」，删除前重新核验设备登记、目录身份、关机状态及构建/测试活动，状态不明时跳过。设备删除后收藏保留并标记失效，同名新设备不会继承授权。系统级模拟器和 Xcode 文档缓存仅收藏供查看及手动处理，不会自动提权或清理。白名单与常用清理互斥，加入白名单会自动退出常用清理。
 - 侧栏新增「概览」（全部项目 / 常用清理 / 白名单）与分类两级导航；白名单拥有独立页面，可逐条移出；常用清理页面无需完整扫描即可即时刷新快照。刷新默认按占用大小排序（可切回按加入时间，选择会记住），还没量到的行排在最后，逐批到达时只补大小不变的顺序，列表不会反复跳动；目录占用合并成少量 `du` 调用、单个文件直接读属性，可清理项先发布、模拟器登记在其后查询，15 秒内重复进入不重新遍历目录树；刷新只是核对磁盘占用，删除自己会重新核验路径与身份，因此刷新或普通扫描进行中清理按钮依旧可用。
+- 侧栏分类默认按「可清理容量」从大到小排列，分类标题右侧显示该分类排除手动处理项后的可清理大小，副标题同时给出总项数与可清理项数；通过分类标题右侧的排序菜单可以在「按可清理容量」和「默认顺序」之间切换，选择会记住。相同容量按固定分类顺序排列，避免扫描后同容量分类来回跳动。
 - 常用清理支持扫描识别的软件更新安装包（例如 `update.zip` 和 updater 目录中的版本化 ZIP），以及已确认 Cargo target/profile 中的编译输出文件：只授权所选文件的完整路径，不清理整个父目录；同一路径重新生成可继续清理；安装包升级导致版本号变化时，会自动匹配同一更新目录中唯一的新版本文件（父目录必须一致，多个候选时不自动选择，旧文件仍存在时保持精确路径）。普通文档、数据库和其他未识别文件不支持加入，旧目录授权不会自动扩展到文件。
 - 「全选当前显示」只作用于当前可见条目（列表头提供三态 checkbox）。侧栏分类决定清理范围：「全部项目」覆盖全部，分类页只覆盖该分类勾选的项目，概览卡、列表头计数、底部「已选 N 项 · 大小」与「清理 N 项」按钮、以及「加入常用清理 / 加入白名单」都跟着当前分类切换，避免在分类页一键清理到没看到的其它分类；切换分类不会取消其它分类的勾选，底部会提示「其它分类还有 M 项保持勾选」。列表过滤器（只看已选 / 常用清理 / 只看大于指定大小，阈值 100 MB～1 GB 下拉可选、默认 1 GB，勾选状态与阈值会记住）只决定显示内容，永远不改变清理范围。迷你模式没有侧栏，清理范围是所有分类里勾选的项目。
 - 重新扫描期间保留上一次结果并在顶部显示进度，勾选与清理操作暂时禁用，新报告完成后一次性替换，避免界面闪空。
