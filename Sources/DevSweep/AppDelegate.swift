@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import SwiftUI
 
 /// 主窗口由 SwiftUI `Window` 场景持有；关闭后场景仍在，但视图已不可直接访问。
 /// 菜单栏通过这个桥接对象调用 `openWindow(id:)` 重新打开窗口。
@@ -12,8 +13,39 @@ final class AppWindowRouter {
     private init() {}
 }
 
-extension Notification.Name {
-    static let devSweepShowSettings = Notification.Name("DevSweep.showSettings")
+/// 设置窗口由 AppKit 直接托管，不依赖 SwiftUI `Settings` 场景的私有 action。
+/// 之前菜单栏发送 `showSettingsWindow:` 在无 Dock / 只有菜单栏入口时会“成功”
+/// 却没有任何窗口出现，这里改成真正的 NSWindow，确保菜单栏、Cmd+, 都能打开。
+@MainActor
+final class SettingsWindowController: NSObject {
+    static let shared = SettingsWindowController()
+
+    private var window: NSWindow?
+
+    func show() {
+        NSApp.activate(ignoringOtherApps: true)
+        if let window {
+            window.makeKeyAndOrderFront(nil)
+            window.orderFrontRegardless()
+            return
+        }
+
+        let services = AppServices.shared
+        let root = SettingsView(onClose: { [weak self] in self?.window?.performClose(nil) })
+            .environmentObject(services.store)
+            .environmentObject(services.updater)
+            .environmentObject(services.scheduler)
+            .environmentObject(services.presentation)
+        let window = NSWindow(contentViewController: NSHostingController(rootView: root))
+        window.title = "设置"
+        window.styleMask = [.titled, .closable, .miniaturizable]
+        window.isReleasedWhenClosed = false
+        window.setContentSize(NSSize(width: 620, height: 720))
+        window.center()
+        self.window = window
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+    }
 }
 
 /// 菜单栏图标、应用生命周期和窗口重新打开。
@@ -166,28 +198,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func openSettings() {
-        NSApp.activate(ignoringOtherApps: true)
-        if NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) {
-            focusSettingsWindow()
-            return
-        }
-        if NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil) {
-            focusSettingsWindow()
-            return
-        }
-        // 旧系统或场景未注册标准 action 时，退回主窗口内的设置面板。
-        openMainWindow()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-            NotificationCenter.default.post(name: .devSweepShowSettings, object: nil)
-        }
-    }
-
-    private func focusSettingsWindow() {
-        DispatchQueue.main.async {
-            NSApp.activate(ignoringOtherApps: true)
-            NSApp.windows.first { $0.canBecomeMain && $0.title != "DevSweep" }?
-                .makeKeyAndOrderFront(nil)
-        }
+        SettingsWindowController.shared.show()
     }
 
     @objc private func quit() {

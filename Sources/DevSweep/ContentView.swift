@@ -1,5 +1,4 @@
 import AppKit
-import Combine
 import SwiftUI
 
 /// A single compatibility point for the macOS 26 glass redesign.
@@ -382,9 +381,6 @@ struct ContentView: View {
         .onAppear {
             // 窗口关闭后 SwiftUI 场景仍在；菜单栏通过这里重新打开主窗口。
             AppWindowRouter.shared.openMainWindow = { openWindow(id: "main") }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .devSweepShowSettings)) { _ in
-            showingSettings = true
         }
         .onChange(of: store.lastError) { value in
             showingError = value != nil
@@ -2416,6 +2412,8 @@ struct HelpView: View {
 }
 
 struct SettingsView: View {
+    /// 由 AppKit 设置窗口注入；sheet 里为 nil，继续用 SwiftUI 的 dismiss。
+    var onClose: (() -> Void)?
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var store: DevSweepStore
     @EnvironmentObject private var updater: DevSweepSoftwareUpdater
@@ -2431,7 +2429,9 @@ struct SettingsView: View {
                 Text("设置")
                     .font(.title2.weight(.bold))
                 Spacer()
-                Button("完成") { dismiss() }
+                Button("完成") {
+                    if let onClose { onClose() } else { dismiss() }
+                }
             }
             Divider()
             ScrollView {

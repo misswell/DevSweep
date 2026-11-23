@@ -15,13 +15,14 @@ struct DevSweepApp: App {
                 .environmentObject(AppServices.shared.presentation)
         }
         .windowResizability(.contentSize)
-
-        Settings {
-            SettingsView()
-                .environmentObject(store)
-                .environmentObject(updater)
-                .environmentObject(AppServices.shared.scheduler)
-                .environmentObject(AppServices.shared.presentation)
+        .commands {
+            // 设置窗口由 AppKit 托管；这里只负责替换系统“设置…”菜单和 Cmd+,。
+            CommandGroup(replacing: .appSettings) {
+                Button("设置…") {
+                    SettingsWindowController.shared.show()
+                }
+                .keyboardShortcut(",", modifiers: .command)
+            }
         }
     }
 }
