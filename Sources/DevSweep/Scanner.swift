@@ -3071,6 +3071,21 @@ final class QuickCleanRefreshContext: @unchecked Sendable {
     }
 }
 
+/// 定时任务一次执行的摘要；用于菜单栏和设置页展示，不参与界面逻辑。
+struct ScheduledMaintenanceSummary {
+    let scannedItemCount: Int
+    let quickCleanTargetCount: Int
+    let removedCount: Int
+    let removedBytes: Int64
+    let failureCount: Int
+}
+
+enum ScheduledMaintenanceOutcome {
+    /// 普通扫描或清理正在进行，本次让路，稍后重试。
+    case busy
+    case completed(ScheduledMaintenanceSummary)
+}
+
 @MainActor
 final class DevSweepStore: ObservableObject {
     private static let projectRootsKey = "DevSweep.projectRoots"
@@ -3325,8 +3340,14 @@ final class DevSweepStore: ObservableObject {
         rebuildQuickCleanRows()
     }
 
-    func scan() {
-        guard !isScanning, !isCleaning else { return }
+    func scan(
+        refreshQuickClean: Bool = true,
+        completion: (() -> Void)? = nil
+    ) {
+        guard !isScanning, !isCleaning else {
+            completion?()
+            return
+        }
         isScanning = true
         lastError = nil
         pathsCleanedDuringScan = []
@@ -3351,15 +3372,20 @@ final class DevSweepStore: ObservableObject {
             }
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.applyScanResult(report)
+                self.applyScanResult(report, refreshQuickClean: refreshQuickClean)
                 self.isScanning = false
                 self.statusMessage = "已扫描 \(report.items.count) 项，已自动选择安全项目，耗时 \(String(format: "%.1f", report.duration)) 秒"
+                completion?()
             }
         }
     }
 
     /// 安装一次新的扫描结果并按用户规则重建列表；也是测试注入原始结果的入口。
     func applyScanResult(_ report: ScanReport) {
+        applyScanResult(report, refreshQuickClean: true)
+    }
+
+    private func applyScanResult(_ report: ScanReport, refreshQuickClean: Bool) {
         let cleanedDuringScan = pathsCleanedDuringScan
         pathsCleanedDuringScan = []
         rawScanItems = report.items.filter {
@@ -3374,7 +3400,7 @@ final class DevSweepStore: ObservableObject {
             skippedPaths: report.skippedPaths,
             permissionFailures: report.permissionFailures
         )
-        if !quickCleanEntries.isEmpty {
+        if refreshQuickClean && !quickCleanEntries.isEmpty {
             refreshQuickCleanSnapshots(force: true)
         }
     }
@@ -3822,8 +3848,82 @@ final class DevSweepStore: ObservableObject {
         cleanQuickCleanEntries(cleanableQuickCleanSnapshots.map(\.entry))
     }
 
+    /// 菜单栏和定时任务使用：不要求先刷新快照，直接对全部自动授权条目执行。
+    /// 执行器仍会逐条重新捕获 FileIdentity，不存在的路径只会被跳过。
+    func cleanAllQuickCleanFromDisk() {
+        rebindVersionedQuickCleanEntries()
+        cleanQuickCleanEntries(quickCleanEntries.filter(\.isAutomatic))
+    }
+
+    /// 没有先打开常用清理页时，更新安装包可能已经换版本。这里做一次与刷新相同的
+    /// 同目录唯一新版本匹配，避免菜单栏/定时任务只认识旧路径而漏清理。
+    @discardableResult
+    private func rebindVersionedQuickCleanEntries() -> Int {
+        guard !quickCleanEntries.isEmpty else { return 0 }
+        let resolution = QuickCleanInspector.resolveVersionedEntries(
+            quickCleanEntries, whitelistedPaths: whitelistedPaths
+        )
+        let reboundCount = zip(quickCleanEntries, resolution.entries)
+            .filter { $0.0.path != $0.1.path }
+            .count
+        guard reboundCount > 0 else { return 0 }
+        replaceQuickCleanEntries(
+            QuickCleanRegistry.normalized(resolution.entries), persist: true
+        )
+        rebuildItems()
+        return reboundCount
+    }
+
     func cleanQuickClean(_ entries: [QuickCleanEntry]) {
         cleanQuickCleanEntries(entries)
+    }
+
+    /// 定时任务：先完整扫描，再清理常用清理中自动授权的条目。
+    /// 扫描结果里的快捷清理快照刷新会与删除同时遍历目录，因此这里跳过刷新，
+    /// 删除完成后的 applyQuickCleanCleanupResult 会统一刷新一次。
+    func runScheduledMaintenance(
+        cleanQuickClean: Bool,
+        completion: @escaping (ScheduledMaintenanceOutcome) -> Void
+    ) {
+        guard !isScanning, !isCleaning else {
+            completion(.busy)
+            return
+        }
+        scan(refreshQuickClean: !cleanQuickClean) { [weak self] in
+            guard let self else { return }
+            let scannedCount = self.lastReport?.items.count ?? 0
+            guard cleanQuickClean else {
+                completion(.completed(ScheduledMaintenanceSummary(
+                    scannedItemCount: scannedCount,
+                    quickCleanTargetCount: 0,
+                    removedCount: 0,
+                    removedBytes: 0,
+                    failureCount: 0
+                )))
+                return
+            }
+            self.rebindVersionedQuickCleanEntries()
+            let targets = self.quickCleanEntries.filter(\.isAutomatic)
+            guard !targets.isEmpty else {
+                completion(.completed(ScheduledMaintenanceSummary(
+                    scannedItemCount: scannedCount,
+                    quickCleanTargetCount: 0,
+                    removedCount: 0,
+                    removedBytes: 0,
+                    failureCount: 0
+                )))
+                return
+            }
+            self.cleanQuickCleanEntries(targets) { report in
+                completion(.completed(ScheduledMaintenanceSummary(
+                    scannedItemCount: scannedCount,
+                    quickCleanTargetCount: targets.count,
+                    removedCount: report.removed.count,
+                    removedBytes: report.removed.reduce(0) { $0 + $1.size },
+                    failureCount: report.failures.count
+                )))
+            }
+        }
     }
 
     /// Called only by the per-device confirmation dialog. Identity comes from
@@ -3865,10 +3965,16 @@ final class DevSweepStore: ObservableObject {
         }
     }
 
-    private func cleanQuickCleanEntries(_ entries: [QuickCleanEntry]) {
+    private func cleanQuickCleanEntries(
+        _ entries: [QuickCleanEntry],
+        completion: ((CleanupReport) -> Void)? = nil
+    ) {
         let targets = QuickCleanRegistry.normalized(entries.filter { $0.isAutomatic && quickCleanEntries.contains($0) })
         // 常用清理自带磁盘核验，不依赖普通扫描的结果，因此普通扫描进行中也可以执行。
-        guard !targets.isEmpty, !isCleaning else { return }
+        guard !targets.isEmpty, !isCleaning else {
+            completion?(CleanupReport(removed: [], failures: []))
+            return
+        }
         isCleaning = true
         lastError = nil
         statusMessage = "正在把常用项目移入废纸篓…"
@@ -3909,6 +4015,7 @@ final class DevSweepStore: ObservableObject {
                     self.lastError = "部分常用项目未能清理：\n\(details)"
                     self.statusMessage = "已处理 \(report.removed.count) 项，\(report.failures.count) 项失败"
                 }
+                completion?(report)
             }
         }
     }

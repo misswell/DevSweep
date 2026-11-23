@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 /// A single compatibility point for the macOS 26 glass redesign.
@@ -133,6 +134,7 @@ private struct LargeThresholdOption: Identifiable {
 struct ContentView: View {
     @EnvironmentObject private var store: DevSweepStore
     @EnvironmentObject private var updater: DevSweepSoftwareUpdater
+    @Environment(\.openWindow) private var openWindow
     @State private var destination: SidebarDestination = .all
     @StateObject private var backgroundProcesses = BackgroundProcessStore()
     @StateObject private var storageDiscovery = StorageDiscoveryStore()
@@ -367,6 +369,13 @@ struct ContentView: View {
             if case .idle = updater.state {
                 await updater.checkForUpdates()
             }
+        }
+        .onAppear {
+            // 窗口关闭后 SwiftUI 场景仍在；菜单栏通过这里重新打开主窗口。
+            AppWindowRouter.shared.openMainWindow = { openWindow(id: "main") }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .devSweepShowSettings)) { _ in
+            showingSettings = true
         }
         .onChange(of: store.lastError) { value in
             showingError = value != nil
@@ -2373,7 +2382,10 @@ struct HelpView: View {
 
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var store: DevSweepStore
     @EnvironmentObject private var updater: DevSweepSoftwareUpdater
+    @EnvironmentObject private var scheduler: AutoCleanupScheduler
+    @EnvironmentObject private var presentation: AppPresentationController
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -2387,11 +2399,126 @@ struct SettingsView: View {
                 Button("完成") { dismiss() }
             }
             Divider()
-            SoftwareUpdateView(updater: updater)
-            Spacer()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    displayCard
+                    autoCleanupCard
+                    SoftwareUpdateView(updater: updater)
+                }
+            }
         }
         .padding(24)
-        .frame(width: 620, height: 500)
+        .frame(width: 620, height: 720)
+        .onAppear { scheduler.start() }
+    }
+
+    private var displayCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("显示")
+                .font(.headline)
+            Toggle("在 Dock 中显示图标", isOn: Binding(
+                get: { presentation.showDockIcon },
+                set: { presentation.setShowDockIcon($0) }
+            ))
+            .toggleStyle(.switch)
+            Toggle("在菜单栏显示图标", isOn: Binding(
+                get: { presentation.showMenuBarIcon },
+                set: { presentation.setShowMenuBarIcon($0) }
+            ))
+            .toggleStyle(.switch)
+            .disabled(!presentation.showDockIcon)
+            Text("隐藏 Dock 图标后，DevSweep 会继续在菜单栏运行，可从菜单栏图标打开窗口、立即扫描、清理常用项或退出。为避免找不到应用，隐藏 Dock 图标时菜单栏图标必须保留。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(14)
+        .background(.quaternary.opacity(0.35))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private var autoCleanupCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("定期自动清理")
+                .font(.headline)
+            Toggle("启用定期扫描与自动清理", isOn: Binding(
+                get: { scheduler.isEnabled },
+                set: { scheduler.setEnabled($0) }
+            ))
+            .toggleStyle(.switch)
+
+            Picker("执行方式", selection: Binding(
+                get: { scheduler.mode },
+                set: { scheduler.setMode($0) }
+            )) {
+                ForEach(AutoCleanupMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .disabled(!scheduler.isEnabled)
+
+            if scheduler.mode == .interval {
+                Picker("间隔", selection: Binding(
+                    get: { scheduler.intervalHours },
+                    set: { scheduler.setIntervalHours($0) }
+                )) {
+                    ForEach(AutoCleanupScheduler.intervalOptions, id: \.self) { hours in
+                        Text("每 \(hours) 小时").tag(hours)
+                    }
+                }
+                .pickerStyle(.menu)
+                .disabled(!scheduler.isEnabled)
+            } else {
+                DatePicker("每天执行时间", selection: Binding(
+                    get: { scheduler.dailyTime },
+                    set: { scheduler.setDailyTime($0) }
+                ), displayedComponents: .hourAndMinute)
+                .disabled(!scheduler.isEnabled)
+            }
+
+            Toggle("扫描后清理常用项", isOn: Binding(
+                get: { scheduler.autoCleanQuickClean },
+                set: { scheduler.setAutoCleanQuickClean($0) }
+            ))
+            .toggleStyle(.checkbox)
+            .disabled(!scheduler.isEnabled)
+
+            HStack(spacing: 10) {
+                if scheduler.isRunning {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("正在扫描并清理…")
+                        .foregroundStyle(.secondary)
+                } else {
+                    Button("立即运行一次") { scheduler.runNow() }
+                        .disabled(store.isScanning || store.isCleaning)
+                }
+                Spacer()
+                if let next = scheduler.nextRunAt, scheduler.isEnabled {
+                    Text("下次 \(devSweepShortTimestamp(next))")
+                        .foregroundStyle(.secondary)
+                }
+                if let last = scheduler.lastRunAt {
+                    Text("上次 \(devSweepShortTimestamp(last))")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .font(.caption)
+
+            if let result = scheduler.lastResult {
+                Text(result)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+
+            Text("自动执行需要 DevSweep 保持运行。只处理常用清理中已长期授权的普通缓存、Rust 编译输出和更新安装包；模拟器、手动项目和白名单路径永远不会被自动清理。错过的计划会在下次启动后补跑。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(14)
+        .background(.quaternary.opacity(0.35))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
 
