@@ -453,22 +453,42 @@ enum DevSweepUpdatePackageValidator {
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
+    /// 校验期间的外部命令。必须边执行边读取 stdout/stderr：
+    /// 旧实现先 `waitUntilExit` 再读同一个 Pipe，codesign 输出占满管道后
+    /// 子进程和主程序会互相等待，设置页就会永久停在「正在验证并准备安装」。
+    /// 统一走带进程组超时的执行器，既避免管道死锁，也能在系统工具异常时退出。
     @discardableResult
-    private static func run(_ executable: String, arguments: [String]) throws -> String {
-        let process = Process()
-        let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-        process.standardOutput = pipe
-        process.standardError = pipe
-        try process.run()
-        process.waitUntilExit()
-        let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        guard process.terminationStatus == 0 else {
+    static func run(
+        _ executable: String,
+        arguments: [String],
+        timeout: TimeInterval = 120
+    ) throws -> String {
+        guard let outcome = ProcessGroupExecutor.execute(
+            executable: URL(fileURLWithPath: executable),
+            arguments: arguments,
+            environment: nil,
+            timeout: timeout
+        ) else {
+            throw DevSweepUpdateError.commandFailed("无法启动 \(executable)")
+        }
+
+        let result = outcome.result
+        let stdout = String(decoding: result.stdout, as: UTF8.self)
+        let stderr = String(decoding: result.stderr, as: UTF8.self)
+        let output = (stdout + stderr).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if result.timedOut {
+            throw DevSweepUpdateError.commandFailed(
+                "\(executable) 超过 \(Int(timeout)) 秒未完成"
+            )
+        }
+        guard result.status == 0 else {
             if executable == "/usr/bin/codesign" {
                 throw DevSweepUpdateError.invalidSignature
             }
-            throw DevSweepUpdateError.commandFailed(output.trimmingCharacters(in: .whitespacesAndNewlines))
+            throw DevSweepUpdateError.commandFailed(
+                output.isEmpty ? "\(executable) 退出码 \(result.status)" : output
+            )
         }
         return output
     }

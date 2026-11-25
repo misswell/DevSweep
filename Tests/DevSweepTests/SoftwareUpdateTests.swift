@@ -118,4 +118,28 @@ final class SoftwareUpdateTests: XCTestCase {
             "c9985db64da8321cf59c6761f94386a8be407038a6ccdd6f34d180a29999118b"
         )
     }
+
+    func testUpdateCommandDrainsLargeOutputWithoutDeadlock() throws {
+        let output = try DevSweepUpdatePackageValidator.run(
+            "/bin/sh",
+            arguments: ["-c", "for i in $(seq 1 4000); do echo line-$i; done"],
+            timeout: 15
+        )
+        XCTAssertTrue(output.contains("line-4000"), "管道输出必须完整读回")
+    }
+
+    func testUpdateCommandTimesOutInsteadOfHanging() throws {
+        XCTAssertThrowsError(
+            try DevSweepUpdatePackageValidator.run(
+                "/bin/sh",
+                arguments: ["-c", "sleep 30"],
+                timeout: 1
+            )
+        ) { error in
+            guard case .commandFailed(let message) = error as? DevSweepUpdateError else {
+                return XCTFail("应报告命令超时，实际为 \(error)")
+            }
+            XCTAssertTrue(message.contains("超过 1 秒未完成"))
+        }
+    }
 }
