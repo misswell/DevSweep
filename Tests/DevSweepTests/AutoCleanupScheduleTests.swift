@@ -98,6 +98,24 @@ final class AutoCleanupScheduleTests: XCTestCase {
             date(2026, 5, 2, 3)
         )
     }
+
+    @MainActor
+    func testEmptyTrashSettingDefaultsOffAndPersists() {
+        let name = "DevSweepAutoCleanupEmptyTrash-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: name)!
+        defaults.removePersistentDomain(forName: name)
+        defer { defaults.removePersistentDomain(forName: name) }
+
+        let store = DevSweepStore(defaults: defaults)
+        let scheduler = AutoCleanupScheduler(store: store, defaults: defaults)
+        XCTAssertFalse(scheduler.autoEmptyTrash)
+
+        scheduler.setAutoEmptyTrash(true)
+        XCTAssertTrue(scheduler.autoEmptyTrash)
+
+        let reloaded = AutoCleanupScheduler(store: store, defaults: defaults)
+        XCTAssertTrue(reloaded.autoEmptyTrash)
+    }
 }
 
 @MainActor

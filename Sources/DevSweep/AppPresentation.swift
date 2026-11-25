@@ -150,6 +150,7 @@ final class AutoCleanupScheduler: ObservableObject {
         static let dailyHour = "DevSweep.autoCleanupDailyHour"
         static let dailyMinute = "DevSweep.autoCleanupDailyMinute"
         static let autoCleanQuickClean = "DevSweep.autoCleanupQuickClean"
+        static let autoEmptyTrash = "DevSweep.autoCleanupEmptyTrash"
         static let lastRunAt = "DevSweep.autoCleanupLastRunAt"
         static let lastResult = "DevSweep.autoCleanupLastResult"
         static let armedAt = "DevSweep.autoCleanupArmedAt"
@@ -159,6 +160,7 @@ final class AutoCleanupScheduler: ObservableObject {
 
     @Published private(set) var schedule: AutoCleanupSchedule
     @Published private(set) var autoCleanQuickClean: Bool
+    @Published private(set) var autoEmptyTrash: Bool
     @Published private(set) var isRunning = false
     @Published private(set) var nextRunAt: Date?
     @Published private(set) var lastRunAt: Date?
@@ -181,6 +183,7 @@ final class AutoCleanupScheduler: ObservableObject {
             StorageKey.dailyHour: 3,
             StorageKey.dailyMinute: 0,
             StorageKey.autoCleanQuickClean: true,
+            StorageKey.autoEmptyTrash: false,
         ])
 
         schedule = AutoCleanupSchedule(
@@ -191,6 +194,7 @@ final class AutoCleanupScheduler: ObservableObject {
             dailyMinute: min(max(defaults.integer(forKey: StorageKey.dailyMinute), 0), 59)
         )
         autoCleanQuickClean = defaults.object(forKey: StorageKey.autoCleanQuickClean) as? Bool ?? true
+        autoEmptyTrash = defaults.object(forKey: StorageKey.autoEmptyTrash) as? Bool ?? false
 
         let lastRunStamp = defaults.double(forKey: StorageKey.lastRunAt)
         lastRunAt = lastRunStamp > 0 ? Date(timeIntervalSince1970: lastRunStamp) : nil
@@ -260,6 +264,12 @@ final class AutoCleanupScheduler: ObservableObject {
         defaults.set(value, forKey: StorageKey.autoCleanQuickClean)
     }
 
+    func setAutoEmptyTrash(_ value: Bool) {
+        guard autoEmptyTrash != value else { return }
+        autoEmptyTrash = value
+        defaults.set(value, forKey: StorageKey.autoEmptyTrash)
+    }
+
     /// 立即执行一次；未启用定时也会执行，但不改变下次定时时间。
     func runNow() {
         guard !isRunning, !store.isScanning, !store.isCleaning else { return }
@@ -268,9 +278,17 @@ final class AutoCleanupScheduler: ObservableObject {
         timer?.invalidate()
         timer = nil
         let cleanQuickClean = autoCleanQuickClean
-        store.runScheduledMaintenance(cleanQuickClean: cleanQuickClean) { [weak self] outcome in
+        let emptyTrash = autoEmptyTrash
+        store.runScheduledMaintenance(
+            cleanQuickClean: cleanQuickClean,
+            emptyTrash: emptyTrash
+        ) { [weak self] outcome in
             Task { @MainActor in
-                self?.finish(outcome: outcome, cleanRequested: cleanQuickClean)
+                self?.finish(
+                    outcome: outcome,
+                    cleanRequested: cleanQuickClean,
+                    emptyTrashRequested: emptyTrash
+                )
             }
         }
     }
@@ -354,7 +372,11 @@ final class AutoCleanupScheduler: ObservableObject {
         startTimer(fireDate: fireDate)
     }
 
-    private func finish(outcome: ScheduledMaintenanceOutcome, cleanRequested: Bool) {
+    private func finish(
+        outcome: ScheduledMaintenanceOutcome,
+        cleanRequested: Bool,
+        emptyTrashRequested: Bool
+    ) {
         isRunning = false
         switch outcome {
         case .busy:
@@ -365,7 +387,11 @@ final class AutoCleanupScheduler: ObservableObject {
             defaults.set(finishedAt.timeIntervalSince1970, forKey: StorageKey.lastRunAt)
             armedAt = finishedAt
             defaults.set(finishedAt.timeIntervalSince1970, forKey: StorageKey.armedAt)
-            let result = Self.resultText(for: summary, cleanRequested: cleanRequested)
+            let result = Self.resultText(
+                for: summary,
+                cleanRequested: cleanRequested,
+                emptyTrashRequested: emptyTrashRequested
+            )
             lastResult = result
             defaults.set(result, forKey: StorageKey.lastResult)
             reschedule()
@@ -374,22 +400,36 @@ final class AutoCleanupScheduler: ObservableObject {
 
     private static func resultText(
         for summary: ScheduledMaintenanceSummary,
-        cleanRequested: Bool
+        cleanRequested: Bool,
+        emptyTrashRequested: Bool
     ) -> String {
         var parts = ["扫描 \(summary.scannedItemCount) 项"]
-        guard cleanRequested else {
+        if cleanRequested {
+            if summary.removedCount > 0 {
+                parts.append("清理 \(summary.removedCount) 项 \(summary.removedBytes.devSweepFileSize)")
+            } else if summary.quickCleanTargetCount > 0 {
+                parts.append("没有可清理的常用项")
+            } else {
+                parts.append("暂无常用项")
+            }
+        } else if !emptyTrashRequested {
             parts.append("仅扫描")
-            return parts.joined(separator: " · ")
-        }
-        if summary.removedCount > 0 {
-            parts.append("清理 \(summary.removedCount) 项 \(summary.removedBytes.devSweepFileSize)")
-        } else if summary.quickCleanTargetCount > 0 {
-            parts.append("没有可清理的常用项")
-        } else {
-            parts.append("暂无常用项")
         }
         if summary.failureCount > 0 {
-            parts.append("\(summary.failureCount) 项失败")
+            parts.append("清理失败 \(summary.failureCount) 项")
+        }
+        if emptyTrashRequested {
+            if summary.emptyTrashFailureCount > 0 {
+                parts.append(
+                    "清空废纸篓 \(summary.emptyTrashRemovedCount) 项成功、\(summary.emptyTrashFailureCount) 项失败"
+                )
+            } else if summary.emptyTrashRemovedCount > 0 {
+                parts.append(
+                    "清空废纸篓 \(summary.emptyTrashRemovedCount) 项 \(summary.emptyTrashBytes.devSweepFileSize)"
+                )
+            } else {
+                parts.append("废纸篓已空")
+            }
         }
         return parts.joined(separator: " · ")
     }

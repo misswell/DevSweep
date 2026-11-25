@@ -2422,6 +2422,7 @@ struct SettingsView: View {
     /// 由 AppKit 设置窗口注入；sheet 里为 nil，继续用 SwiftUI 的 dismiss。
     var onClose: (() -> Void)?
     @Environment(\.dismiss) private var dismiss
+    @State private var showingEmptyTrashConfirmation = false
     @EnvironmentObject private var store: DevSweepStore
     @EnvironmentObject private var updater: DevSweepSoftwareUpdater
     @EnvironmentObject private var scheduler: AutoCleanupScheduler
@@ -2525,6 +2526,37 @@ struct SettingsView: View {
             .toggleStyle(.checkbox)
             .disabled(!scheduler.isEnabled)
 
+            Toggle("每次执行后清空废纸篓（不可恢复）", isOn: Binding(
+                get: { scheduler.autoEmptyTrash },
+                set: { newValue in
+                    if newValue {
+                        showingEmptyTrashConfirmation = true
+                    } else {
+                        scheduler.setAutoEmptyTrash(false)
+                    }
+                }
+            ))
+            .toggleStyle(.checkbox)
+            .disabled(!scheduler.isEnabled)
+            .alert("清空废纸篓不可恢复", isPresented: $showingEmptyTrashConfirmation) {
+                Button("取消", role: .cancel) {
+                    scheduler.setAutoEmptyTrash(false)
+                }
+                Button("开启", role: .destructive) {
+                    scheduler.setAutoEmptyTrash(true)
+                }
+            } message: {
+                Text("开启后，每次执行（包括「立即运行一次」）结束都会永久删除废纸篓里的全部项目，包括你用 Finder 手动删除的文件；这些项目不能从废纸篓恢复，也不会出现在 DevSweep 的扫描结果里。")
+            }
+            if scheduler.autoEmptyTrash {
+                Label(
+                    "废纸篓会连同外接磁盘上属于你的废纸篓一起清空；开启期间请确认没有仍想保留的文件。",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+            }
+
             HStack(spacing: 10) {
                 if scheduler.isRunning {
                     ProgressView()
@@ -2554,7 +2586,7 @@ struct SettingsView: View {
                     .textSelection(.enabled)
             }
 
-            Text("自动执行需要 DevSweep 保持运行。只处理常用清理中已长期授权的普通缓存、Rust 编译输出和更新安装包；模拟器、手动项目和白名单路径永远不会被自动清理。错过的计划会在下次启动后补跑。")
+            Text("自动执行需要 DevSweep 保持运行。清理只处理常用清理中已长期授权的普通缓存、Rust 编译输出和更新安装包；模拟器、手动项目和白名单路径永远不会被自动清理。开启「清空废纸篓」后，每次执行结束会永久删除废纸篓全部内容。错过的计划会在下次启动后补跑。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

@@ -3078,6 +3078,9 @@ struct ScheduledMaintenanceSummary {
     let removedCount: Int
     let removedBytes: Int64
     let failureCount: Int
+    let emptyTrashRemovedCount: Int
+    let emptyTrashBytes: Int64
+    let emptyTrashFailureCount: Int
 }
 
 enum ScheduledMaintenanceOutcome {
@@ -3124,6 +3127,7 @@ final class DevSweepStore: ObservableObject {
     private let home: URL
     private let simulatorInspector: SimulatorCleanupInspecting
     private let simulatorExecutor: SimulatorCleanupExecuting
+    private let trashEmptying: TrashEmptying
     private var transientNoticeTask: Task<Void, Never>?
     private var quickCleanRefreshGeneration = 0
     private var quickCleanRefreshContext: QuickCleanRefreshContext?
@@ -3145,12 +3149,14 @@ final class DevSweepStore: ObservableObject {
         defaults: UserDefaults = .standard,
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         simulatorInspector: SimulatorCleanupInspecting = SimulatorCleanupExecutor(),
-        simulatorExecutor: SimulatorCleanupExecuting = SimulatorCleanupExecutor()
+        simulatorExecutor: SimulatorCleanupExecuting = SimulatorCleanupExecutor(),
+        trashEmptying: TrashEmptying = FileManagerTrashEmptying()
     ) {
         self.defaults = defaults
         self.home = home
         self.simulatorInspector = simulatorInspector
         self.simulatorExecutor = simulatorExecutor
+        self.trashEmptying = trashEmptying
         if let saved = defaults.array(forKey: Self.projectRootsKey) as? [String] {
             let configuredRoots = Self.normalizeProjectRoots(saved.map { URL(fileURLWithPath: $0) })
             projectRoots = saved.isEmpty
@@ -3914,11 +3920,13 @@ final class DevSweepStore: ObservableObject {
         cleanQuickCleanEntries(entries)
     }
 
-    /// 定时任务：先完整扫描，再清理常用清理中自动授权的条目。
+    /// 定时任务：先完整扫描，再清理常用清理中自动授权的条目；
+    /// 如用户开启「清空废纸篓」，清理结束后永久删除废纸篓里的全部项目。
     /// 扫描结果里的快捷清理快照刷新会与删除同时遍历目录，因此这里跳过刷新，
     /// 删除完成后的 applyQuickCleanCleanupResult 会统一刷新一次。
     func runScheduledMaintenance(
         cleanQuickClean: Bool,
+        emptyTrash: Bool,
         completion: @escaping (ScheduledMaintenanceOutcome) -> Void
     ) {
         guard !isScanning, !isCleaning else {
@@ -3929,34 +3937,99 @@ final class DevSweepStore: ObservableObject {
             guard let self else { return }
             let scannedCount = self.lastReport?.items.count ?? 0
             guard cleanQuickClean else {
-                completion(.completed(ScheduledMaintenanceSummary(
+                self.finishScheduledMaintenance(
                     scannedItemCount: scannedCount,
                     quickCleanTargetCount: 0,
-                    removedCount: 0,
-                    removedBytes: 0,
-                    failureCount: 0
-                )))
+                    cleanupReport: nil,
+                    emptyTrash: emptyTrash,
+                    completion: completion
+                )
                 return
             }
             self.rebindVersionedQuickCleanEntries()
             let targets = self.quickCleanEntries.filter(\.isAutomatic)
             guard !targets.isEmpty else {
-                completion(.completed(ScheduledMaintenanceSummary(
+                self.finishScheduledMaintenance(
                     scannedItemCount: scannedCount,
                     quickCleanTargetCount: 0,
-                    removedCount: 0,
-                    removedBytes: 0,
-                    failureCount: 0
-                )))
+                    cleanupReport: nil,
+                    emptyTrash: emptyTrash,
+                    completion: completion
+                )
                 return
             }
-            self.cleanQuickCleanEntries(targets) { report in
-                completion(.completed(ScheduledMaintenanceSummary(
+            self.cleanQuickCleanEntries(targets) { [weak self] report in
+                self?.finishScheduledMaintenance(
                     scannedItemCount: scannedCount,
                     quickCleanTargetCount: targets.count,
-                    removedCount: report.removed.count,
-                    removedBytes: report.removed.reduce(0) { $0 + $1.size },
-                    failureCount: report.failures.count
+                    cleanupReport: report,
+                    emptyTrash: emptyTrash,
+                    completion: completion
+                )
+            }
+        }
+    }
+
+    private func finishScheduledMaintenance(
+        scannedItemCount: Int,
+        quickCleanTargetCount: Int,
+        cleanupReport: CleanupReport?,
+        emptyTrash: Bool,
+        completion: @escaping (ScheduledMaintenanceOutcome) -> Void
+    ) {
+        let removedCount = cleanupReport?.removed.count ?? 0
+        let removedBytes = cleanupReport?.removed.reduce(0) { $0 + $1.size } ?? 0
+        let failureCount = cleanupReport?.failures.count ?? 0
+
+        guard emptyTrash else {
+            completion(.completed(ScheduledMaintenanceSummary(
+                scannedItemCount: scannedItemCount,
+                quickCleanTargetCount: quickCleanTargetCount,
+                removedCount: removedCount,
+                removedBytes: removedBytes,
+                failureCount: failureCount,
+                emptyTrashRemovedCount: 0,
+                emptyTrashBytes: 0,
+                emptyTrashFailureCount: 0
+            )))
+            return
+        }
+
+        // 清空废纸篓同样要占用「正在清理」状态，避免用户同时触发扫描或
+        // 另一批清理，与这里遍历 / 删除同一批目录。
+        isCleaning = true
+        statusMessage = "正在清空废纸篓…"
+        let previousError = lastError
+        let trashEmptying = self.trashEmptying
+        let home = self.home
+        DispatchQueue.global(qos: .utility).async {
+            let report = trashEmptying.emptyTrash(home: home)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.isCleaning = false
+                if report.removedCount > 0 {
+                    self.cleanupGeneration += 1
+                }
+                let trashSize = report.removedBytes.devSweepFileSize
+                if report.failures.isEmpty {
+                    self.statusMessage = report.removedCount > 0
+                        ? "已清空废纸篓 \(report.removedCount) 项，释放 \(trashSize)"
+                        : "废纸篓已经是空的"
+                } else {
+                    self.statusMessage = "已清空废纸篓 \(report.removedCount) 项，\(report.failures.count) 项未能删除"
+                    let details = report.failures.prefix(5).joined(separator: "\n")
+                    let message = "部分废纸篓项目未能删除：\n\(details)"
+                    self.lastError = previousError.map { "\($0)\n\(message)" } ?? message
+                }
+                completion(.completed(ScheduledMaintenanceSummary(
+                    scannedItemCount: scannedItemCount,
+                    quickCleanTargetCount: quickCleanTargetCount,
+                    removedCount: removedCount,
+                    removedBytes: removedBytes,
+                    failureCount: failureCount,
+                    emptyTrashRemovedCount: report.removedCount,
+                    emptyTrashBytes: report.removedBytes,
+                    emptyTrashFailureCount: report.failures.count
                 )))
             }
         }
