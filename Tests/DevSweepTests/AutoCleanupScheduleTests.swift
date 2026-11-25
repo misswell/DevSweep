@@ -109,12 +109,16 @@ final class AutoCleanupScheduleTests: XCTestCase {
         let store = DevSweepStore(defaults: defaults)
         let scheduler = AutoCleanupScheduler(store: store, defaults: defaults)
         XCTAssertFalse(scheduler.autoEmptyTrash)
+        XCTAssertEqual(scheduler.autoEmptyTrashTiming, .afterCleanup)
 
         scheduler.setAutoEmptyTrash(true)
+        scheduler.setAutoEmptyTrashTiming(.beforeScan)
         XCTAssertTrue(scheduler.autoEmptyTrash)
+        XCTAssertEqual(scheduler.autoEmptyTrashTiming, .beforeScan)
 
         let reloaded = AutoCleanupScheduler(store: store, defaults: defaults)
         XCTAssertTrue(reloaded.autoEmptyTrash)
+        XCTAssertEqual(reloaded.autoEmptyTrashTiming, .beforeScan)
     }
 }
 

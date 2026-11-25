@@ -81,6 +81,20 @@ enum AutoCleanupMode: String, CaseIterable, Identifiable {
     }
 }
 
+enum AutoTrashEmptyTiming: String, CaseIterable, Identifiable {
+    case beforeScan
+    case afterCleanup
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .beforeScan: return "扫描前清空"
+        case .afterCleanup: return "清理后清空"
+        }
+    }
+}
+
 /// 纯计算部分：不持有 Timer、不读取磁盘，便于直接测试补跑语义。
 struct AutoCleanupSchedule: Equatable {
     var isEnabled: Bool = false
@@ -151,6 +165,7 @@ final class AutoCleanupScheduler: ObservableObject {
         static let dailyMinute = "DevSweep.autoCleanupDailyMinute"
         static let autoCleanQuickClean = "DevSweep.autoCleanupQuickClean"
         static let autoEmptyTrash = "DevSweep.autoCleanupEmptyTrash"
+        static let autoEmptyTrashTiming = "DevSweep.autoCleanupEmptyTrashTiming"
         static let lastRunAt = "DevSweep.autoCleanupLastRunAt"
         static let lastResult = "DevSweep.autoCleanupLastResult"
         static let armedAt = "DevSweep.autoCleanupArmedAt"
@@ -161,6 +176,7 @@ final class AutoCleanupScheduler: ObservableObject {
     @Published private(set) var schedule: AutoCleanupSchedule
     @Published private(set) var autoCleanQuickClean: Bool
     @Published private(set) var autoEmptyTrash: Bool
+    @Published private(set) var autoEmptyTrashTiming: AutoTrashEmptyTiming
     @Published private(set) var isRunning = false
     @Published private(set) var nextRunAt: Date?
     @Published private(set) var lastRunAt: Date?
@@ -184,6 +200,7 @@ final class AutoCleanupScheduler: ObservableObject {
             StorageKey.dailyMinute: 0,
             StorageKey.autoCleanQuickClean: true,
             StorageKey.autoEmptyTrash: false,
+            StorageKey.autoEmptyTrashTiming: AutoTrashEmptyTiming.afterCleanup.rawValue,
         ])
 
         schedule = AutoCleanupSchedule(
@@ -195,6 +212,9 @@ final class AutoCleanupScheduler: ObservableObject {
         )
         autoCleanQuickClean = defaults.object(forKey: StorageKey.autoCleanQuickClean) as? Bool ?? true
         autoEmptyTrash = defaults.object(forKey: StorageKey.autoEmptyTrash) as? Bool ?? false
+        autoEmptyTrashTiming = AutoTrashEmptyTiming(
+            rawValue: defaults.string(forKey: StorageKey.autoEmptyTrashTiming) ?? ""
+        ) ?? .afterCleanup
 
         let lastRunStamp = defaults.double(forKey: StorageKey.lastRunAt)
         lastRunAt = lastRunStamp > 0 ? Date(timeIntervalSince1970: lastRunStamp) : nil
@@ -270,6 +290,12 @@ final class AutoCleanupScheduler: ObservableObject {
         defaults.set(value, forKey: StorageKey.autoEmptyTrash)
     }
 
+    func setAutoEmptyTrashTiming(_ timing: AutoTrashEmptyTiming) {
+        guard autoEmptyTrashTiming != timing else { return }
+        autoEmptyTrashTiming = timing
+        defaults.set(timing.rawValue, forKey: StorageKey.autoEmptyTrashTiming)
+    }
+
     /// 立即执行一次；未启用定时也会执行，但不改变下次定时时间。
     func runNow() {
         guard !isRunning, !store.isScanning, !store.isCleaning else { return }
@@ -279,15 +305,18 @@ final class AutoCleanupScheduler: ObservableObject {
         timer = nil
         let cleanQuickClean = autoCleanQuickClean
         let emptyTrash = autoEmptyTrash
+        let emptyTrashBeforeScan = autoEmptyTrashTiming == .beforeScan
         store.runScheduledMaintenance(
             cleanQuickClean: cleanQuickClean,
-            emptyTrash: emptyTrash
+            emptyTrash: emptyTrash,
+            emptyTrashBeforeScan: emptyTrashBeforeScan
         ) { [weak self] outcome in
             Task { @MainActor in
                 self?.finish(
                     outcome: outcome,
                     cleanRequested: cleanQuickClean,
-                    emptyTrashRequested: emptyTrash
+                    emptyTrashRequested: emptyTrash,
+                    emptyTrashBeforeScan: emptyTrashBeforeScan
                 )
             }
         }
@@ -375,7 +404,8 @@ final class AutoCleanupScheduler: ObservableObject {
     private func finish(
         outcome: ScheduledMaintenanceOutcome,
         cleanRequested: Bool,
-        emptyTrashRequested: Bool
+        emptyTrashRequested: Bool,
+        emptyTrashBeforeScan: Bool
     ) {
         isRunning = false
         switch outcome {
@@ -390,7 +420,8 @@ final class AutoCleanupScheduler: ObservableObject {
             let result = Self.resultText(
                 for: summary,
                 cleanRequested: cleanRequested,
-                emptyTrashRequested: emptyTrashRequested
+                emptyTrashRequested: emptyTrashRequested,
+                emptyTrashBeforeScan: emptyTrashBeforeScan
             )
             lastResult = result
             defaults.set(result, forKey: StorageKey.lastResult)
@@ -401,7 +432,8 @@ final class AutoCleanupScheduler: ObservableObject {
     private static func resultText(
         for summary: ScheduledMaintenanceSummary,
         cleanRequested: Bool,
-        emptyTrashRequested: Bool
+        emptyTrashRequested: Bool,
+        emptyTrashBeforeScan: Bool
     ) -> String {
         var parts = ["扫描 \(summary.scannedItemCount) 项"]
         if cleanRequested {
@@ -419,16 +451,17 @@ final class AutoCleanupScheduler: ObservableObject {
             parts.append("清理失败 \(summary.failureCount) 项")
         }
         if emptyTrashRequested {
+            let prefix = emptyTrashBeforeScan ? "扫描前清空废纸篓" : "清理后清空废纸篓"
             if summary.emptyTrashFailureCount > 0 {
                 parts.append(
-                    "清空废纸篓 \(summary.emptyTrashRemovedCount) 项成功、\(summary.emptyTrashFailureCount) 项失败"
+                    "\(prefix) \(summary.emptyTrashRemovedCount) 项成功、\(summary.emptyTrashFailureCount) 项失败"
                 )
             } else if summary.emptyTrashRemovedCount > 0 {
                 parts.append(
-                    "清空废纸篓 \(summary.emptyTrashRemovedCount) 项 \(summary.emptyTrashBytes.devSweepFileSize)"
+                    "\(prefix) \(summary.emptyTrashRemovedCount) 项 \(summary.emptyTrashBytes.devSweepFileSize)"
                 )
             } else {
-                parts.append("废纸篓已空")
+                parts.append("\(prefix)：废纸篓已空")
             }
         }
         return parts.joined(separator: " · ")

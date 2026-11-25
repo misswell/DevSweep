@@ -2546,9 +2546,19 @@ struct SettingsView: View {
                     scheduler.setAutoEmptyTrash(true)
                 }
             } message: {
-                Text("开启后，每次执行（包括「立即运行一次」）结束都会永久删除废纸篓里的全部项目，包括你用 Finder 手动删除的文件；这些项目不能从废纸篓恢复，也不会出现在 DevSweep 的扫描结果里。")
+                Text("开启后，每次执行（包括「立即运行一次」）都会按所选时机永久删除废纸篓里的全部项目，包括你用 Finder 手动删除的文件；这些项目不能从废纸篓恢复，也不会出现在 DevSweep 的扫描结果里。")
             }
             if scheduler.autoEmptyTrash {
+                Picker("清空时机", selection: Binding(
+                    get: { scheduler.autoEmptyTrashTiming },
+                    set: { scheduler.setAutoEmptyTrashTiming($0) }
+                )) {
+                    ForEach(AutoTrashEmptyTiming.allCases) { timing in
+                        Text(timing.title).tag(timing)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .disabled(!scheduler.isEnabled)
                 Label(
                     "废纸篓会连同外接磁盘上属于你的废纸篓一起清空；开启期间请确认没有仍想保留的文件。",
                     systemImage: "exclamationmark.triangle.fill"
@@ -2586,7 +2596,7 @@ struct SettingsView: View {
                     .textSelection(.enabled)
             }
 
-            Text("自动执行需要 DevSweep 保持运行。清理只处理常用清理中已长期授权的普通缓存、Rust 编译输出和更新安装包；模拟器、手动项目和白名单路径永远不会被自动清理。开启「清空废纸篓」后，每次执行结束会永久删除废纸篓全部内容。错过的计划会在下次启动后补跑。")
+            Text("自动执行需要 DevSweep 保持运行。清理只处理常用清理中已长期授权的普通缓存、Rust 编译输出和更新安装包；模拟器、手动项目和白名单路径永远不会被自动清理。开启「清空废纸篓」后，会在扫描前或清理完成后（按上方选择）永久删除废纸篓全部内容。错过的计划会在下次启动后补跑。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
