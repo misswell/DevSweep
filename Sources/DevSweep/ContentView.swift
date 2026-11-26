@@ -146,6 +146,7 @@ struct ContentView: View {
     @State private var showingConfirmation = false
     @State private var showingQuickCleanHint = false
     @State private var showingError = false
+    @AppStorage("DevSweep.hideTrashEmptyingWarning") private var hideTrashEmptyingWarning = false
     @State private var showingHelp = false
     @State private var showingSettings = false
     @State private var showingScanDetails = false
@@ -383,7 +384,33 @@ struct ContentView: View {
             AppWindowRouter.shared.openMainWindow = { openWindow(id: "main") }
         }
         .onChange(of: store.lastError) { value in
-            showingError = value != nil
+            guard let value else {
+                showingError = false
+                return
+            }
+            // 只屏蔽废纸篓提示；合并了其他清理错误时仍须显示完整内容。
+            guard value.hasPrefix("部分废纸篓项目未能删除：\n") else {
+                showingError = true
+                return
+            }
+            guard !hideTrashEmptyingWarning else {
+                store.clearError()
+                return
+            }
+            DispatchQueue.main.async {
+                guard store.lastError == value else { return }
+                let alert = NSAlert()
+                alert.messageText = "部分项目未能清理"
+                alert.informativeText = value
+                alert.addButton(withTitle: "知道了")
+                alert.showsSuppressionButton = true
+                alert.suppressionButton?.title = "不再提醒"
+                alert.runModal()
+                if alert.suppressionButton?.state == .on {
+                    hideTrashEmptyingWarning = true
+                }
+                if store.lastError == value { store.clearError() }
+            }
         }
         .onChange(of: store.cleanupGeneration) { _ in
             // 清理会改变磁盘占用；发现页保留当前目录，重新测量后刷新图表和列表。
